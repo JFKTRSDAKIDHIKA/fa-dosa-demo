@@ -73,15 +73,15 @@ def create_simple_conv_onnx():
     print(f"Created Simple CNN ONNX model: {output_path}")
 
 def create_bert_like_onnx():
-    """Create a BERT-like transformer ONNX model."""
+    """Create a smaller BERT-like transformer ONNX model."""
     class SimpleBERT(nn.Module):
         def __init__(self):
             super(SimpleBERT, self).__init__()
-            self.embedding = nn.Embedding(30522, 768)  # Vocab size, hidden size
-            self.linear1 = nn.Linear(768, 3072)
+            self.embedding = nn.Embedding(10000, 256)  # Reduced vocab size and hidden size
+            self.linear1 = nn.Linear(256, 512)
             self.relu = nn.ReLU()
-            self.linear2 = nn.Linear(3072, 768)
-            self.layernorm = nn.LayerNorm(768)
+            self.linear2 = nn.Linear(512, 256)
+            self.layernorm = nn.LayerNorm(256)
             
         def forward(self, input_ids):
             x = self.embedding(input_ids)
@@ -101,11 +101,11 @@ def create_bert_like_onnx():
     model = SimpleBERT()
     model.eval()
     
-    # Create dummy input (batch_size=1, seq_len=128)
-    dummy_input = torch.randint(0, 30522, (1, 128))
+    # Create dummy input with smaller sequence length
+    dummy_input = torch.randint(0, 10000, (1, 64))
     
     # Export to ONNX
-    output_path = "onnx_models/bert_base.onnx"
+    output_path = "onnx_models/bert_small.onnx"
     torch.onnx.export(
         model,
         dummy_input,
@@ -116,7 +116,7 @@ def create_bert_like_onnx():
         input_names=['input_ids'],
         output_names=['output']
     )
-    print(f"Created BERT-like ONNX model: {output_path}")
+    print(f"Created smaller BERT-like ONNX model: {output_path}")
 
 if __name__ == "__main__":
     # Ensure onnx_models directory exists
@@ -132,7 +132,7 @@ if __name__ == "__main__":
         print("Available models:")
         print("- simple_cnn: 2-layer CNN with Conv->ReLU patterns")
         print("- resnet18: Standard ResNet-18 architecture")
-        print("- bert_base: BERT-like transformer with linear layers")
+        print("- bert_small: Smaller BERT-like transformer with linear layers (under 100MB)")
     except Exception as e:
         print(f"Error creating ONNX models: {e}")
         print("Make sure PyTorch and torchvision are installed.")
