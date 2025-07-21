@@ -7,6 +7,7 @@ from operator import mul
 from dosa.config import Config
 from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
+from dosa.dmt import InPlaceFusionDMT
 
 # Define TENSOR_DIM_MAP
 TENSOR_DIM_MAP = {
@@ -22,6 +23,12 @@ class HighFidelityPerformanceModel(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        self.dmt_registry = {
+            ('Conv', 'ReLU'): InPlaceFusionDMT(),
+            ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(),
+            ('MatMul', 'Add'): InPlaceFusionDMT(),
+            # Add more patterns as needed
+        }
 
     def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict) -> dict:
         """
@@ -102,7 +109,7 @@ class HighFidelityPerformanceModel(nn.Module):
 
         return accesses
 
-    def forward(self, graph, hw_params: HardwareParameters, fusion_params, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         total_latency = torch.tensor(0.0, device=self.config.DEVICE)
         total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
@@ -110,63 +117,72 @@ class HighFidelityPerformanceModel(nn.Module):
         all_factors = mapping.get_all_factors()
 
         for group in graph.fusion_groups:
-            layer_name = group[0]
-            layer = graph.layers[layer_name]
-            macs = reduce(mul, layer['dims'].values(), 1)
-            
-            num_pes = hw_params.get_projected_num_pes()
-            compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
-            
-            per_level_accesses = self.calculate_per_level_accesses(layer['dims'], all_factors)
-            memory_latencies = []
-            num_pes_sqrt = torch.sqrt(num_pes)
+            current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
+            dmt_model = self.dmt_registry.get(current_pattern)
 
-            for interface, accesses in per_level_accesses.items():
-                upper_level_name = interface.split('_to_')[0]
-                level_info = next((level for level in self.config.MEMORY_HIERARCHY if level['name'] == upper_level_name), None)
-                
-                if upper_level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
-                    # Dynamic bandwidth: 2 * sqrt(PEs) words/cycle
-                    bandwidth_gb_s = (2 * num_pes_sqrt * self.config.BYTES_PER_ELEMENT * self.config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
-                else: # L3_DRAM
-                    bandwidth_gb_s = level_info['bandwidth_gb_s']
-
-                memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
-            
-            if memory_latencies:
-                latency = torch.maximum(compute_latency, torch.max(torch.stack(memory_latencies)))
+            if dmt_model:
+                latency, energy, group_buffer_mismatch_loss = dmt_model(group, graph, hw_params, mapping, self.config)
+                total_buffer_mismatch_loss += group_buffer_mismatch_loss
+                # For now, we assume DMT handles its own buffer requirements implicitly
+                # and doesn't contribute to the mismatch loss in this simplified model.
+                # A more advanced implementation might have DMTs also return a loss.
             else:
-                latency = compute_latency
+                # Fallback to original logic for single layers or unsupported patterns
+                layer_name = group[0]
+                layer = graph.layers[layer_name]
+                macs = reduce(mul, layer['dims'].values(), 1)
+                
+                num_pes = hw_params.get_projected_num_pes()
+                compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+                
+                per_level_accesses = self.calculate_per_level_accesses(layer['dims'], all_factors)
+                memory_latencies = []
+                num_pes_sqrt = torch.sqrt(num_pes)
 
-            energy = torch.tensor(0.0, device=self.config.DEVICE)
-            energy += macs * self.config.PE_MAC_EPA_PJ
-            
-            for interface, accesses_bytes in per_level_accesses.items():
-                lower_level_name = interface.split('_to_')[1]
-                accesses_4bytes = accesses_bytes / 4.0
+                for interface, accesses in per_level_accesses.items():
+                    upper_level_name = interface.split('_to_')[0]
+                    level_info = next((level for level in self.config.MEMORY_HIERARCHY if level['name'] == upper_level_name), None)
+                    
+                    if upper_level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
+                        bandwidth_gb_s = (2 * num_pes_sqrt * self.config.BYTES_PER_ELEMENT * self.config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
+                    else: # L3_DRAM
+                        bandwidth_gb_s = level_info['bandwidth_gb_s']
 
-                if lower_level_name == 'L0_Registers':
-                    energy += accesses_4bytes * self.config.L0_REG_BASE_EPA_PJ
-                elif lower_level_name == 'L1_Accumulator':
-                    size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                    # EPA = Base + Coeff * (C1 / sqrt(C_PE))
-                    epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                    energy += accesses_4bytes * epa
-                elif lower_level_name == 'L2_Scratchpad':
-                    size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                    epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                    energy += accesses_4bytes * epa
-                elif lower_level_name == 'L3_DRAM':
-                    energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
+                    memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
+                
+                if memory_latencies:
+                    latency = torch.maximum(compute_latency, torch.max(torch.stack(memory_latencies)))
+                else:
+                    latency = compute_latency
 
-            # Calculate buffer mismatch loss for this layer
-            for i, level in enumerate(self.config.MEMORY_HIERARCHY):
-                if level['type'] == 'buffer':
-                    required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
-                    available_kb = hw_params.get_buffer_size_kb(level['name'])
-                    buffer_deficit = torch.relu(required_kb - available_kb)
-                    level_mismatch_loss = torch.pow(buffer_deficit, 2)
-                    total_buffer_mismatch_loss += level_mismatch_loss
+                energy = torch.tensor(0.0, device=self.config.DEVICE)
+                energy += macs * self.config.PE_MAC_EPA_PJ
+                
+                for interface, accesses_bytes in per_level_accesses.items():
+                    lower_level_name = interface.split('_to_')[1]
+                    accesses_4bytes = accesses_bytes / 4.0
+
+                    if lower_level_name == 'L0_Registers':
+                        energy += accesses_4bytes * self.config.L0_REG_BASE_EPA_PJ
+                    elif lower_level_name == 'L1_Accumulator':
+                        size_kb = hw_params.get_buffer_size_kb(lower_level_name)
+                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                        energy += accesses_4bytes * epa
+                    elif lower_level_name == 'L2_Scratchpad':
+                        size_kb = hw_params.get_buffer_size_kb(lower_level_name)
+                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+                        energy += accesses_4bytes * epa
+                    elif lower_level_name == 'L3_DRAM':
+                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
+
+                # Calculate buffer mismatch loss for this layer
+                for i, level in enumerate(self.config.MEMORY_HIERARCHY):
+                    if level['type'] == 'buffer':
+                        required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
+                        available_kb = hw_params.get_buffer_size_kb(level['name'])
+                        buffer_deficit = torch.relu(required_kb - available_kb)
+                        level_mismatch_loss = torch.pow(buffer_deficit, 2)
+                        total_buffer_mismatch_loss += level_mismatch_loss
 
             total_latency += latency
             total_energy += energy

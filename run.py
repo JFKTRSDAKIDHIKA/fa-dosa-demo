@@ -280,7 +280,7 @@ def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping
         
         for i in range(num_mapping_steps):
             optimizer_map.zero_grad()
-            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, fusion_params, mapping)
+            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, mapping)
             
             # Calculate loss components
             continuous_pes = hw_params.get_num_pes()
@@ -340,7 +340,8 @@ def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping
                         'l2_size_kb': hw_params.get_buffer_size_kb('L2_Scratchpad')
                     },
                     'mapping_params_snapshot': mapping.get_all_factors(),
-                    'gumbel_tau': mapping.projector.tau
+                    'gumbel_tau': mapping.projector.tau,
+                    'fusion_decisions': fusion_params.get_fusion_decisions_serializable(graph)
                 }
                 logger.log_step(log_data)
         
@@ -359,7 +360,7 @@ def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping
         
         for i in range(num_hardware_steps):
             optimizer_hw.zero_grad()
-            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, fusion_params, mapping)
+            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, mapping)
             
             # Calculate loss components
             continuous_pes = hw_params.get_num_pes()
@@ -417,7 +418,8 @@ def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping
                         'l2_size_kb': hw_params.get_buffer_size_kb('L2_Scratchpad')
                     },
                     'mapping_params_snapshot': mapping.get_all_factors(),
-                    'gumbel_tau': mapping.projector.tau
+                    'gumbel_tau': mapping.projector.tau,
+                    'fusion_decisions': fusion_params.get_fusion_decisions_serializable(graph)
                 }
                 logger.log_step(log_data)
     
@@ -436,8 +438,11 @@ def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping
             final_mapping[dim_name][level_name]['temporal'] = level_factors['temporal'].item()
             final_mapping[dim_name][level_name]['spatial'] = level_factors['spatial'].item()
 
+    # Get final fusion decisions
+    final_fusion_decisions = fusion_params.get_fusion_decisions_serializable(graph)
+    
     # Save the final configuration to JSON
-    save_configuration_to_json(hw_params, final_mapping, "final_configuration.json")
+    save_configuration_to_json(hw_params, final_mapping, final_fusion_decisions, "final_configuration.json")
     
     # Close the logger
     logger.close()

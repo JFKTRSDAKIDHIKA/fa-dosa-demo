@@ -47,17 +47,31 @@ class FusionParameters(nn.Module):
 
     def get_fusion_decisions(self):
         return torch.sigmoid(self.fusion_logits) > 0.5
+    
+    def get_fusion_decisions_serializable(self, graph):
+        """Return a JSON-serializable representation of fusion decisions."""
+        decisions = self.get_fusion_decisions()
+        fusion_decisions = []
+        
+        for i, group in enumerate(graph.fusion_groups):
+            fusion_decisions.append({
+                "group": group,
+                "fused": bool(decisions[i].item())
+            })
+        
+        return fusion_decisions
 
 def calculate_macs(dims):
     return dims.get('N', 1) * dims.get('C', 1) * dims.get('K', 1) * dims.get('P', 1) * dims.get('Q', 1) * dims.get('R', 1) * dims.get('S', 1)
 
-def save_configuration_to_json(hw_params, projected_mapping, file_path="final_configuration.json"):
+def save_configuration_to_json(hw_params, projected_mapping, fusion_decisions, file_path="final_configuration.json"):
     config_dict = {
         "num_pes": hw_params.get_projected_num_pes().item(),
         "l0_size_kb": hw_params.get_buffer_size_kb('L0_Registers').item(),
         "l1_size_kb": hw_params.get_buffer_size_kb('L1_Accumulator').item(),
         "l2_size_kb": hw_params.get_buffer_size_kb('L2_Scratchpad').item(),
-        "mapping": projected_mapping
+        "mapping": projected_mapping,
+        "fusion_strategy": fusion_decisions
     }
     with open(file_path, 'w') as f:
         json.dump(config_dict, f, indent=4)
