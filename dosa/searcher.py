@@ -5,6 +5,7 @@ import numpy as np
 from typing import Dict, Any, List, Tuple
 import random
 from .utils import OptimizationLogger, get_divisors
+from .space import SearchSpace
 
 
 class BaseSearcher(ABC):
@@ -31,15 +32,18 @@ class BaseSearcher(ABC):
         self.config = config
         self.logger = logger or OptimizationLogger()
         
+        # 创建搜索空间实例
+        self.space = SearchSpace(graph)
+        
         # 记录最佳结果
         self.best_loss = float('inf')
         self.best_params = None
         self.best_metrics = None
         
         # 损失策略配置
-        self.loss_strategy = getattr(config, 'LOSS_STRATEGY', 'original')
+        self.loss_strategy = getattr(config, 'LOSS_STRATEGY', 'log_edp_plus_area')
         self.loss_weights = getattr(config, 'LOSS_WEIGHTS', {
-            'area_weight': 0.1,
+            'area_weight': getattr(config, 'AREA_WEIGHT', 0.1),
             'mismatch_penalty_weight': 10.0,
             'pe_penalty_weight_phase_a': 0.1,
             'pe_penalty_weight_phase_b': 0.01,
@@ -59,18 +63,21 @@ class BaseSearcher(ABC):
         """
         pass
     
-    def evaluate(self, params: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    def evaluate(self, flat_params: List[float]) -> Tuple[float, Dict[str, float]]:
         """
         统一的目标函数接口，评估给定参数的性能
         
         Args:
-            params: 扁平化的参数字典
+            flat_params: 扁平化的参数列表
             
         Returns:
             (loss, metrics): 损失值和性能指标字典
         """
-        # 将扁平化参数设置到模型中
-        self._set_params_from_dict(params)
+        # 将扁平化参数转换为结构化字典
+        params_dict = self.space.from_flat(flat_params)
+        
+        # 将参数设置到模型中
+        self._set_params_from_dict(params_dict)
         
         # 调用性能模型
         latency, energy, area, mismatch_loss = self.perf_model(
@@ -80,20 +87,8 @@ class BaseSearcher(ABC):
         # 计算PE惩罚
         pe_square_penalty = self.hw_params.get_pe_square_penalty()
         
-        # 根据策略计算损失
-        if self.loss_strategy == 'strategy_A':
-            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-            area_loss = self.loss_weights['area_weight'] * area
-            mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
-            loss = edp_loss + area_loss + mismatch_penalty + pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
-        elif self.loss_strategy == 'strategy_B':
-            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-            area_loss = self.loss_weights['area_weight'] * area
-            loss = self.loss_weights['edp_weight'] * edp_loss + area_loss + mismatch_loss * self.loss_weights['mismatch_penalty_weight'] + pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
-        else:  # 原始策略
-            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-            area_loss = self.loss_weights['area_weight'] * area
-            loss = edp_loss + area_loss + mismatch_loss * self.loss_weights['mismatch_penalty_weight'] + pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
+        # 使用统一的损失计算方法
+        loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
         
         # 构建性能指标字典
         metrics = {
@@ -110,7 +105,7 @@ class BaseSearcher(ABC):
     
     def _compute_loss(self, latency, energy, area, mismatch_loss, pe_square_penalty):
         """
-        计算总损失
+        计算总损失 - 完整复现原始run.py中的损失计算逻辑
         
         Args:
             latency: 延迟张量
@@ -129,20 +124,47 @@ class BaseSearcher(ABC):
         mismatch_loss = mismatch_loss.squeeze() if mismatch_loss.dim() > 0 else mismatch_loss
         pe_square_penalty = pe_square_penalty.squeeze() if pe_square_penalty.dim() > 0 else pe_square_penalty
         
-        # 使用与原始实现相同的损失策略
-        if self.config.LOSS_STRATEGY == 'log_edp_plus_area':
+        # 根据损失策略计算损失
+        if self.loss_strategy == 'strategy_A':
+            # Strategy A: 复杂的对数损失计算
+            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_loss = self.loss_weights['area_weight'] * area
+            mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
+            pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
+            loss = edp_loss + area_loss + mismatch_penalty + pe_penalty
+            
+        elif self.loss_strategy == 'strategy_B':
+            # Strategy B: 加权EDP损失计算
+            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_loss = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
+            pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
+            loss = (self.loss_weights['edp_weight'] * edp_loss + 
+                   area_loss + mismatch_penalty + pe_penalty)
+            
+        elif self.loss_strategy == 'log_edp_plus_area':
+            # 标准策略：log(EDP) + 面积惩罚
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-            area_penalty = self.config.AREA_WEIGHT * area
-            loss = log_edp + area_penalty + mismatch_loss + pe_square_penalty
-        elif self.config.LOSS_STRATEGY == 'edp_plus_area':
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
+            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty
+            
+        elif self.loss_strategy == 'edp_plus_area':
+            # EDP + 面积惩罚
             edp = latency * energy
-            area_penalty = self.config.AREA_WEIGHT * area
-            loss = edp + area_penalty + mismatch_loss + pe_square_penalty
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
+            loss = edp + area_penalty + mismatch_penalty + pe_penalty
+            
         else:
-            # 默认策略
+            # 默认策略：与log_edp_plus_area相同
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-            area_penalty = self.config.AREA_WEIGHT * area
-            loss = log_edp + area_penalty + mismatch_loss + pe_square_penalty
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
+            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty
         
         # 确保返回标量张量
         return loss.squeeze() if loss.dim() > 0 else loss
@@ -210,7 +232,11 @@ class BaseSearcher(ABC):
                 params[f'{dim_name}_{level_name}_spatial'] = level_factors['spatial'].item()
         
         # 融合参数
-        params['fusion_logits'] = self.fusion_params.fusion_logits.squeeze().tolist()
+        fusion_logits = self.fusion_params.fusion_logits.squeeze()
+        if fusion_logits.dim() == 0:  # 标量情况
+            params['fusion_logits'] = [fusion_logits.item()]
+        else:
+            params['fusion_logits'] = fusion_logits.tolist()
         
         return params
     
@@ -279,52 +305,6 @@ def get_random_valid_divisor(dim_size: int) -> int:
     return int(divisors[torch.randint(0, len(divisors), (1,)).item()].item())
 
 
-def sample_random_params(graph, hw_param_ranges: Dict[str, Tuple[float, float]]) -> Dict[str, Any]:
-    """
-    随机采样参数空间
-    
-    Args:
-        graph: ComputationGraph实例
-        hw_param_ranges: 硬件参数范围字典
-        
-    Returns:
-        随机采样的参数字典
-    """
-    params = {}
-    
-    # 随机采样硬件参数
-    # num_pes: 确保是平方数
-    min_sqrt = int(np.sqrt(hw_param_ranges['num_pes'][0]))
-    max_sqrt = int(np.sqrt(hw_param_ranges['num_pes'][1]))
-    sqrt_pes = random.randint(min_sqrt, max_sqrt)
-    params['num_pes'] = sqrt_pes * sqrt_pes
-    
-    # buffer sizes: 对数均匀采样
-    for level in ['l0_registers', 'l1_accumulator', 'l2_scratchpad']:
-        key = f'{level}_size_kb'
-        if key in hw_param_ranges:
-            min_val, max_val = hw_param_ranges[key]
-            log_min, log_max = np.log(min_val), np.log(max_val)
-            params[key] = np.exp(random.uniform(log_min, log_max))
-    
-    # 随机采样映射参数
-    for dim_name, dim_size in graph.problem_dims.items():
-        for level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']:
-            # 随机选择有效的temporal和spatial因子
-            temporal_factor = get_random_valid_divisor(dim_size)
-            remaining_size = dim_size // temporal_factor
-            spatial_factor = get_random_valid_divisor(remaining_size)
-            
-            params[f'{dim_name}_{level_name}_temporal'] = float(temporal_factor)
-            params[f'{dim_name}_{level_name}_spatial'] = float(spatial_factor)
-    
-    # 随机采样融合参数
-    num_fusion_groups = len(graph.fusion_groups)
-    params['fusion_logits'] = [random.choice([-2.0, 2.0]) for _ in range(num_fusion_groups)]
-    
-    return params
-
-
 class FADOSASearcher(BaseSearcher):
     """
     FA-DOSA搜索器：基于梯度的交替优化
@@ -382,9 +362,11 @@ class FADOSASearcher(BaseSearcher):
                     self.graph, self.hw_params, self.mapping
                 )
                 
-                # 简化损失计算，先只使用基本项
-                edp = latency * energy
-                loss = torch.log(edp + 1e-8)  # 只使用log EDP
+                # 计算PE惩罚
+                pe_square_penalty = self.hw_params.get_pe_square_penalty()
+                
+                # 使用统一的损失计算方法
+                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
                 
                 # 反向传播
                 loss.backward()
@@ -393,7 +375,8 @@ class FADOSASearcher(BaseSearcher):
                 # 计算指标用于记录
                 with torch.no_grad():
                     current_params = self._get_params_as_dict()
-                    _, metrics = self.evaluate(current_params)
+                    flat_params = self.space.to_flat(current_params)
+                    _, metrics = self.evaluate(flat_params)
                 
                 # 退火温度
                 self.mapping.anneal_tau()
@@ -428,9 +411,11 @@ class FADOSASearcher(BaseSearcher):
                     self.graph, self.hw_params, self.mapping
                 )
                 
-                # 简化损失计算，先只使用基本项
-                edp = latency * energy
-                loss = torch.log(edp + 1e-8)  # 只使用log EDP
+                # 计算PE惩罚
+                pe_square_penalty = self.hw_params.get_pe_square_penalty()
+                
+                # 使用统一的损失计算方法
+                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
                 
                 # 反向传播
                 loss.backward()
@@ -439,7 +424,8 @@ class FADOSASearcher(BaseSearcher):
                 # 计算指标用于记录
                 with torch.no_grad():
                     current_params = self._get_params_as_dict()
-                    _, metrics = self.evaluate(current_params)
+                    flat_params = self.space.to_flat(current_params)
+                    _, metrics = self.evaluate(flat_params)
                 
                 # 更新最佳结果
                 trial_count += 1
@@ -465,14 +451,6 @@ class RandomSearcher(BaseSearcher):
     
     def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
         super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger)
-        
-        # 定义参数空间范围
-        self.hw_param_ranges = {
-            'num_pes': (16, 1024),  # PE数量范围
-            'l0_registers_size_kb': (0.1, 10.0),  # L0缓存大小范围
-            'l1_accumulator_size_kb': (0.5, 50.0),  # L1缓存大小范围
-            'l2_scratchpad_size_kb': (1.0, 100.0)  # L2缓存大小范围
-        }
     
     def search(self, num_trials: int) -> Dict[str, Any]:
         """
@@ -487,20 +465,24 @@ class RandomSearcher(BaseSearcher):
         print(f"Starting Random Search with {num_trials} trials...")
         
         for trial in range(num_trials):
-            # 随机采样参数
-            random_params = sample_random_params(self.graph, self.hw_param_ranges)
+            # 使用SearchSpace随机采样参数
+            random_params_dict = self.space.sample()
+            
+            # 转换为扁平化格式
+            flat_params = self.space.to_flat(random_params_dict)
             
             # 评估当前配置
-            loss, metrics = self.evaluate(random_params)
+            loss, metrics = self.evaluate(flat_params)
             
             # 更新最佳结果
-            self.update_best_result(loss, random_params, metrics, trial + 1)
+            self.update_best_result(loss, random_params_dict, metrics, trial + 1)
             
             # 记录日志
             if (trial + 1) % 10 == 0 or trial == 0:
-                print(f"Trial {trial + 1}: Loss={loss:.4f}, EDP={metrics['edp']:.2e}, Best EDP={self.best_metrics['edp']:.2e}")
+                best_edp = self.best_metrics['edp'] if self.best_metrics else float('inf')
+                print(f"Trial {trial + 1}: Loss={loss:.4f}, EDP={metrics['edp']:.2e}, Best EDP={best_edp:.2e}")
             
-            self.log_trial(trial + 1, loss, metrics, random_params)
+            self.log_trial(trial + 1, loss, metrics, random_params_dict)
         
         return {
             'best_loss': self.best_loss,
@@ -512,18 +494,61 @@ class RandomSearcher(BaseSearcher):
 
 class BayesianOptimizationSearcher(BaseSearcher):
     """
-    贝叶斯优化搜索器（框架实现）
+    贝叶斯优化搜索器：基于 scikit-optimize 的高效黑盒优化
     """
     
     def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
         super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger)
         
-        # TODO: 集成scikit-optimize
-        # self.space = self._define_search_space()
+        # 定义 scikit-optimize 搜索空间
+        self.skopt_space = self._define_search_space()
+    
+    def _define_search_space(self):
+        """
+        将 SearchSpace 转换为 scikit-optimize 格式的搜索空间
+        
+        Returns:
+            scikit-optimize 的 space 对象列表
+        """
+        from skopt.space import Real, Integer, Categorical
+        
+        skopt_dimensions = []
+        
+        # 遍历 SearchSpace 中定义的所有维度，确保顺序一致
+        for dim in self.space.dimensions:
+            dim_type = dim['type']
+            name = dim['name']
+            
+            if dim_type == 'integer_square':
+                # 平方数参数：使用sqrt范围
+                min_sqrt, max_sqrt = dim['range']
+                skopt_dimensions.append(
+                    Integer(low=min_sqrt, high=max_sqrt, name=name)
+                )
+            
+            elif dim_type == 'log_uniform':
+                # 对数均匀分布
+                min_val, max_val = dim['range']
+                skopt_dimensions.append(
+                    Real(low=min_val, high=max_val, 
+                         prior='log-uniform', name=name)
+                )
+            
+            elif dim_type == 'categorical':
+                # 类别类型参数：使用Categorical维度
+                categories = dim['categories']
+                skopt_dimensions.append(
+                    Categorical(categories=categories, name=name)
+                )
+            
+            else:
+                raise ValueError(f"Unknown dimension type: {dim_type}")
+        
+        return skopt_dimensions
     
     def search(self, num_trials: int) -> Dict[str, Any]:
         """
-        执行贝叶斯优化搜索（待实现）
+        执行贝叶斯优化搜索
         
         Args:
             num_trials: 评估次数
@@ -531,43 +556,230 @@ class BayesianOptimizationSearcher(BaseSearcher):
         Returns:
             最佳结果字典
         """
-        print(f"Bayesian Optimization Searcher (Framework) - {num_trials} trials")
-        print("TODO: Implement scikit-optimize integration")
+        from skopt import gp_minimize
         
-        # 临时实现：回退到随机搜索
-        random_searcher = RandomSearcher(
-            self.graph, self.hw_params, self.mapping, 
-            self.fusion_params, self.perf_model, self.config, self.logger
+        print(f"Starting Bayesian Optimization with {num_trials} trials...")
+        
+        # 定义目标函数
+        def objective(flat_params: list) -> float:
+            """
+            贝叶斯优化的目标函数
+            
+            Args:
+                flat_params: scikit-optimize 传入的扁平化参数列表
+                
+            Returns:
+                损失值（需要最小化）
+            """
+            # 评估参数配置
+            loss, metrics = self.evaluate(flat_params)
+            
+            # 处理无效的损失值
+            import numpy as np
+            if np.isnan(loss) or np.isinf(loss) or loss > 1e15:
+                # 对于无效值，使用一个大的有限值
+                loss = 1e15
+                # 同时修正metrics中的无效值
+                for key, value in metrics.items():
+                    if np.isnan(value) or np.isinf(value):
+                        metrics[key] = 1e15
+            
+            # 将扁平化参数转换为结构化字典用于记录
+            params_dict = self.space.from_flat(flat_params)
+            
+            # 更新最佳结果（只有当损失值有效时）
+            trial_num = len(objective.trial_history) + 1
+            if loss < 1e15:  # 只有有效的损失值才更新最佳结果
+                self.update_best_result(loss, params_dict, metrics, trial_num)
+            
+            # 记录试验历史
+            objective.trial_history.append({
+                'loss': loss,
+                'metrics': metrics,
+                'params': params_dict
+            })
+            
+            # 记录日志
+            if trial_num % 10 == 0 or trial_num == 1:
+                best_edp = self.best_metrics['edp'] if self.best_metrics else float('inf')
+                print(f"BO Trial {trial_num}: Loss={loss:.4f}, EDP={metrics['edp']:.2e}, Best EDP={best_edp:.2e}")
+            
+            self.log_trial(trial_num, loss, metrics, params_dict)
+            
+            return loss
+        
+        # 初始化试验历史
+        objective.trial_history = []
+        
+        # 执行贝叶斯优化
+        result = gp_minimize(
+            func=objective,
+            dimensions=self.skopt_space,
+            n_calls=num_trials,
+            n_initial_points=min(20, num_trials // 2),  # 初始随机采样点数
+            random_state=42,  # 固定随机种子保证可复现性
+            acq_func='EI',  # 期望改进采集函数
+            n_jobs=1  # 单线程执行
         )
-        return random_searcher.search(num_trials)
-    
-    def _define_search_space(self):
-        """
-        定义贝叶斯优化的搜索空间（待实现）
         
-        Returns:
-            scikit-optimize的space对象
-        """
-        # TODO: 使用skopt.space定义搜索空间
-        pass
+        # 处理优化结果
+        best_flat_params = result.x
+        best_loss = result.fun
+        
+        # 将最优参数转换为结构化字典
+        best_params_dict = self.space.from_flat(best_flat_params)
+        
+        print(f"\nBayesian Optimization completed!")
+        print(f"Best loss: {best_loss:.4f}")
+        if self.best_metrics is not None:
+            print(f"Best EDP: {self.best_metrics['edp']:.2e}")
+        else:
+            print("No valid solutions found during optimization.")
+        
+        return {
+            'best_loss': self.best_loss,
+            'best_params': self.best_params,
+            'best_metrics': self.best_metrics or {},  # 如果为None则返回空字典
+            'total_trials': num_trials,
+            'skopt_result': result  # 保存完整的 scikit-optimize 结果
+        }
 
 
 class GeneticAlgorithmSearcher(BaseSearcher):
     """
-    遗传算法搜索器（框架实现）
+    遗传算法搜索器（基于DEAP实现）
     """
     
     def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
         super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger)
         
-        # TODO: 集成DEAP
+        # 遗传算法参数
         self.population_size = getattr(config, 'GA_POPULATION_SIZE', 50)
         self.mutation_rate = getattr(config, 'GA_MUTATION_RATE', 0.1)
         self.crossover_rate = getattr(config, 'GA_CROSSOVER_RATE', 0.8)
+        
+        # 初始化DEAP
+        self._setup_deap()
+    
+    def _setup_deap(self):
+        """
+        设置DEAP遗传算法框架
+        """
+        from deap import base, creator, tools
+        
+        # 创建适应度类型（最小化）
+        if not hasattr(creator, "FitnessMin"):
+            creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+        
+        # 创建个体类型
+        if not hasattr(creator, "Individual"):
+            creator.create("Individual", list, fitness=creator.FitnessMin)
+        
+        # 创建工具箱
+        self.toolbox = base.Toolbox()
+        
+        # 注册基因生成函数
+        self.toolbox.register("attr_item", self._sample_attribute)
+        
+        # 注册个体和种群生成函数
+        self.toolbox.register("individual", tools.initIterate, creator.Individual, self.toolbox.attr_item)
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        
+        # 注册演化算子
+        self.toolbox.register("evaluate", self._deap_evaluate_wrapper)
+        self.toolbox.register("mate", tools.cxTwoPoint)
+        self.toolbox.register("mutate", self._deap_mutate, indpb=self.mutation_rate)
+        self.toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    def _sample_attribute(self) -> list:
+        """
+        从搜索空间中随机采样一个扁平化的参数列表
+        
+        Returns:
+            扁平化的参数列表
+        """
+        # 从SearchSpace随机采样
+        params_dict = self.space.sample()
+        # 转换为扁平化列表
+        return self.space.to_flat(params_dict)
+    
+    def _deap_evaluate_wrapper(self, individual: list) -> tuple:
+        """
+        DEAP评估函数包装器
+        
+        Args:
+            individual: 个体（扁平化参数列表）
+            
+        Returns:
+            适应度元组
+        """
+        # 评估个体
+        loss, metrics = self.evaluate(individual)
+        
+        # 转换为结构化字典用于记录
+        params_dict = self.space.from_flat(individual)
+        
+        # 更新最佳结果
+        trial_num = getattr(self, '_current_trial', 0) + 1
+        self._current_trial = trial_num
+        self.update_best_result(loss, params_dict, metrics, trial_num)
+        
+        # 记录日志
+        if trial_num % 10 == 0 or trial_num == 1:
+            best_edp = self.best_metrics['edp'] if self.best_metrics else float('inf')
+            print(f"GA Trial {trial_num}: Loss={loss:.4f}, EDP={metrics['edp']:.2e}, Best EDP={best_edp:.2e}")
+        
+        self.log_trial(trial_num, loss, metrics, params_dict)
+        
+        # DEAP需要返回元组
+        return (loss,)
+    
+    def _deap_mutate(self, individual: list, indpb: float) -> tuple:
+        """
+        自定义变异算子
+        
+        Args:
+            individual: 个体（扁平化参数列表）
+            indpb: 每个基因的变异概率
+            
+        Returns:
+            变异后的个体
+        """
+        import random
+        
+        # 遍历个体中的每个基因
+        for i in range(len(individual)):
+            # 以indpb概率决定是否变异
+            if random.random() < indpb:
+                # 获取对应的维度定义
+                dim = self.space.dimensions[i]
+                dim_type = dim['type']
+                
+                if dim_type == 'integer_square':
+                    # 平方数参数：重新采样sqrt值
+                    min_sqrt, max_sqrt = dim['range']
+                    individual[i] = float(random.randint(min_sqrt, max_sqrt))
+                    
+                elif dim_type == 'log_uniform':
+                    # 对数均匀分布：重新采样
+                    min_val, max_val = dim['range']
+                    import numpy as np
+                    log_min, log_max = np.log(min_val), np.log(max_val)
+                    individual[i] = float(np.exp(random.uniform(log_min, log_max)))
+                    
+                elif dim_type == 'categorical':
+                    # 类别参数：重新采样索引
+                    num_categories = len(dim['categories'])
+                    individual[i] = float(random.randint(0, num_categories - 1))
+                    
+                else:
+                    raise ValueError(f"Unknown dimension type: {dim_type}")
+        
+        return (individual,)
     
     def search(self, num_trials: int) -> Dict[str, Any]:
         """
-        执行遗传算法搜索（待实现）
+        执行遗传算法搜索
         
         Args:
             num_trials: 评估次数（对应于代数 * 种群大小）
@@ -575,12 +787,104 @@ class GeneticAlgorithmSearcher(BaseSearcher):
         Returns:
             最佳结果字典
         """
-        print(f"Genetic Algorithm Searcher (Framework) - {num_trials} trials")
-        print("TODO: Implement DEAP integration")
+        from deap import algorithms, tools
+        import random
         
-        # 临时实现：回退到随机搜索
-        random_searcher = RandomSearcher(
-            self.graph, self.hw_params, self.mapping, 
-            self.fusion_params, self.perf_model, self.config, self.logger
-        )
-        return random_searcher.search(num_trials)
+        # 计算代数
+        generations = max(1, num_trials // self.population_size)
+        actual_trials = generations * self.population_size
+        
+        print(f"Starting Genetic Algorithm with {generations} generations, population size {self.population_size}")
+        print(f"Total evaluations: {actual_trials}")
+        
+        # 初始化试验计数器
+        self._current_trial = 0
+        
+        # 设置随机种子
+        random.seed(42)
+        
+        # 初始化种群
+        pop = self.toolbox.population(n=self.population_size)
+        
+        # 设置统计信息
+        stats = tools.Statistics(lambda ind: ind.fitness.values[0])
+        stats.register("avg", lambda x: sum(x) / len(x))
+        stats.register("min", min)
+        stats.register("max", max)
+        
+        # 名人堂（保存最优个体）
+        hof = tools.HallOfFame(1)
+        
+        # 运行演化算法
+        print("\nStarting evolution...")
+        
+        # 评估初始种群
+        fitnesses = list(map(self.toolbox.evaluate, pop))
+        for ind, fit in zip(pop, fitnesses):
+            ind.fitness.values = fit
+        
+        # 更新名人堂
+        hof.update(pop)
+        
+        # 记录初始统计信息
+        record = stats.compile(pop)
+        print(f"Generation 0: {record}")
+        
+        # 演化循环
+        for generation in range(1, generations + 1):
+            print(f"\n--- Generation {generation}/{generations} ---")
+            
+            # 选择下一代的父代
+            offspring = self.toolbox.select(pop, len(pop))
+            offspring = list(map(self.toolbox.clone, offspring))
+            
+            # 交叉
+            for child1, child2 in zip(offspring[::2], offspring[1::2]):
+                if random.random() < self.crossover_rate:
+                    self.toolbox.mate(child1, child2)
+                    del child1.fitness.values
+                    del child2.fitness.values
+            
+            # 变异
+            for mutant in offspring:
+                if random.random() < self.mutation_rate:
+                    self.toolbox.mutate(mutant)
+                    del mutant.fitness.values
+            
+            # 评估无效个体
+            invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+            fitnesses = list(map(self.toolbox.evaluate, invalid_ind))
+            for ind, fit in zip(invalid_ind, fitnesses):
+                ind.fitness.values = fit
+            
+            # 替换种群
+            pop[:] = offspring
+            
+            # 更新名人堂
+            hof.update(pop)
+            
+            # 记录统计信息
+            record = stats.compile(pop)
+            print(f"Generation {generation}: {record}")
+        
+        # 获取最优个体
+        best_individual = hof[0]
+        best_loss = best_individual.fitness.values[0]
+        
+        # 转换最优参数为结构化字典
+        best_params_dict = self.space.from_flat(list(best_individual))
+        
+        print(f"\nGenetic Algorithm completed!")
+        print(f"Best loss: {best_loss:.4f}")
+        print(f"Best EDP: {self.best_metrics['edp']:.2e}")
+        print(f"Total evaluations: {self._current_trial}")
+        
+        return {
+            'best_loss': self.best_loss,
+            'best_params': self.best_params,
+            'best_metrics': self.best_metrics,
+            'total_trials': self._current_trial,
+            'generations': generations,
+            'population_size': self.population_size,
+            'hall_of_fame': hof  # 保存名人堂
+        }

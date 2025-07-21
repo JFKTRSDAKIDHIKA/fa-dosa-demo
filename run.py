@@ -263,8 +263,12 @@ def run_experiment(
     fusion_params = FusionParameters(graph)
     perf_model = HighFidelityPerformanceModel(config)
     
+    # 确保output目录存在
+    import os
+    os.makedirs('output', exist_ok=True)
+    
     # 创建日志器
-    log_filename = f"optimization_log_{searcher_type.replace('-', '_')}.jsonl"
+    log_filename = f"output/optimization_log_{searcher_type.replace('-', '_')}.jsonl"
     logger = OptimizationLogger(log_filename)
     
     # 根据searcher_type实例化对应的搜索器
@@ -281,36 +285,47 @@ def run_experiment(
     # 输出结果
     print(f"\n--- Search Completed in {end_time - start_time:.2f}s ---")
     print(f"Best Loss: {results['best_loss']:.4f}")
-    print(f"Best EDP: {results['best_metrics']['edp']:.2e}")
-    print(f"Best Area: {results['best_metrics']['area_mm2']:.2f}mm²")
+    
+    # 安全地访问best_metrics
+    best_metrics = results.get('best_metrics', {})
+    if best_metrics and 'edp' in best_metrics:
+        print(f"Best EDP: {best_metrics['edp']:.2e}")
+        print(f"Best Area: {best_metrics['area_mm2']:.2f}mm²")
+    else:
+        print("No valid solutions found.")
+    
     print(f"Total Trials: {results['total_trials']}")
     
-    # 保存最终配置
-    final_config_filename = f"final_configuration_{searcher_type.replace('-', '_')}.json"
-    
-    # 从最佳参数中提取映射和融合决策
-    best_mapping = results['best_params'].get('mapping', {})
-    best_fusion_decisions = results['best_params'].get('fusion_decisions', [])
-    
-    # 设置硬件参数到最佳配置
-    if 'num_pes' in results['best_params']:
-        hw_params.log_num_pes.data = torch.log(torch.tensor(float(results['best_params']['num_pes'])))
-    for level in ['l0_registers', 'l1_accumulator', 'l2_scratchpad']:
-        key = f'{level}_size_kb'
-        if key in results['best_params']:
-            level_name = level.replace('_', ' ').title().replace(' ', '_')
-            if level == 'l0_registers':
-                level_name = 'L0_Registers'
-            elif level == 'l1_accumulator':
-                level_name = 'L1_Accumulator'
-            elif level == 'l2_scratchpad':
-                level_name = 'L2_Scratchpad'
-            if level_name in hw_params.log_buffer_sizes_kb:
-                hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_params'][key])))
-    
-    save_configuration_to_json(
-        hw_params, best_mapping, best_fusion_decisions, final_config_filename
-    )
+    # 保存最终配置（仅当找到有效解时）
+    if results['best_params'] is not None:
+        final_config_filename = f"output/final_configuration_{searcher_type.replace('-', '_')}.json"
+        
+        # 从最佳参数中提取映射和融合决策
+        best_mapping = results['best_params'].get('mapping', {})
+        best_fusion_decisions = results['best_params'].get('fusion_decisions', [])
+        
+        # 设置硬件参数到最佳配置
+        if 'num_pes' in results['best_params']:
+            hw_params.log_num_pes.data = torch.log(torch.tensor(float(results['best_params']['num_pes'])))
+        for level in ['l0_registers', 'l1_accumulator', 'l2_scratchpad']:
+            key = f'{level}_size_kb'
+            if key in results['best_params']:
+                level_name = level.replace('_', ' ').title().replace(' ', '_')
+                if level == 'l0_registers':
+                    level_name = 'L0_Registers'
+                elif level == 'l1_accumulator':
+                    level_name = 'L1_Accumulator'
+                elif level == 'l2_scratchpad':
+                    level_name = 'L2_Scratchpad'
+                if level_name in hw_params.log_buffer_sizes_kb:
+                    hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_params'][key])))
+        
+        save_configuration_to_json(
+            hw_params, best_mapping, best_fusion_decisions, final_config_filename
+        )
+        print(f"Configuration saved to {final_config_filename}")
+    else:
+        print("No valid configuration to save.")
     
     # 关闭日志器
     logger.close()
@@ -421,9 +436,14 @@ def run_comparison_experiment(
     
     for searcher_type, results in all_results.items():
         if 'error' not in results:
-            print(f"{searcher_type.upper():15s}: "
-                  f"Best EDP = {results['best_metrics']['edp']:.2e}, "
-                  f"Best Loss = {results['best_loss']:.4f}")
+            best_metrics = results.get('best_metrics', {})
+            if best_metrics and 'edp' in best_metrics:
+                print(f"{searcher_type.upper():15s}: "
+                      f"Best EDP = {best_metrics['edp']:.2e}, "
+                      f"Best Loss = {results['best_loss']:.4f}")
+            else:
+                print(f"{searcher_type.upper():15s}: "
+                      f"No valid solutions found, Best Loss = {results['best_loss']:.4f}")
         else:
             print(f"{searcher_type.upper():15s}: ERROR - {results['error']}")
     
@@ -450,13 +470,30 @@ if __name__ == "__main__":
         num_trials=50  # 减少试验次数以加快测试
     )
     
-    # 示例2: 运行对比实验 - 轻量级测试配置
-    print("\n=== Comparison Experiment ===")
-    comparison_results = run_comparison_experiment(
+    # 贝叶斯优化实验 - 轻量级测试配置
+    bayesian_results = run_experiment(
         model_name="resnet18",
-        searcher_types=["fa-dosa", "random_search"],
-        num_trials=20  # 进一步减少试验次数以加快测试
+        searcher_type="bayesian_opt",
+        num_trials=50  # 减少试验次数以加快测试
     )
+    
+    # 遗传算法实验 - 轻量级测试配置
+    genetic_results = run_experiment(
+        model_name="resnet18",
+        searcher_type="genetic_algo",
+        num_trials=50,  # 减少试验次数以加快测试
+        population_size=20,  # 减少种群大小以加快测试
+        mutation_rate=0.1,
+        crossover_rate=0.8
+    )
+    
+    # 示例2: 运行对比实验 - 四种算法完整对比
+    # print("\n=== Comprehensive Comparison Experiment ===")
+    # comparison_results = run_comparison_experiment(
+    #     model_name="resnet18",
+    #     searcher_types=["fa-dosa", "random_search", "bayesian_opt", "genetic_algo"],
+    #     num_trials=50  # 统一试验次数以确保公平对比
+    # )
     
     # 示例3: 其他模型的实验（注释掉，可根据需要启用）
     # run_experiment(model_name="bert_base", searcher_type="fa-dosa", num_trials=200)

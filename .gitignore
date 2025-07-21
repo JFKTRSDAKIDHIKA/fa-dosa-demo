@@ -1,2 +1,4 @@
 *.onnx
 *.json
+*.jsonl
+*.png
