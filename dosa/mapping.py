@@ -157,10 +157,10 @@ class FineGrainedMapping(nn.Module):
             self.factors[level_name] = nn.ModuleDict()
             for dim_name in self.dims.keys():
                 # 使用ParameterDict来正确注册参数
-                # 初始化为1（在log空间中为0）
+                # 初始化为1（在log空间中为0），确保是标量张量
                 self.factors[level_name][dim_name] = nn.ParameterDict({
-                    'temporal': nn.Parameter(torch.zeros(1)), # log(1) = 0
-                    'spatial': nn.Parameter(torch.zeros(1))
+                    'temporal': nn.Parameter(torch.tensor(0.0)), # log(1) = 0, 标量
+                    'spatial': nn.Parameter(torch.tensor(0.0))   # log(1) = 0, 标量
                 })
 
     def get_factor(self, level_name, dim_name, factor_type):

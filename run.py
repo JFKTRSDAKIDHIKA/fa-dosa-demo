@@ -235,227 +235,231 @@ def _create_fallback_graph() -> ComputationGraph:
 
 # --- 主实验流程 ---
 
-def run_experiment(model_name: str = "resnet18", num_outer_steps=10, num_mapping_steps=200, num_hardware_steps=50, lr_mapping=1e-2, lr_hardware=1e-2):
-    # Initialize the optimization logger
-    logger = OptimizationLogger("optimization_log.jsonl")
-    print(f"--- Running High-Fidelity FA-DOSA Experiment for {model_name} ---")
+def run_experiment(
+    model_name: str = "resnet18", 
+    searcher_type: str = "fa-dosa",
+    num_trials: int = 500,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    重构后的实验启动器，支持多种搜索算法
+    
+    Args:
+        model_name: 模型名称 (e.g., 'resnet18', 'bert_base')
+        searcher_type: 搜索器类型 ('fa-dosa', 'random_search', 'bayesian_opt', 'genetic_algo')
+        num_trials: 试验次数或评估次数
+        **kwargs: 其他搜索器特定参数
+        
+    Returns:
+        搜索结果字典
+    """
+    print(f"--- Running DSE Experiment: {searcher_type.upper()} on {model_name} ---")
+    
+    # 初始化核心组件
     config = Config()
     graph = parse_onnx_to_graph(model_name)
-    
-    # Loss function strategy selection
-    loss_strategy = 'strategy_A'  # Options: 'strategy_A', 'strategy_B', or 'original'
-    
-    # Unified loss weight configuration
-    loss_weights = {
-        'area_weight': 0.01,           # Weight for area penalty
-        'edp_weight': 10.0,           # For Strategy B: Amplified EDP Benefit
-        'pe_penalty_weight_phase_a': 0.01,  # PE penalty weight for mapping phase
-        'pe_penalty_weight_phase_b': 0.01,  # PE penalty weight for hardware phase
-        'mismatch_penalty_weight': config.MISMATCH_PENALTY_WEIGHT  # From config
-    }
-
     hw_params = HardwareParameters()
-    # 使用一个共享的mapping对象
     mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY)
     fusion_params = FusionParameters(graph)
     perf_model = HighFidelityPerformanceModel(config)
     
-    # Alternating optimization scheme
-    for outer_step in range(num_outer_steps):
-        print(f"\n--- Outer Step {outer_step + 1}/{num_outer_steps} ---")
-        
-        # Phase A: Optimize Mapping & Fusion (freeze hardware)
-        print("--- Phase A: Optimizing Mapping & Fusion ---")
-        
-        # Freeze hardware parameters
-        for p in hw_params.parameters():
-            p.requires_grad = False
-        # Unfreeze mapping and fusion parameters
-        for p in list(mapping.parameters()) + list(fusion_params.parameters()):
-            p.requires_grad = True
-            
-        # Create optimizer for mapping and fusion parameters
-        map_fus_params = list(mapping.parameters()) + list(fusion_params.parameters())
-        optimizer_map = optim.Adam(map_fus_params, lr=lr_mapping)
-        
-        for i in range(num_mapping_steps):
-            optimizer_map.zero_grad()
-            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, mapping)
-            
-            # Calculate loss components
-            continuous_pes = hw_params.get_num_pes()
-            sqrt_pes = torch.sqrt(continuous_pes)
-            pe_square_penalty = torch.pow(sqrt_pes - torch.round(sqrt_pes), 2)
-
-            # Strategy-based loss calculation
-            if loss_strategy == 'strategy_A':
-                # Strategy A: Log-space Penalty ("Soft Wall")
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                mismatch_penalty = torch.log(1.0 + mismatch_loss * loss_weights['mismatch_penalty_weight'])
-                loss = edp_loss + area_loss + mismatch_penalty + pe_square_penalty * loss_weights['pe_penalty_weight_phase_a']
-            elif loss_strategy == 'strategy_B':
-                # Strategy B: Amplified EDP Benefit
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                loss = loss_weights['edp_weight'] * edp_loss + area_loss + mismatch_loss * loss_weights['mismatch_penalty_weight'] + pe_square_penalty * loss_weights['pe_penalty_weight_phase_a']
-            else:  # Fallback to original
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                loss = edp_loss + area_loss + mismatch_loss * loss_weights['mismatch_penalty_weight'] + pe_square_penalty * loss_weights['pe_penalty_weight_phase_a']
-            loss.backward()
-            optimizer_map.step()
-            # Anneal temperature for Gumbel-Softmax after each step
-            mapping.anneal_tau()
-            
-            if i % 10 == 0:
-                if loss_strategy == 'strategy_A':
-                    print(f"[Map] Iter {i}: Loss={loss.item():.4f}, EDP={edp_loss.item():.4f}, Area={area_loss.item():.4f}, Mismatch_Penalty={mismatch_penalty.item():.4f}, PE_Penalty={pe_square_penalty.item():.4f}")
-                else:
-                    print(f"[Map] Iter {i}: Loss={loss.item():.4f}, EDP={edp_loss.item():.4f}, Area={area_loss.item():.4f}, Mismatch={mismatch_loss.item():.4f}, PE_Penalty={pe_square_penalty.item():.4f}")
-                print(f"         Latency={latency.item():.2e}s, Energy={energy.item():.2e}pJ, Area={area.item():.2f}mm²")
-                
-                # Log optimization data
-                log_data = {
-                    'phase': 'A: Mapping',
-                    'outer_step': outer_step,
-                    'inner_step': i,
-                    'loss_total': loss,
-                    'loss_components': {
-                        'edp': edp_loss,
-                        'area': area_loss,
-                        'mismatch': mismatch_loss if loss_strategy != 'strategy_A' else mismatch_penalty,
-                        'pe_penalty': pe_square_penalty
-                    },
-                    'performance_metrics': {
-                        'latency_sec': latency,
-                        'energy_pj': energy,
-                        'area_mm2': area
-                    },
-                    'hardware_params': {
-                        'num_pes': hw_params.get_num_pes(),
-                        'projected_num_pes': hw_params.get_projected_num_pes(),
-                        'l0_size_kb': hw_params.get_buffer_size_kb('L0_Registers'),
-                        'l1_size_kb': hw_params.get_buffer_size_kb('L1_Accumulator'),
-                        'l2_size_kb': hw_params.get_buffer_size_kb('L2_Scratchpad')
-                    },
-                    'mapping_params_snapshot': mapping.get_all_factors(),
-                    'gumbel_tau': mapping.projector.tau,
-                    'fusion_decisions': fusion_params.get_fusion_decisions_serializable(graph)
-                }
-                logger.log_step(log_data)
-        
-        # Phase B: Optimize Hardware (freeze mapping and fusion)
-        print("--- Phase B: Optimizing Hardware ---")
-        
-        # Freeze mapping and fusion parameters
-        for p in list(mapping.parameters()) + list(fusion_params.parameters()):
-            p.requires_grad = False
-        # Unfreeze hardware parameters
-        for p in hw_params.parameters():
-            p.requires_grad = True
-            
-        # Create optimizer for hardware parameters
-        optimizer_hw = optim.Adam(hw_params.parameters(), lr=lr_hardware)
-        
-        for i in range(num_hardware_steps):
-            optimizer_hw.zero_grad()
-            latency, energy, area, mismatch_loss = perf_model(graph, hw_params, mapping)
-            
-            # Calculate loss components
-            continuous_pes = hw_params.get_num_pes()
-            sqrt_pes = torch.sqrt(continuous_pes)
-            pe_square_penalty = torch.pow(sqrt_pes - torch.round(sqrt_pes), 2)
-
-            # Strategy-based loss calculation (Phase B: consistent area weight)
-            if loss_strategy == 'strategy_A':
-                # Strategy A: Log-space Penalty ("Soft Wall")
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                mismatch_penalty = torch.log(1.0 + mismatch_loss * loss_weights['mismatch_penalty_weight'])
-                loss = edp_loss + area_loss + mismatch_penalty + pe_square_penalty * loss_weights['pe_penalty_weight_phase_b']
-            elif loss_strategy == 'strategy_B':
-                # Strategy B: Amplified EDP Benefit
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                loss = loss_weights['edp_weight'] * edp_loss + area_loss + mismatch_loss * loss_weights['mismatch_penalty_weight'] + pe_square_penalty * loss_weights['pe_penalty_weight_phase_b']
-            else:  # Fallback to original
-                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                area_loss = loss_weights['area_weight'] * area
-                loss = edp_loss + area_loss + mismatch_loss * loss_weights['mismatch_penalty_weight'] + pe_square_penalty * loss_weights['pe_penalty_weight_phase_b']
-            loss.backward()
-            optimizer_hw.step()
-            
-            if i % 10 == 0:
-                if loss_strategy == 'strategy_A':
-                    print(f"[HW] Iter {i}: Loss={loss.item():.4f}, EDP={edp_loss.item():.4f}, Area={area_loss.item():.4f}, Mismatch_Penalty={mismatch_penalty.item():.4f}, PE_Penalty={pe_square_penalty.item():.4f}")
-                else:
-                    print(f"[HW] Iter {i}: Loss={loss.item():.4f}, EDP={edp_loss.item():.4f}, Area={area_loss.item():.4f}, Mismatch={mismatch_loss.item():.4f}, PE_Penalty={pe_square_penalty.item():.4f}")
-                print(f"         Latency={latency.item():.2e}s, Energy={energy.item():.2e}pJ, Area={area.item():.2f}mm²")
-                
-                # Log optimization data
-                log_data = {
-                    'phase': 'B: Hardware',
-                    'outer_step': outer_step,
-                    'inner_step': i,
-                    'loss_total': loss,
-                    'loss_components': {
-                        'edp': edp_loss,
-                        'area': area_loss,
-                        'mismatch': mismatch_loss if loss_strategy != 'strategy_A' else mismatch_penalty,
-                        'pe_penalty': pe_square_penalty
-                    },
-                    'performance_metrics': {
-                        'latency_sec': latency,
-                        'energy_pj': energy,
-                        'area_mm2': area
-                    },
-                    'hardware_params': {
-                        'num_pes': hw_params.get_num_pes(),
-                        'projected_num_pes': hw_params.get_projected_num_pes(),
-                        'l0_size_kb': hw_params.get_buffer_size_kb('L0_Registers'),
-                        'l1_size_kb': hw_params.get_buffer_size_kb('L1_Accumulator'),
-                        'l2_size_kb': hw_params.get_buffer_size_kb('L2_Scratchpad')
-                    },
-                    'mapping_params_snapshot': mapping.get_all_factors(),
-                    'gumbel_tau': mapping.projector.tau,
-                    'fusion_decisions': fusion_params.get_fusion_decisions_serializable(graph)
-                }
-                logger.log_step(log_data)
+    # 创建日志器
+    log_filename = f"optimization_log_{searcher_type.replace('-', '_')}.jsonl"
+    logger = OptimizationLogger(log_filename)
     
-    print("\n--- Final Configuration ---")
-    print(f"PEs: {hw_params.get_projected_num_pes().item():.0f}")
-    for level in config.MEMORY_HIERARCHY:
-        if level['type'] == 'buffer':
-            print(f"{level['name']} Size: {hw_params.get_buffer_size_kb(level['name']).item():.2f} KB")
-
-    # Get the final projected mapping
-    final_mapping = mapping.get_all_factors()
-
-    # Convert tensors to floats for JSON serialization
-    for dim_name, dim_factors in final_mapping.items():
-        for level_name, level_factors in dim_factors.items():
-            final_mapping[dim_name][level_name]['temporal'] = level_factors['temporal'].item()
-            final_mapping[dim_name][level_name]['spatial'] = level_factors['spatial'].item()
-
-    # Get final fusion decisions
-    final_fusion_decisions = fusion_params.get_fusion_decisions_serializable(graph)
-    
-    # Save the final configuration to JSON
-    save_configuration_to_json(hw_params, final_mapping, final_fusion_decisions, "final_configuration.json")
-    
-    # Close the logger
-    logger.close()
-
-if __name__ == "__main__":
-    # Example: Run experiment with ResNet-18
-    run_experiment(
-        model_name="resnet18",
-        num_outer_steps=5, 
-        num_mapping_steps=50, 
-        num_hardware_steps=50
+    # 根据searcher_type实例化对应的搜索器
+    searcher = create_searcher(
+        searcher_type, graph, hw_params, mapping, 
+        fusion_params, perf_model, config, logger, **kwargs
     )
     
-    # Additional examples for other models:
-    # run_experiment(model_name="bert_base", num_outer_steps=3)
-    # run_experiment(model_name="unet", num_outer_steps=3)
+    # 执行搜索
+    start_time = time.time()
+    results = searcher.search(num_trials)
+    end_time = time.time()
+    
+    # 输出结果
+    print(f"\n--- Search Completed in {end_time - start_time:.2f}s ---")
+    print(f"Best Loss: {results['best_loss']:.4f}")
+    print(f"Best EDP: {results['best_metrics']['edp']:.2e}")
+    print(f"Best Area: {results['best_metrics']['area_mm2']:.2f}mm²")
+    print(f"Total Trials: {results['total_trials']}")
+    
+    # 保存最终配置
+    final_config_filename = f"final_configuration_{searcher_type.replace('-', '_')}.json"
+    
+    # 从最佳参数中提取映射和融合决策
+    best_mapping = results['best_params'].get('mapping', {})
+    best_fusion_decisions = results['best_params'].get('fusion_decisions', [])
+    
+    # 设置硬件参数到最佳配置
+    if 'num_pes' in results['best_params']:
+        hw_params.log_num_pes.data = torch.log(torch.tensor(float(results['best_params']['num_pes'])))
+    for level in ['l0_registers', 'l1_accumulator', 'l2_scratchpad']:
+        key = f'{level}_size_kb'
+        if key in results['best_params']:
+            level_name = level.replace('_', ' ').title().replace(' ', '_')
+            if level == 'l0_registers':
+                level_name = 'L0_Registers'
+            elif level == 'l1_accumulator':
+                level_name = 'L1_Accumulator'
+            elif level == 'l2_scratchpad':
+                level_name = 'L2_Scratchpad'
+            if level_name in hw_params.log_buffer_sizes_kb:
+                hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_params'][key])))
+    
+    save_configuration_to_json(
+        hw_params, best_mapping, best_fusion_decisions, final_config_filename
+    )
+    
+    # 关闭日志器
+    logger.close()
+    
+    return results
+
+
+def create_searcher(
+    searcher_type: str, graph, hw_params, mapping, fusion_params, 
+    perf_model, config, logger, **kwargs
+):
+    """
+    工厂函数：根据类型创建对应的搜索器
+    
+    Args:
+        searcher_type: 搜索器类型
+        其他参数: 搜索器初始化所需的组件
+        **kwargs: 搜索器特定参数
+        
+    Returns:
+        对应的搜索器实例
+    """
+    from dosa.searcher import (
+        FADOSASearcher, RandomSearcher, 
+        BayesianOptimizationSearcher, GeneticAlgorithmSearcher
+    )
+    
+    # 为FA-DOSA设置默认参数
+    if searcher_type == 'fa-dosa':
+        config.NUM_OUTER_STEPS = kwargs.get('num_outer_steps', 5)
+        config.NUM_MAPPING_STEPS = kwargs.get('num_mapping_steps', 50)
+        config.NUM_HARDWARE_STEPS = kwargs.get('num_hardware_steps', 50)
+        config.LR_MAPPING = kwargs.get('lr_mapping', 0.01)
+        config.LR_HARDWARE = kwargs.get('lr_hardware', 0.01)
+        
+        return FADOSASearcher(
+            graph, hw_params, mapping, fusion_params, perf_model, config, logger
+        )
+    
+    elif searcher_type == 'random_search':
+        return RandomSearcher(
+            graph, hw_params, mapping, fusion_params, perf_model, config, logger
+        )
+    
+    elif searcher_type == 'bayesian_opt':
+        return BayesianOptimizationSearcher(
+            graph, hw_params, mapping, fusion_params, perf_model, config, logger
+        )
+    
+    elif searcher_type == 'genetic_algo':
+        # 设置遗传算法参数
+        config.GA_POPULATION_SIZE = kwargs.get('population_size', 50)
+        config.GA_MUTATION_RATE = kwargs.get('mutation_rate', 0.1)
+        config.GA_CROSSOVER_RATE = kwargs.get('crossover_rate', 0.8)
+        
+        return GeneticAlgorithmSearcher(
+            graph, hw_params, mapping, fusion_params, perf_model, config, logger
+        )
+    
+    else:
+        raise ValueError(f"Unknown searcher type: {searcher_type}. "
+                        f"Supported types: 'fa-dosa', 'random_search', 'bayesian_opt', 'genetic_algo'")
+
+
+def run_comparison_experiment(
+    model_name: str = "resnet18",
+    searcher_types: List[str] = ["fa-dosa", "random_search"],
+    num_trials: int = 500
+) -> Dict[str, Dict[str, Any]]:
+    """
+    运行多个搜索器的对比实验
+    
+    Args:
+        model_name: 模型名称
+        searcher_types: 要对比的搜索器类型列表
+        num_trials: 每个搜索器的试验次数
+        
+    Returns:
+        所有搜索器的结果字典
+    """
+    print(f"\n=== Running Comparison Experiment on {model_name} ===")
+    print(f"Searchers: {searcher_types}")
+    print(f"Trials per searcher: {num_trials}\n")
+    
+    all_results = {}
+    
+    for searcher_type in searcher_types:
+        print(f"\n{'='*60}")
+        print(f"Running {searcher_type.upper()}")
+        print(f"{'='*60}")
+        
+        try:
+            results = run_experiment(
+                model_name=model_name,
+                searcher_type=searcher_type,
+                num_trials=num_trials
+            )
+            all_results[searcher_type] = results
+            
+        except Exception as e:
+            print(f"Error running {searcher_type}: {e}")
+            all_results[searcher_type] = {'error': str(e)}
+    
+    # 输出对比总结
+    print(f"\n{'='*60}")
+    print("COMPARISON SUMMARY")
+    print(f"{'='*60}")
+    
+    for searcher_type, results in all_results.items():
+        if 'error' not in results:
+            print(f"{searcher_type.upper():15s}: "
+                  f"Best EDP = {results['best_metrics']['edp']:.2e}, "
+                  f"Best Loss = {results['best_loss']:.4f}")
+        else:
+            print(f"{searcher_type.upper():15s}: ERROR - {results['error']}")
+    
+    return all_results
+
+if __name__ == "__main__":
+    # 示例1: 运行单个搜索器实验
+    print("=== Single Searcher Experiment ===")
+    
+    # FA-DOSA实验 - 轻量级测试配置
+    fa_dosa_results = run_experiment(
+        model_name="resnet18",
+        searcher_type="fa-dosa",
+        num_trials=50,  # 减少总评估次数以加快测试
+        num_outer_steps=2,  # 减少外层步数
+        num_mapping_steps=5,  # 减少映射优化步数
+        num_hardware_steps=5  # 减少硬件优化步数
+    )
+    
+    # 随机搜索实验 - 轻量级测试配置
+    random_results = run_experiment(
+        model_name="resnet18",
+        searcher_type="random_search",
+        num_trials=50  # 减少试验次数以加快测试
+    )
+    
+    # 示例2: 运行对比实验 - 轻量级测试配置
+    print("\n=== Comparison Experiment ===")
+    comparison_results = run_comparison_experiment(
+        model_name="resnet18",
+        searcher_types=["fa-dosa", "random_search"],
+        num_trials=20  # 进一步减少试验次数以加快测试
+    )
+    
+    # 示例3: 其他模型的实验（注释掉，可根据需要启用）
+    # run_experiment(model_name="bert_base", searcher_type="fa-dosa", num_trials=200)
+    # run_experiment(model_name="unet", searcher_type="random_search", num_trials=300)
+    
+    print("\n=== All Experiments Completed ===")

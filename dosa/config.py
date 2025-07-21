@@ -39,6 +39,10 @@ class Config:
         self.AREA_BASE_MM2 = 1.0
         self.PENALTY_WEIGHT = 1e3
         self.MISMATCH_PENALTY_WEIGHT = 1.0
+        
+        # 损失策略配置
+        self.LOSS_STRATEGY = 'log_edp_plus_area'  # 可选: 'log_edp_plus_area', 'edp_plus_area'
+        self.AREA_WEIGHT = 1e-3  # 面积权重
 
     @staticmethod
     def get_instance():
