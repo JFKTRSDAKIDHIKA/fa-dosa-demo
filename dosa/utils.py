@@ -65,12 +65,22 @@ def calculate_macs(dims):
     return dims.get('N', 1) * dims.get('C', 1) * dims.get('K', 1) * dims.get('P', 1) * dims.get('Q', 1) * dims.get('R', 1) * dims.get('S', 1)
 
 def save_configuration_to_json(hw_params, projected_mapping, fusion_decisions, file_path="final_configuration.json"):
+    # Helper function to convert tensors to native Python types
+    def to_native_types(data):
+        if isinstance(data, dict):
+            return {k: to_native_types(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [to_native_types(i) for i in data]
+        if isinstance(data, torch.Tensor):
+            return data.item() if data.numel() == 1 else data.tolist()
+        return data
+    
     config_dict = {
         "num_pes": hw_params.get_projected_num_pes().item(),
         "l0_size_kb": hw_params.get_buffer_size_kb('L0_Registers').item(),
         "l1_size_kb": hw_params.get_buffer_size_kb('L1_Accumulator').item(),
         "l2_size_kb": hw_params.get_buffer_size_kb('L2_Scratchpad').item(),
-        "mapping": projected_mapping,
+        "mapping": to_native_types(projected_mapping),
         "fusion_strategy": fusion_decisions
     }
     with open(file_path, 'w') as f:

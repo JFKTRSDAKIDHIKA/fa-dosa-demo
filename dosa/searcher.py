@@ -330,7 +330,13 @@ class FADOSASearcher(BaseSearcher):
         Returns:
             最佳结果字典
         """
+        import os
+        from .utils import save_configuration_to_json
+        
         print(f"Starting FA-DOSA search with {self.num_outer_steps} outer steps...")
+        
+        # 确保output目录存在
+        os.makedirs('output', exist_ok=True)
         
         trial_count = 0
         
@@ -383,7 +389,16 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 更新最佳结果
                 trial_count += 1
+                old_best_loss = self.best_loss
                 self.update_best_result(loss.item(), current_params, metrics, trial_count)
+                
+                # 质量驱动的触发：当找到新的全局最优解时保存配置
+                if loss.item() < old_best_loss:
+                    self._save_validation_config(trial_count, "quality_driven")
+                
+                # 多样性驱动的触发：周期性保存配置
+                if i % 50 == 0:
+                    self._save_validation_config(trial_count, "diversity_driven")
                 
                 # 记录日志
                 if i % 10 == 0:
@@ -429,7 +444,16 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 更新最佳结果
                 trial_count += 1
+                old_best_loss = self.best_loss
                 self.update_best_result(loss.item(), current_params, metrics, trial_count)
+                
+                # 质量驱动的触发：当找到新的全局最优解时保存配置
+                if loss.item() < old_best_loss:
+                    self._save_validation_config(trial_count, "quality_driven")
+                
+                # 多样性驱动的触发：周期性保存配置
+                if i % 50 == 0:
+                    self._save_validation_config(trial_count, "diversity_driven")
                 
                 # 记录日志
                 if i % 10 == 0:
@@ -442,6 +466,39 @@ class FADOSASearcher(BaseSearcher):
             'best_metrics': self.best_metrics,
             'total_trials': trial_count
         }
+    
+    def _save_validation_config(self, trial_count: int, trigger_type: str):
+        """
+        保存当前配置到验证数据集
+        
+        Args:
+            trial_count: 当前试验次数
+            trigger_type: 触发类型（"quality_driven" 或 "diversity_driven"）
+        """
+        from .utils import save_configuration_to_json
+        
+        try:
+            # 获取当前完整的映射信息
+            projected_mapping = self.mapping.get_all_factors()
+            
+            # 获取融合决策
+            fusion_decisions = self.fusion_params.get_fusion_decisions_serializable(self.graph)
+            
+            # 生成文件路径
+            file_path = f"output/validation_config_trial_{trial_count}.json"
+            
+            # 保存配置
+            save_configuration_to_json(
+                hw_params=self.hw_params,
+                projected_mapping=projected_mapping,
+                fusion_decisions=fusion_decisions,
+                file_path=file_path
+            )
+            
+            print(f"[{trigger_type}] Saved validation config: {file_path}")
+            
+        except Exception as e:
+            print(f"Warning: Failed to save validation config at trial {trial_count}: {e}")
 
 
 class RandomSearcher(BaseSearcher):

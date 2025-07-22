@@ -197,14 +197,14 @@ class HighFidelityPerformanceModel(nn.Module):
         return total_latency, total_energy, area_cost, total_buffer_mismatch_loss
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
-        total_buffer_bytes = torch.tensor(0.0)
+        total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
         level_name = self.config.MEMORY_HIERARCHY[level_idx]['name']
 
         for tensor_type, tensor_dims in TENSOR_DIM_MAP.items():
             tile_dims = {}
             for dim_name in tensor_dims:
                 if dim_name in dims:
-                    tile_dims[dim_name] = torch.tensor(1.0)
+                    tile_dims[dim_name] = torch.tensor(1.0, device=self.config.DEVICE)
                     for i in range(level_idx + 1):
                         inner_level_name = self.config.MEMORY_HIERARCHY[i]['name']
                         if inner_level_name in factors[dim_name]:
@@ -212,7 +212,7 @@ class HighFidelityPerformanceModel(nn.Module):
                                 factors[dim_name][inner_level_name]['temporal'].squeeze() * \
                                 factors[dim_name][inner_level_name]['spatial'].squeeze()
             
-            tensor_tile_size = reduce(mul, [tile_dims.get(d, torch.tensor(1.0)) for d in tensor_dims if d in dims], torch.tensor(1.0))
+            tensor_tile_size = reduce(mul, [tile_dims.get(d, torch.tensor(1.0, device=self.config.DEVICE)) for d in tensor_dims if d in dims], torch.tensor(1.0, device=self.config.DEVICE))
             total_buffer_bytes += tensor_tile_size * self.config.BYTES_PER_ELEMENT
 
         return total_buffer_bytes / 1024.0

@@ -2,3 +2,10 @@
 *.json
 *.jsonl
 *.png
+*.yaml
+*.log
+*.txt
+*.csv
+*.cpp
+*.xml
+*.pyc
