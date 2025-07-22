@@ -23,9 +23,9 @@ class Config:
         ]
         
         # 能量模型（单位：pJ）
-        self.PE_MAC_EPA_PJ = 0.561 * 1e6
+        self.PE_MAC_EPA_PJ = 12.68 
         # 单位能耗（pJ/access）
-        self.L0_REG_BASE_EPA_PJ = 0.487 * 1e6
+        self.L0_REG_BASE_EPA_PJ = 0.009
         self.L1_ACCUM_BASE_EPA_PJ = 1.94 * 1e6
         self.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB = 0.1005 * 1e6
         self.L2_SPM_BASE_EPA_PJ = 0.49 * 1e6
