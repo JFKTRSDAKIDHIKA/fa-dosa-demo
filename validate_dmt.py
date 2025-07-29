@@ -305,7 +305,7 @@ def generate_timeloop_files(config, work_dir):
     # --- 4. Generate env.yaml ---
     env_config = {
         'globals': {'environment_variables': {
-            'ACCELERGY_COMPONENT_LIBRARIES': '/root/fa-dosa/accelergy-timeloop-infrastructure/src/accelergy-library-plug-in/library/'
+            'ACCELERGY_COMPONENT_LIBRARIES': '/root/accelergy-timeloop-infrastructure/src/accelergy-library-plug-in/library/'
         }},
         'variables': {'global_cycle_seconds': 1e-9, 'technology': "40nm"}
     }
@@ -353,8 +353,12 @@ def get_timeloop_simulation(config):
         if stats and hasattr(stats, 'cycles') and hasattr(stats, 'energy'):
             simulated_latency = float(stats.cycles)
             simulated_energy = float(stats.energy)
+            print(f"[INFO] Successfully extracted metrics: cycles={simulated_latency}, energy={simulated_energy}")
         else:
             print("[ERROR] Failed to extract performance metrics from Timeloop results.")
+            print(f"[DEBUG] stats object: {stats}")
+            if stats:
+                print(f"[DEBUG] stats attributes: {dir(stats)}")
             return -1.0, -1.0
         
         # Clean up only on success

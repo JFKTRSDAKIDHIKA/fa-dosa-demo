@@ -6,6 +6,10 @@ import pandas as pd
 import random
 from dosa.utils import get_divisors
 
+# Set up environment variables for Timeloop
+os.environ['PATH'] = os.environ.get('PATH', '') + ':/root/accelergy-timeloop-infrastructure/src/timeloop/bin:/root/accelergy-timeloop-infrastructure/src/timeloop/build'
+os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + ':/root/accelergy-timeloop-infrastructure/src/timeloop/lib:/root/accelergy-timeloop-infrastructure/src/timeloop/build'
+
 # --- Define Search Spaces ---
 
 # 1. Fused Groups to be tested (example from ResNet-18)
@@ -281,8 +285,20 @@ def main():
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             print(f"[ERROR] Failed to validate config {i+1}: {e}")
-            if hasattr(e, 'stderr'):
+            if hasattr(e, 'stderr') and e.stderr:
                 print(f"[STDERR]:\n{e.stderr}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(f"[STDOUT]:\n{e.stdout}")
+            # Add a fallback result with -1 values to continue processing
+            flat_result = {
+                **config['fusion_group_info'],
+                **config['hardware_config'],
+                "predicted_latency": -1.0,
+                "simulated_latency": -1.0,
+                "predicted_energy": -1.0,
+                "simulated_energy": -1.0,
+            }
+            all_results.append(flat_result)
 
     # 3. Save results to CSV
     if all_results:
