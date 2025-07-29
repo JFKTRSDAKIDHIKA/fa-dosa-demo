@@ -62,7 +62,9 @@ class FusionParameters(nn.Module):
         return fusion_decisions
 
 def calculate_macs(dims):
-    return dims.get('N', 1) * dims.get('C', 1) * dims.get('K', 1) * dims.get('P', 1) * dims.get('Q', 1) * dims.get('R', 1) * dims.get('S', 1)
+    output_elements = dims.get('N', 1) * dims.get('K', 1) * dims.get('P', 1) * dims.get('Q', 1)
+    ops_per_element = dims.get('C', 1) * dims.get('R', 1) * dims.get('S', 1)
+    return output_elements * ops_per_element
 
 def save_configuration_to_json(hw_params, projected_mapping, fusion_decisions, file_path="final_configuration.json"):
     # Helper function to convert tensors to native Python types

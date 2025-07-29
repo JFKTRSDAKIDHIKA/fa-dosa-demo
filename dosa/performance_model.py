@@ -130,7 +130,8 @@ class HighFidelityPerformanceModel(nn.Module):
                 # Fallback to original logic for single layers or unsupported patterns
                 layer_name = group[0]
                 layer = graph.layers[layer_name]
-                macs = reduce(mul, layer['dims'].values(), 1)
+                from dosa.utils import calculate_macs # 确保导入
+                macs = calculate_macs(layer['dims'])
                 
                 num_pes = hw_params.get_projected_num_pes()
                 compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)

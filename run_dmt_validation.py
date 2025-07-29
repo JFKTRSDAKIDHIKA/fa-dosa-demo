@@ -4,6 +4,7 @@ import os
 import itertools
 import pandas as pd
 import random
+import argparse
 from dosa.utils import get_divisors
 
 # Set up environment variables for Timeloop
@@ -11,6 +12,9 @@ os.environ['PATH'] = os.environ.get('PATH', '') + ':/root/accelergy-timeloop-inf
 os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + ':/root/accelergy-timeloop-infrastructure/src/timeloop/lib:/root/accelergy-timeloop-infrastructure/src/timeloop/build'
 
 # --- Define Search Spaces ---
+
+# Configuration for number of validation runs
+MAX_VALIDATION_RUNS = None  # Set to None for full sweep, or specify a number (e.g., 1, 2, 4) for quick testing
 
 # 1. Fused Groups to be tested (example from ResNet-18)
 FUSION_GROUPS_TO_TEST = [
@@ -223,13 +227,30 @@ def generate_configurations():
 
 def main():
     """Main control script to run DMT validation experiments."""
-    output_csv_path = "dmt_validation_results.csv"
+    parser = argparse.ArgumentParser(description="Run DMT validation experiments")
+    parser.add_argument('--max-runs', type=int, default=MAX_VALIDATION_RUNS,
+                       help='Maximum number of validation runs (default: None for full sweep)')
+    parser.add_argument('--output', type=str, default="dmt_validation_results.csv",
+                       help='Output CSV file path (default: dmt_validation_results.csv)')
+    args = parser.parse_args()
+    
+    output_csv_path = args.output
     temp_config_path = "temp_config.json"
     all_results = []
+    max_runs = args.max_runs
 
     print("Starting DMT validation run...")
+    if max_runs is not None:
+        print(f"[INFO] Limited to {max_runs} validation runs for quick testing")
+    else:
+        print("[INFO] Running full validation sweep")
 
     for i, config in enumerate(generate_configurations()):
+        # Check if we've reached the maximum number of runs
+        if max_runs is not None and i >= max_runs:
+            print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
+            break
+            
         print(f"--- Running Validation Point {i+1} ---")
         
         # 1. Write the temporary config file
