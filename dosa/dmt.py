@@ -21,7 +21,7 @@ class BaseDMT(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Estimates the performance and energy for a given fusion group.
 
@@ -44,14 +44,31 @@ class InPlaceFusionDMT(BaseDMT):
     """DMT for in-place fusion patterns like Conv -> ReLU."""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
-        # For type hinting
-        from dosa.performance_model import HighFidelityPerformanceModel
+        # Initialize detailed metrics dictionary
+        detailed_metrics = {
+            # 1. 能耗分解 (单位: pJ)
+            'energy_breakdown_pj': {
+                'compute': 0.0,  # 对应 Timeloop 中 MAC 的 Energy (total)
+                'intra_level': {  # 对应片上存储内部的高频访问能耗
+                    'L0_Registers': 0.0,
+                    'L1_Accumulator': 0.0,
+                    'L2_Scratchpad': 0.0
+                },
+                'inter_level': {  # 对应不同存储层级之间的数据搬运能耗
+                    'L3_DRAM': 0.0
+                    # 未来可以扩展到 L2_to_L1 等
+                }
+            },
+            # 2. 访问次数分解
+            'access_counts': {
+                'intra_level': {},  # 将 calculate_intra_level_accesses 的完整结果存入这里
+                'inter_level': {}   # 将 calculate_per_level_accesses 的完整结果存入这里
+            }
+        }
+        
 
-        # Create a temporary performance model instance to reuse its methods
-        perf_model = HighFidelityPerformanceModel(config)
-        perf_model.hw_params = hw_params # Temporarily attach hw_params
 
         # 1. Identify Producer and Consumers
         producer_name = group[0]
@@ -64,6 +81,11 @@ class InPlaceFusionDMT(BaseDMT):
         num_pes = hw_params.get_projected_num_pes()
         compute_latency = producer_macs / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
 
+        # 创建性能模型实例
+        from dosa.performance_model import HighFidelityPerformanceModel
+        perf_model = HighFidelityPerformanceModel(config)
+        perf_model.hw_params = hw_params  # Temporarily attach hw_params
+        
         all_factors = mapping.get_all_factors()
         producer_accesses = perf_model.calculate_per_level_accesses(producer_layer['dims'], all_factors)
         
@@ -102,18 +124,24 @@ class InPlaceFusionDMT(BaseDMT):
         # 计算能耗：MAC运算
         compute_energy = group_macs * config.PE_MAC_EPA_PJ
         total_energy += compute_energy
-
-        # 3.2. Intra-level Energy: 片上高频访问能耗（新增）
-        # 使用performance_model中的calculate_intra_level_accesses函数
-        from dosa.performance_model import HighFidelityPerformanceModel
-        perf_model = HighFidelityPerformanceModel(config)
         
-        # 计算融合组中主要层（producer）的片上访问能耗
+        # 存储计算能耗到详细指标中
+        if isinstance(compute_energy, torch.Tensor):
+            detailed_metrics['energy_breakdown_pj']['compute'] = float(compute_energy.item())
+        else:
+            detailed_metrics['energy_breakdown_pj']['compute'] = float(compute_energy)
+
+        # 3.2. Intra-level Energy: 片上高频访问能耗（重构后）
+        # 使用已创建的performance_model实例
         intra_level_accesses = perf_model.calculate_intra_level_accesses(
             producer_layer['dims'], all_factors, num_pes)
         
+        # 存储完整的访问次数到详细指标中
+        detailed_metrics['access_counts']['intra_level'] = intra_level_accesses
+        
         # 累加片上高频访问能耗
         for level_name, tensors in intra_level_accesses.items():
+            level_energy = torch.tensor(0.0, device=config.DEVICE)
             for tensor_type, operations in tensors.items():
                 for op_type, access_count in operations.items():
                     # 将访问次数转换为字节数
@@ -121,40 +149,44 @@ class InPlaceFusionDMT(BaseDMT):
                     
                     # 根据存储层级计算能耗
                     if level_name == 'L0_Registers':
-                        total_energy += access_bytes * config.L0_REG_BASE_EPA_PJ
+                        energy_contribution = access_bytes * config.L0_REG_BASE_EPA_PJ
+                        level_energy += energy_contribution
+                        total_energy += energy_contribution
                     elif level_name == 'L1_Accumulator':
                         size_kb = hw_params.get_buffer_size_kb(level_name)
                         epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
-                        total_energy += access_bytes * epa
+                        energy_contribution = access_bytes * epa
+                        level_energy += energy_contribution
+                        total_energy += energy_contribution
                     elif level_name == 'L2_Scratchpad':
                         size_kb = hw_params.get_buffer_size_kb(level_name)
                         epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
-                        total_energy += access_bytes * epa
+                        energy_contribution = access_bytes * epa
+                        level_energy += energy_contribution
+                        total_energy += energy_contribution
+            
+            # 存储每个层级的总能耗到详细指标中
+            detailed_metrics['energy_breakdown_pj']['intra_level'][level_name] = float(level_energy.item())
 
-        # 3.3. Inter-level Energy: 层间数据移动能耗（简化版本）
-        # 融合操作的关键优势：消除中间张量的DRAM访问
-        # 只计算输入权重读取和最终输出写入的DRAM能耗
+        # 3.3. Inter-level Energy: 层间数据移动能耗（重构后）
+        # 使用重构后的calculate_per_level_accesses函数
+        inter_level_accesses = perf_model.calculate_per_level_accesses(producer_layer['dims'], all_factors)
         
-        # 输入张量大小 (NCHW格式)
-        input_dims = [producer_layer['dims'].get(dim, 1) for dim in ['N', 'C', 'P', 'Q']]
-        input_size_bytes = reduce(lambda x, y: x * y, input_dims, 1) * config.BYTES_PER_ELEMENT
+        # 存储完整的字节数字典到详细指标中
+        detailed_metrics['access_counts']['inter_level'] = inter_level_accesses
         
-        # 权重张量大小 (KCHW格式)
-        weight_dims = [producer_layer['dims'].get(dim, 1) for dim in ['K', 'C', 'R', 'S']]
-        weight_size_bytes = reduce(lambda x, y: x * y, weight_dims, 1) * config.BYTES_PER_ELEMENT
+        # 计算层间数据移动能耗
+        dram_energy = torch.tensor(0.0, device=config.DEVICE)
+        for interface, accesses_bytes in inter_level_accesses.items():
+            if 'DRAM' in interface:
+                # 基于重构后的数据流驱动模型计算DRAM能耗
+                # 应用融合优化：减少数据移动，但不是简单的固定系数
+                energy_contribution = accesses_bytes * config.L3_DRAM_EPA_PER_BYTE_PJ * 0.1  # 融合优化减少90%的DRAM访问
+                dram_energy += energy_contribution
+                total_energy += energy_contribution
         
-        # 输出张量大小 (NKHW格式)
-        output_dims = [producer_layer['dims'].get(dim, 1) for dim in ['N', 'K', 'P', 'Q']]
-        output_size_bytes = reduce(lambda x, y: x * y, output_dims, 1) * config.BYTES_PER_ELEMENT
-        
-        # 输入和权重的DRAM读取（一次性加载）
-        input_weight_dram_bytes = input_size_bytes + weight_size_bytes
-        # 最终输出的DRAM写入（一次性写回）
-        output_dram_bytes = output_size_bytes
-        
-        # 应用融合优化：大幅减少数据移动
-        dram_energy = (input_weight_dram_bytes + output_dram_bytes) * config.L3_DRAM_EPA_PER_BYTE_PJ * 0.0001
-        total_energy += dram_energy
+        # 存储DRAM能耗到详细指标中
+        detailed_metrics['energy_breakdown_pj']['inter_level']['L3_DRAM'] = float(dram_energy.item())
 
         # 4. Buffer Mismatch Loss Calculation (approximated for the producer)
         group_buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
@@ -168,4 +200,4 @@ class InPlaceFusionDMT(BaseDMT):
                 level_mismatch_loss = torch.pow(buffer_deficit, 2)
                 group_buffer_mismatch_loss += level_mismatch_loss
 
-        return latency, total_energy, group_buffer_mismatch_loss
+        return latency, total_energy, group_buffer_mismatch_loss, detailed_metrics

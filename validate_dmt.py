@@ -46,6 +46,20 @@ yaml.add_representer(Container, represent_container)
 yaml.add_representer(Hierarchical, represent_hierarchical)
 
 
+def convert_tensors_to_native(obj):
+    """递归将PyTorch Tensor转换为Python原生数字类型。"""
+    if isinstance(obj, torch.Tensor):
+        return float(obj.item())
+    elif isinstance(obj, dict):
+        return {key: convert_tensors_to_native(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_tensors_to_native(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_tensors_to_native(item) for item in obj)
+    else:
+        return obj
+
+
 def get_dmt_prediction(config):
     """Calculates performance prediction using the DMT model.
     Returns prediction results with latency in seconds and energy in picojoules."""
@@ -99,7 +113,7 @@ def get_dmt_prediction(config):
     group = (producer_layer, consumer_layer)
     
     with torch.no_grad():
-        predicted_latency, predicted_energy, _ = dmt_model(
+        predicted_latency, predicted_energy, _, detailed_metrics = dmt_model(
             group, graph, hw_params, mapping, dosa_config
         )
 
@@ -107,8 +121,11 @@ def get_dmt_prediction(config):
     predicted_latency_s = predicted_latency.item()
     predicted_energy_pj = predicted_energy.item()
     
+    # 将detailed_metrics中的Tensor转换为Python原生数字类型
+    native_detailed_metrics = convert_tensors_to_native(detailed_metrics)
+    
     print(f"[INFO] DMT prediction complete: latency={predicted_latency_s} s, energy={predicted_energy_pj} pJ")
-    return predicted_latency_s, predicted_energy_pj
+    return predicted_latency_s, predicted_energy_pj, native_detailed_metrics
 
 
 def generate_timeloop_files(config, work_dir):
@@ -406,7 +423,7 @@ def main():
         config = json.load(f)
 
     # 获取预测值和仿真值，使用明确的变量名称
-    predicted_latency_s, predicted_energy_pj = get_dmt_prediction(config)
+    predicted_latency_s, predicted_energy_pj, detailed_metrics = get_dmt_prediction(config)
     simulated_latency_s, simulated_energy_pj = get_timeloop_simulation(config)
 
     # 更新结果字典结构，使键名能够清晰地反映物理单位
@@ -419,7 +436,8 @@ def main():
         "simulation": {
             "latency_s": simulated_latency_s, 
             "energy_pj": simulated_energy_pj
-        }
+        },
+        "detailed_prediction_metrics": detailed_metrics
     }
 
     print("\n---DMT_VALIDATION_RESULT_START---")

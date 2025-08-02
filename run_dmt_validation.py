@@ -293,6 +293,13 @@ def main():
             json_output = stdout_content[start_idx + len(start_marker):end_idx].strip()
             validation_data = json.loads(json_output)
             
+            # Save detailed JSON result to individual file
+            detailed_output_path = f"output/validation_result_{i+1}.json"
+            os.makedirs("output", exist_ok=True)
+            with open(detailed_output_path, 'w') as f:
+                json.dump(validation_data, f, indent=4)
+            print(f"[INFO] Detailed JSON result saved to {detailed_output_path}")
+            
             # Flatten the result for CSV logging
             flat_result = {
                 **config['fusion_group_info'],
