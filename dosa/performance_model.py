@@ -260,14 +260,14 @@ class HighFidelityPerformanceModel(nn.Module):
                         energy += accesses_4bytes * self.config.L0_REG_BASE_EPA_PJ
                     elif lower_level_name == 'L1_Accumulator':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
                         energy += accesses_4bytes * epa
                     elif lower_level_name == 'L2_Scratchpad':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
+                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
                         energy += accesses_4bytes * epa
                     elif lower_level_name == 'L3_DRAM':
-                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PER_BYTE_PJ
+                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
                 
                 # 3. Intra-level Energy (片上高频访问能耗)
                 intra_level_accesses = self.calculate_intra_level_accesses(layer['dims'], all_factors, num_pes)
@@ -283,11 +283,11 @@ class HighFidelityPerformanceModel(nn.Module):
                                 energy += access_bytes * self.config.L0_REG_BASE_EPA_PJ
                             elif level_name == 'L1_Accumulator':
                                 size_kb = hw_params.get_buffer_size_kb(level_name)
-                                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
                                 energy += access_bytes * epa
                             elif level_name == 'L2_Scratchpad':
                                 size_kb = hw_params.get_buffer_size_kb(level_name)
-                                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
+                                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
                                 energy += access_bytes * epa
 
                 # Calculate buffer mismatch loss for this layer

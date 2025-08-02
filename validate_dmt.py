@@ -376,7 +376,8 @@ def get_timeloop_simulation(config):
         if stats and hasattr(stats, 'cycles') and hasattr(stats, 'energy'):
             # 获取原始值并明确单位
             simulated_cycles = float(stats.cycles)
-            simulated_energy_pj = float(stats.energy)
+            simulated_energy_uj = float(stats.energy)
+            simulated_energy_pj = simulated_energy_uj * 1e6
             
             # 获取DosaConfig实例以访问时钟频率
             dosa_config = DosaConfig()
@@ -408,6 +409,7 @@ def get_timeloop_simulation(config):
 
     print("[INFO] Timeloop simulation complete.")
     return simulated_latency_s, simulated_energy_pj
+
 
 def main():
     """Main function to run the DMT validation.

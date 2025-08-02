@@ -154,13 +154,13 @@ class InPlaceFusionDMT(BaseDMT):
                         total_energy += energy_contribution
                     elif level_name == 'L1_Accumulator':
                         size_kb = hw_params.get_buffer_size_kb(level_name)
-                        epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
+                        epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
                         energy_contribution = access_bytes * epa
                         level_energy += energy_contribution
                         total_energy += energy_contribution
                     elif level_name == 'L2_Scratchpad':
                         size_kb = hw_params.get_buffer_size_kb(level_name)
-                        epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
+                        epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
                         energy_contribution = access_bytes * epa
                         level_energy += energy_contribution
                         total_energy += energy_contribution
@@ -179,9 +179,11 @@ class InPlaceFusionDMT(BaseDMT):
         dram_energy = torch.tensor(0.0, device=config.DEVICE)
         for interface, accesses_bytes in inter_level_accesses.items():
             if 'DRAM' in interface:
-                # 基于重构后的数据流驱动模型计算DRAM能耗
-                # 应用融合优化：减少数据移动，但不是简单的固定系数
-                energy_contribution = accesses_bytes * config.L3_DRAM_EPA_PER_BYTE_PJ * 0.1  # 融合优化减少90%的DRAM访问
+                # [Refactor Note]: 移除了原有的 `* 0.1` 硬编码折扣因子。
+                # 该因子是为了模拟数据融合对DRAM访问的优化，但过于激进且缺乏理论依据。
+                # 未来的优化方向是：让 `calculate_per_level_accesses` 函数能够感知融合决策 (fusion decision)，
+                # 当融合发生时，自动不出帐 (account for) producer layer 的 Output 张量从 L2 到 DRAM 的写回流量。
+                energy_contribution = accesses_bytes * config.L3_DRAM_EPA_PJ
                 dram_energy += energy_contribution
                 total_energy += energy_contribution
         
