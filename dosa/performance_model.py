@@ -30,6 +30,88 @@ class HighFidelityPerformanceModel(nn.Module):
             # Add more patterns as needed
         }
 
+    def calculate_intra_level_accesses(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor) -> dict:
+        """
+        计算片上高频次数据访问（Intra-level access）的总标量访问次数。
+        这是由总计算量驱动的、针对各个张量在每个片上存储层级的访问次数。
+        """
+        from dosa.utils import calculate_macs
+        
+        # 1. 计算总MAC运算次数
+        total_macs = calculate_macs(layer_dims)
+        
+        # 2. 初始化返回字典
+        intra_accesses = {
+            "L0_Registers": {
+                "Input": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Weight": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Output": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE), "updates": torch.tensor(0.0, device=self.config.DEVICE)}
+            },
+            "L1_Accumulator": {
+                "Input": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Weight": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Output": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE), "updates": torch.tensor(0.0, device=self.config.DEVICE)}
+            },
+            "L2_Scratchpad": {
+                "Input": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Weight": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE)},
+                "Output": {"reads": torch.tensor(0.0, device=self.config.DEVICE), "writes": torch.tensor(0.0, device=self.config.DEVICE), "updates": torch.tensor(0.0, device=self.config.DEVICE)}
+            }
+        }
+        
+        # 3. L0_Registers (最内层) - 每次MAC都需要读取Input和Weight，更新Output
+        # 基本原则：每次MAC运算都伴随一次从最内层缓存读取Input和Weight
+        intra_accesses["L0_Registers"]["Input"]["reads"] = total_macs
+        intra_accesses["L0_Registers"]["Weight"]["reads"] = total_macs  
+        intra_accesses["L0_Registers"]["Output"]["updates"] = total_macs
+        
+        # 4. L1_Accumulator - 考虑空间复用和时间复用
+        # Weight在PE间的空间复用：如果一个Weight值被广播到多个PE，读取次数会减少
+        pe_mesh_size = torch.sqrt(num_pes)  # 假设PE阵列是方形的
+        
+        # 从mapping_table中获取空间分解因子
+        spatial_factors = {}
+        for dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
+            if dim_name in mapping_table and 'PE_array' in mapping_table[dim_name]:
+                spatial_factors[dim_name] = mapping_table[dim_name]['PE_array']['spatial'].get(dim_name, 1)
+            else:
+                spatial_factors[dim_name] = 1
+        
+        # L1层的访问次数考虑空间复用
+        # Weight的空间复用：在K和C维度上的空间分解会影响Weight的复用
+        weight_spatial_reuse = torch.tensor(spatial_factors.get('K', 1) * spatial_factors.get('C', 1), dtype=torch.float32, device=self.config.DEVICE)
+        weight_l1_reads = total_macs / torch.clamp(weight_spatial_reuse, min=torch.tensor(1.0, device=self.config.DEVICE))
+        
+        # Input的空间复用：在N、P、Q维度上的空间分解会影响Input的复用  
+        input_spatial_reuse = torch.tensor(spatial_factors.get('N', 1) * spatial_factors.get('P', 1) * spatial_factors.get('Q', 1), dtype=torch.float32, device=self.config.DEVICE)
+        input_l1_reads = total_macs / torch.clamp(input_spatial_reuse, min=torch.tensor(1.0, device=self.config.DEVICE))
+        
+        intra_accesses["L1_Accumulator"]["Input"]["reads"] = input_l1_reads
+        intra_accesses["L1_Accumulator"]["Weight"]["reads"] = weight_l1_reads
+        intra_accesses["L1_Accumulator"]["Output"]["updates"] = total_macs / torch.clamp(pe_mesh_size, min=torch.tensor(1.0, device=self.config.DEVICE))
+        
+        # 5. L2_Scratchpad - 更高层级的访问，考虑时间复用
+        # 4. 计算时间分解因子（用于L2访问估算）
+        temporal_factors = {}
+        for dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
+            total_temporal = torch.tensor(1.0, device=self.config.DEVICE)
+            if dim_name in mapping_table:
+                for level_name in ['L0_Registers', 'L1_Accumulator']:
+                    if level_name in mapping_table[dim_name]:
+                        temporal_val = mapping_table[dim_name][level_name].get('temporal', 1)
+                        total_temporal *= torch.tensor(temporal_val, device=self.config.DEVICE)
+            temporal_factors[dim_name] = total_temporal
+        
+        # L2层的访问次数基于tile大小和外层循环次数
+        # 简化计算：基于时间分解因子估算
+        l2_reduction_factor = torch.tensor(temporal_factors.get('R', 1) * temporal_factors.get('S', 1) * temporal_factors.get('C', 1), dtype=torch.float32, device=self.config.DEVICE)
+        
+        intra_accesses["L2_Scratchpad"]["Input"]["reads"] = total_macs / torch.clamp(l2_reduction_factor, min=torch.tensor(1.0, device=self.config.DEVICE))
+        intra_accesses["L2_Scratchpad"]["Weight"]["reads"] = total_macs / torch.clamp(l2_reduction_factor, min=torch.tensor(1.0, device=self.config.DEVICE))
+        intra_accesses["L2_Scratchpad"]["Output"]["updates"] = total_macs / torch.clamp(l2_reduction_factor * pe_mesh_size, min=torch.tensor(1.0, device=self.config.DEVICE))
+        
+        return intra_accesses
+
     def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict) -> dict:
         """
         Physically accurate model for data movement between memory levels.
@@ -97,7 +179,7 @@ class HighFidelityPerformanceModel(nn.Module):
                             if dim_name in mapping_table and level_name in mapping_table[dim_name]:
                                 reuse_factor *= mapping_table[dim_name][level_name]['temporal']
                 
-                refined_num_outer_iterations = num_outer_iterations / (reuse_factor + 1e-9)
+                refined_num_outer_iterations = num_outer_iterations / (reuse_factor + torch.tensor(1e-9, device=self.config.DEVICE))
 
                 # Step D: Calculate tensor_access_bytes
                 tensor_access_bytes = (data_footprint_elements_at_lower_level * 
@@ -134,7 +216,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 macs = calculate_macs(layer['dims'])
                 
                 num_pes = hw_params.get_projected_num_pes()
-                compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+                compute_latency = macs / (num_pes * self.config.CLOCK_FREQUENCY_MHZ * 1e6 + torch.tensor(1e-9, device=self.config.DEVICE))
                 
                 per_level_accesses = self.calculate_per_level_accesses(layer['dims'], all_factors)
                 memory_latencies = []
@@ -149,16 +231,20 @@ class HighFidelityPerformanceModel(nn.Module):
                     else: # L3_DRAM
                         bandwidth_gb_s = level_info['bandwidth_gb_s']
 
-                    memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
+                    memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + torch.tensor(1e-9, device=self.config.DEVICE)))
                 
                 if memory_latencies:
                     latency = torch.maximum(compute_latency, torch.max(torch.stack(memory_latencies)))
                 else:
                     latency = compute_latency
 
+                # 计算总能耗：compute_energy + inter_level_energy + intra_level_energy
                 energy = torch.tensor(0.0, device=self.config.DEVICE)
+                
+                # 1. Compute Energy (MAC运算能耗)
                 energy += macs * self.config.PE_MAC_EPA_PJ
                 
+                # 2. Inter-level Energy (层间数据移动能耗)
                 for interface, accesses_bytes in per_level_accesses.items():
                     lower_level_name = interface.split('_to_')[1]
                     accesses_4bytes = accesses_bytes / 4.0
@@ -167,14 +253,35 @@ class HighFidelityPerformanceModel(nn.Module):
                         energy += accesses_4bytes * self.config.L0_REG_BASE_EPA_PJ
                     elif lower_level_name == 'L1_Accumulator':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / num_pes_sqrt)
                         energy += accesses_4bytes * epa
                     elif lower_level_name == 'L2_Scratchpad':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
                         energy += accesses_4bytes * epa
                     elif lower_level_name == 'L3_DRAM':
-                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
+                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PER_BYTE_PJ
+                
+                # 3. Intra-level Energy (片上高频访问能耗)
+                intra_level_accesses = self.calculate_intra_level_accesses(layer['dims'], all_factors, num_pes)
+                
+                for level_name, tensors in intra_level_accesses.items():
+                    for tensor_type, operations in tensors.items():
+                        for op_type, access_count in operations.items():
+                            # 将访问次数转换为字节数
+                            access_bytes = access_count * self.config.BYTES_PER_ELEMENT
+                            
+                            # 根据存储层级计算能耗
+                            if level_name == 'L0_Registers':
+                                energy += access_bytes * self.config.L0_REG_BASE_EPA_PJ
+                            elif level_name == 'L1_Accumulator':
+                                size_kb = hw_params.get_buffer_size_kb(level_name)
+                                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                                energy += access_bytes * epa
+                            elif level_name == 'L2_Scratchpad':
+                                size_kb = hw_params.get_buffer_size_kb(level_name)
+                                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
+                                energy += access_bytes * epa
 
                 # Calculate buffer mismatch loss for this layer
                 for i, level in enumerate(self.config.MEMORY_HIERARCHY):

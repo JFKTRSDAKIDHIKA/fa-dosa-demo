@@ -297,10 +297,10 @@ def main():
             flat_result = {
                 **config['fusion_group_info'],
                 **config['hardware_config'],
-                "predicted_latency": validation_data['prediction']['latency'],
-                "simulated_latency": validation_data['simulation']['latency'],
-                "predicted_energy": validation_data['prediction']['energy'],
-                "simulated_energy": validation_data['simulation']['energy'],
+                "predicted_latency": validation_data['prediction']['latency_s'],
+                "simulated_latency": validation_data['simulation']['latency_s'],
+                "predicted_energy": validation_data['prediction']['energy_pj'],
+                "simulated_energy": validation_data['simulation']['energy_pj'],
             }
             all_results.append(flat_result)
 

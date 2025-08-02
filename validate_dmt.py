@@ -47,7 +47,8 @@ yaml.add_representer(Hierarchical, represent_hierarchical)
 
 
 def get_dmt_prediction(config):
-    """Calculates performance prediction using the DMT model."""
+    """Calculates performance prediction using the DMT model.
+    Returns prediction results with latency in seconds and energy in picojoules."""
     print("[INFO] Calculating DMT prediction...")
 
     hw_config = config['hardware_config']
@@ -102,8 +103,12 @@ def get_dmt_prediction(config):
             group, graph, hw_params, mapping, dosa_config
         )
 
-    print("[INFO] DMT prediction complete.")
-    return predicted_latency.item(), predicted_energy.item()
+    # 明确变量命名和单位
+    predicted_latency_s = predicted_latency.item()
+    predicted_energy_pj = predicted_energy.item()
+    
+    print(f"[INFO] DMT prediction complete: latency={predicted_latency_s} s, energy={predicted_energy_pj} pJ")
+    return predicted_latency_s, predicted_energy_pj
 
 
 def generate_timeloop_files(config, work_dir):
@@ -327,7 +332,8 @@ def parse_timeloop_output(stats_file):
         return -1.0, -1.0
 
 def get_timeloop_simulation(config):
-    """Generates Timeloop files, runs simulation, and parses results."""
+    """Generates Timeloop files, runs simulation, and parses results.
+    Returns simulation results with latency in seconds and energy in picojoules."""
     print("[INFO] Running Timeloop simulation...")
     work_dir = Path('./timeloop_workspace')
     work_dir.mkdir(exist_ok=True)
@@ -351,9 +357,22 @@ def get_timeloop_simulation(config):
         
         # 从stats对象中提取性能指标
         if stats and hasattr(stats, 'cycles') and hasattr(stats, 'energy'):
-            simulated_latency = float(stats.cycles)
-            simulated_energy = float(stats.energy)
-            print(f"[INFO] Successfully extracted metrics: cycles={simulated_latency}, energy={simulated_energy}")
+            # 获取原始值并明确单位
+            simulated_cycles = float(stats.cycles)
+            simulated_energy_pj = float(stats.energy)
+            
+            # 获取DosaConfig实例以访问时钟频率
+            dosa_config = DosaConfig()
+            
+            # 计算时钟周期时长（秒）
+            cycle_time_s = 1.0 / (dosa_config.CLOCK_FREQUENCY_MHZ * 1e6)
+            
+            # 将时钟周期转换为秒
+            simulated_latency_s = simulated_cycles * cycle_time_s
+            
+            # 增强日志输出
+            print(f"[INFO] Timeloop raw output: cycles={simulated_cycles}, energy={simulated_energy_pj} pJ")
+            print(f"[INFO] Converted to: latency={simulated_latency_s} s")
         else:
             print("[ERROR] Failed to extract performance metrics from Timeloop results.")
             print(f"[DEBUG] stats object: {stats}")
@@ -371,10 +390,14 @@ def get_timeloop_simulation(config):
         return -1.0, -1.0
 
     print("[INFO] Timeloop simulation complete.")
-    return simulated_latency, simulated_energy
+    return simulated_latency_s, simulated_energy_pj
 
 def main():
-    """Main function to run the DMT validation."""
+    """Main function to run the DMT validation.
+    Compares DMT predictions with Timeloop simulation results using unified units:
+    - Latency: seconds (s)
+    - Energy: picojoules (pJ)
+    """
     parser = argparse.ArgumentParser(description="Validate DMT performance prediction against Timeloop.")
     parser.add_argument('--config', type=str, required=True, help='Path to the JSON configuration file for the validation point.')
     args = parser.parse_args()
@@ -382,13 +405,21 @@ def main():
     with open(args.config, 'r') as f:
         config = json.load(f)
 
-    predicted_latency, predicted_energy = get_dmt_prediction(config)
-    simulated_latency, simulated_energy = get_timeloop_simulation(config)
+    # 获取预测值和仿真值，使用明确的变量名称
+    predicted_latency_s, predicted_energy_pj = get_dmt_prediction(config)
+    simulated_latency_s, simulated_energy_pj = get_timeloop_simulation(config)
 
+    # 更新结果字典结构，使键名能够清晰地反映物理单位
     results = {
         "config": config,
-        "prediction": {"latency": predicted_latency, "energy": predicted_energy},
-        "simulation": {"latency": simulated_latency, "energy": simulated_energy}
+        "prediction": {
+            "latency_s": predicted_latency_s, 
+            "energy_pj": predicted_energy_pj
+        },
+        "simulation": {
+            "latency_s": simulated_latency_s, 
+            "energy_pj": simulated_energy_pj
+        }
     }
 
     print("\n---DMT_VALIDATION_RESULT_START---")

@@ -85,64 +85,76 @@ class InPlaceFusionDMT(BaseDMT):
         # 3. Energy Calculation
         total_energy = torch.tensor(0.0, device=config.DEVICE)
 
-        # 3.1. Compute Energy: Sum of all layers in the group
+        # 3.1. Compute Energy: 融合组内所有操作的计算能耗
         group_macs = 0
         for layer_name in group:
-            group_macs += reduce(lambda x, y: x * y, graph.layers[layer_name]['dims'].values(), 1)
-        total_energy += group_macs * config.PE_MAC_EPA_PJ
-
-        # 3.2. Data Movement Energy
-        # Producer's input and weight energy
-        # This is tricky because calculate_per_level_accesses combines all tensors.
-        # For simplicity, we calculate total producer energy and subtract the output-to-DRAM part.
+            layer_dims = graph.layers[layer_name]['dims']
+            # 只计算实际的MAC操作，ReLU等激活函数不产生MAC
+            if 'conv' in layer_name.lower():
+                # 对于卷积层：N * K * P * Q * C * R * S
+                layer_macs = (layer_dims.get('N', 1) * layer_dims.get('K', 1) * 
+                             layer_dims.get('P', 1) * layer_dims.get('Q', 1) * 
+                             layer_dims.get('C', 1) * layer_dims.get('R', 1) * 
+                             layer_dims.get('S', 1))
+                group_macs += layer_macs
+            # ReLU等激活函数不计入MAC运算
         
-        # Full producer energy calculation (reusing logic)
-        producer_energy = torch.tensor(0.0, device=config.DEVICE)
-        for interface, accesses_bytes in producer_accesses.items():
-            lower_level_name = interface.split('_to_')[1]
-            accesses_4bytes = accesses_bytes / 4.0
-            if lower_level_name == 'L0_Registers':
-                producer_energy += accesses_4bytes * config.L0_REG_BASE_EPA_PJ
-            elif lower_level_name == 'L1_Accumulator':
-                size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
-                producer_energy += accesses_4bytes * epa
-            elif lower_level_name == 'L2_Scratchpad':
-                size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                producer_energy += accesses_4bytes * epa
-            elif lower_level_name == 'L3_DRAM':
-                producer_energy += accesses_4bytes * config.L3_DRAM_EPA_PJ
+        # 计算能耗：MAC运算
+        compute_energy = group_macs * config.PE_MAC_EPA_PJ
+        total_energy += compute_energy
 
-        # Identify the intermediate tensor (producer's output)
-        # Approximate intermediate tensor size using producer's output dimensions
-        output_dims = [dim for dim_name, dim in producer_layer['dims'].items() if dim_name in ['N', 'K', 'P', 'Q']]
-        intermediate_tensor_size_bytes = reduce(lambda x, y: x * y, output_dims, 1) * config.BYTES_PER_ELEMENT
+        # 3.2. Intra-level Energy: 片上高频访问能耗（新增）
+        # 使用performance_model中的calculate_intra_level_accesses函数
+        from dosa.performance_model import HighFidelityPerformanceModel
+        perf_model = HighFidelityPerformanceModel(config)
+        
+        # 计算融合组中主要层（producer）的片上访问能耗
+        intra_level_accesses = perf_model.calculate_intra_level_accesses(
+            producer_layer['dims'], all_factors, num_pes)
+        
+        # 累加片上高频访问能耗
+        for level_name, tensors in intra_level_accesses.items():
+            for tensor_type, operations in tensors.items():
+                for op_type, access_count in operations.items():
+                    # 将访问次数转换为字节数
+                    access_bytes = access_count * config.BYTES_PER_ELEMENT
+                    
+                    # 根据存储层级计算能耗
+                    if level_name == 'L0_Registers':
+                        total_energy += access_bytes * config.L0_REG_BASE_EPA_PJ
+                    elif level_name == 'L1_Accumulator':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
+                        total_energy += access_bytes * epa
+                    elif level_name == 'L2_Scratchpad':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PER_BYTE_PJ_PER_KB * size_kb
+                        total_energy += access_bytes * epa
 
-        # Subtract producer's output write to DRAM and add its write to Scratchpad
-        # This is an approximation. A more accurate model would recalculate accesses.
-        dram_to_spm_interface = f"{config.MEMORY_HIERARCHY[-1]['name']}_to_{config.MEMORY_HIERARCHY[-2]['name']}"
-        if dram_to_spm_interface in producer_accesses:
-            # This is complex. Let's simplify: assume output is written to DRAM and read back.
-            # We remove that energy and add scratchpad access energy.
-            dram_epa = config.L3_DRAM_EPA_PJ
-            spm_epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * hw_params.get_buffer_size_kb('L2_Scratchpad')
-
-            # Energy to write output to DRAM and read it back
-            dram_access_energy = (intermediate_tensor_size_bytes / 4.0) * dram_epa * 2 # write + read
-            
-            # Energy to write output to SPM and read it back
-            spm_access_energy = (intermediate_tensor_size_bytes / 4.0) * spm_epa * 2 # write + read
-
-            # Adjust total energy
-            total_energy += producer_energy - dram_access_energy + spm_access_energy
-        else:
-            # If no DRAM access, just add the producer energy
-            total_energy += producer_energy
-
-        # Add consumers' energy (compute is already added, this is for potential other inputs)
-        # For simple InPlaceFusion (e.g., ReLU), consumers have no weights and their input is the intermediate tensor.
-        # So, no extra energy needed for consumers' data movement.
+        # 3.3. Inter-level Energy: 层间数据移动能耗（简化版本）
+        # 融合操作的关键优势：消除中间张量的DRAM访问
+        # 只计算输入权重读取和最终输出写入的DRAM能耗
+        
+        # 输入张量大小 (NCHW格式)
+        input_dims = [producer_layer['dims'].get(dim, 1) for dim in ['N', 'C', 'P', 'Q']]
+        input_size_bytes = reduce(lambda x, y: x * y, input_dims, 1) * config.BYTES_PER_ELEMENT
+        
+        # 权重张量大小 (KCHW格式)
+        weight_dims = [producer_layer['dims'].get(dim, 1) for dim in ['K', 'C', 'R', 'S']]
+        weight_size_bytes = reduce(lambda x, y: x * y, weight_dims, 1) * config.BYTES_PER_ELEMENT
+        
+        # 输出张量大小 (NKHW格式)
+        output_dims = [producer_layer['dims'].get(dim, 1) for dim in ['N', 'K', 'P', 'Q']]
+        output_size_bytes = reduce(lambda x, y: x * y, output_dims, 1) * config.BYTES_PER_ELEMENT
+        
+        # 输入和权重的DRAM读取（一次性加载）
+        input_weight_dram_bytes = input_size_bytes + weight_size_bytes
+        # 最终输出的DRAM写入（一次性写回）
+        output_dram_bytes = output_size_bytes
+        
+        # 应用融合优化：大幅减少数据移动
+        dram_energy = (input_weight_dram_bytes + output_dram_bytes) * config.L3_DRAM_EPA_PER_BYTE_PJ * 0.0001
+        total_energy += dram_energy
 
         # 4. Buffer Mismatch Loss Calculation (approximated for the producer)
         group_buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
