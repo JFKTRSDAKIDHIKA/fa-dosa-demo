@@ -46,20 +46,25 @@ class InPlaceFusionDMT(BaseDMT):
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
                 mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
-        # Initialize detailed metrics dictionary
+        # Initialize detailed metrics dictionary - 精确复现DOSA源码结构
         detailed_metrics = {
-            # 1. 能耗分解 (单位: pJ) - 重构后符合DOSA论文Equation 13
+            # 1. 能耗分解 (单位: pJ) - 三段式能量模型
             'energy_breakdown_pj': {
-                'compute': 0.0,  # 对应 Timeloop 中 MAC 的 Energy (total)
-                'memory_access': {  # 对应各存储层级的访存能耗
+                'compute': 0.0,  # 计算能耗
+                'intra_level': {  # 层内能耗 (L0, L1, L2)
                     'L0_Registers': 0.0,
                     'L1_Accumulator': 0.0,
-                    'L2_Scratchpad': 0.0,
+                    'L2_Scratchpad': 0.0
+                },
+                'inter_level': {  # 层间能耗 (仅DRAM)
                     'L3_DRAM': 0.0
                 }
             },
             # 2. 访问次数分解
-            'access_counts': {}  # 将 calculate_intra_level_accesses 的完整结果存入这里
+            'access_counts': {
+                'intra_level': {},  # calculate_intra_level_accesses 结果
+                'inter_level': {}   # calculate_per_level_accesses 结果
+            }
         }
         
 
@@ -115,8 +120,8 @@ class InPlaceFusionDMT(BaseDMT):
                 group_macs += layer_macs
             # ReLU等激活函数不计入MAC运算
         
-        # 计算能耗：MAC运算 (大幅降低以匹配仿真结果)
-        compute_energy = group_macs * config.PE_MAC_EPA_PJ * 0.00001  # 大幅缩放因子
+        # 计算能耗：MAC运算 - 精确复现DOSA源码
+        compute_energy = group_macs * config.PE_MAC_EPA_PJ
         total_energy += compute_energy
         
         # 存储计算能耗到详细指标中
@@ -125,52 +130,50 @@ class InPlaceFusionDMT(BaseDMT):
         else:
             detailed_metrics['energy_breakdown_pj']['compute'] = float(compute_energy)
 
-        # 3.2. Memory Access Energy: 基于DOSA论文Equation 13的正确能量模型
-        # 获取总访问次数 - 这是正确的访问统计，不应用于重复计算能耗
+        # 3.2. 层内能耗 (Intra-level Energy) - 精确复现dosa源码实现
+        # 调用 calculate_intra_level_accesses 来获取包含L0高估访问在内的次数
         intra_level_accesses = perf_model.calculate_intra_level_accesses(
             producer_layer['dims'], all_factors, num_pes)
         
-        # 存储完整的访问次数到详细指标中
-        detailed_metrics['access_counts'] = intra_level_accesses
+        # 将访问次数详情存入metrics
+        detailed_metrics['access_counts']['intra_level'] = convert_tensors_to_native(intra_level_accesses)
         
-        # 计算片上存储能耗 (On-Chip Memory Energy)
+        # 累加L0, L1, L2的层内能耗
         for level_name, tensors in intra_level_accesses.items():
-            # 计算当前层级的总访问次数
-            total_accesses_at_level = 0
+            level_energy = torch.tensor(0.0, device=config.DEVICE)
             for tensor_type, operations in tensors.items():
                 for op_type, access_count in operations.items():
-                    total_accesses_at_level += access_count
+                    access_bytes = access_count * config.BYTES_PER_ELEMENT
+                    
+                    energy_contribution = torch.tensor(0.0, device=config.DEVICE)
+                    if level_name == 'L0_Registers':
+                        energy_contribution = access_bytes * config.L0_REG_BASE_EPA_PJ
+                    elif level_name == 'L1_Accumulator':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
+                        energy_contribution = access_bytes * epa
+                    elif level_name == 'L2_Scratchpad':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+                        energy_contribution = access_bytes * epa
+                    
+                    level_energy += energy_contribution
+                    total_energy += energy_contribution
             
-            # 根据level_name获取对应的EPA (单位: pJ per access)
-            # 大幅降低EPA参数以匹配Timeloop仿真结果
-            if level_name == 'L0_Registers':
-                # L0寄存器的EPA应该很小，因为是最靠近PE的存储
-                epa = config.L0_REG_BASE_EPA_PJ * 0.00001  # 大幅缩放因子
-            elif level_name == 'L1_Accumulator':
-                size_kb = hw_params.get_buffer_size_kb(level_name)
-                base_epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
-                epa = base_epa * 0.0001  # 大幅缩放因子
-            elif level_name == 'L2_Scratchpad':
-                size_kb = hw_params.get_buffer_size_kb(level_name)
-                base_epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                epa = base_epa * 0.0001  # 大幅缩放因子
-            else:
-                continue  # 跳过未知的存储层级
-            
-            # 计算当前层级的总能耗: Accesses(i) × EPA(i)
-            level_energy = total_accesses_at_level * epa
-            detailed_metrics['energy_breakdown_pj']['memory_access'][level_name] = float(level_energy.item())
-            total_energy += level_energy
+            detailed_metrics['energy_breakdown_pj']['intra_level'][level_name] = float(level_energy.item())
         
-        # 计算DRAM能耗 - 使用producer_accesses (已在延迟计算部分获得)
-        if "L3_DRAM_to_L2_Scratchpad" in producer_accesses:
-            dram_access_bytes = producer_accesses["L3_DRAM_to_L2_Scratchpad"]
-            dram_access_count = dram_access_bytes / config.BYTES_PER_ELEMENT
-            dram_energy = dram_access_count * config.L3_DRAM_EPA_PJ
-            detailed_metrics['energy_breakdown_pj']['memory_access']['L3_DRAM'] = float(dram_energy.item())
-            total_energy += dram_energy
-        else:
-            detailed_metrics['energy_breakdown_pj']['memory_access']['L3_DRAM'] = 0.0
+        # 3.3. 层间能耗 (Inter-level Energy) - 只计算DRAM部分
+        inter_level_accesses = producer_accesses
+        detailed_metrics['access_counts']['inter_level'] = {k: v.item() for k, v in inter_level_accesses.items()}
+        
+        dram_energy = torch.tensor(0.0, device=config.DEVICE)
+        for interface, accesses_bytes in inter_level_accesses.items():
+            if 'DRAM' in interface:
+                energy_contribution = (accesses_bytes / config.BYTES_PER_ELEMENT) * config.L3_DRAM_EPA_PJ
+                dram_energy += energy_contribution
+                total_energy += energy_contribution
+        
+        detailed_metrics['energy_breakdown_pj']['inter_level']['L3_DRAM'] = float(dram_energy.item())
 
         # 4. Buffer Mismatch Loss Calculation (approximated for the producer)
         group_buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
@@ -185,3 +188,17 @@ class InPlaceFusionDMT(BaseDMT):
                 group_buffer_mismatch_loss += level_mismatch_loss
 
         return latency, total_energy, group_buffer_mismatch_loss, detailed_metrics
+
+
+def convert_tensors_to_native(obj):
+    """将Tensor对象转换为Python原生数据类型，确保detailed_metrics可以被正确处理。"""
+    if isinstance(obj, torch.Tensor):
+        return float(obj.item())
+    elif isinstance(obj, dict):
+        return {k: convert_tensors_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_tensors_to_native(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_tensors_to_native(item) for item in obj)
+    else:
+        return obj
