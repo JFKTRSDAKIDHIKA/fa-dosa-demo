@@ -706,13 +706,21 @@ def main():
             
             # 数据追加
             all_results.append(combined_result)
-            print(f"[SUCCESS] Validation point {i+1} completed")
+
+            # 增量写入CSV文件
+            df = pd.DataFrame([combined_result])
+            if i == 0:
+                # 第一次写入，包含表头
+                df.to_csv(args.output, index=False, mode='w')
+            else:
+                # 后续写入，追加模式，不包含表头
+                df.to_csv(args.output, index=False, mode='a', header=False)
+            
+            print(f"[SUCCESS] Validation point {i+1} completed and saved to {args.output}")
 
         # 结果持久化
         if all_results:
-            df = pd.DataFrame(all_results)
-            df.to_csv(output_csv_path, index=False)
-            print(f"\nValidation complete. {len(all_results)} data points saved to {output_csv_path}")
+            print(f"\nValidation complete. {len(all_results)} data points saved to {args.output}")
         else:
             print("\nValidation run finished, but no results were collected.")
             
