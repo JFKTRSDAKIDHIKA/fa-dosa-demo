@@ -80,7 +80,7 @@ class BaseSearcher(ABC):
         self._set_params_from_dict(params_dict)
         
         # 调用性能模型
-        latency, energy, area, mismatch_loss = self.perf_model(
+        latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
             self.graph, self.hw_params, self.mapping
         )
         
@@ -88,7 +88,7 @@ class BaseSearcher(ABC):
         pe_square_penalty = self.hw_params.get_pe_square_penalty()
         
         # 使用统一的损失计算方法
-        loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
+        loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
         
         # 构建性能指标字典
         metrics = {
@@ -103,7 +103,7 @@ class BaseSearcher(ABC):
         
         return loss.item(), metrics
     
-    def _compute_loss(self, latency, energy, area, mismatch_loss, pe_square_penalty):
+    def _compute_loss(self, latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty):
         """
         计算总损失 - 完整复现原始run.py中的损失计算逻辑
         
@@ -113,6 +113,7 @@ class BaseSearcher(ABC):
             area: 面积张量
             mismatch_loss: 不匹配损失张量
             pe_square_penalty: PE平方惩罚张量
+            compatibility_penalty: 兼容性惩罚张量
             
         Returns:
             总损失张量
@@ -123,6 +124,11 @@ class BaseSearcher(ABC):
         area = area.squeeze() if area.dim() > 0 else area
         mismatch_loss = mismatch_loss.squeeze() if mismatch_loss.dim() > 0 else mismatch_loss
         pe_square_penalty = pe_square_penalty.squeeze() if pe_square_penalty.dim() > 0 else pe_square_penalty
+        compatibility_penalty = compatibility_penalty.squeeze() if compatibility_penalty.dim() > 0 else compatibility_penalty
+        
+        # 获取兼容性惩罚权重
+        comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
+        comp_penalty = comp_penalty_weight * compatibility_penalty
         
         # 根据损失策略计算损失
         if self.loss_strategy == 'strategy_A':
@@ -131,7 +137,7 @@ class BaseSearcher(ABC):
             area_loss = self.loss_weights['area_weight'] * area
             mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
             pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
-            loss = edp_loss + area_loss + mismatch_penalty + pe_penalty
+            loss = edp_loss + area_loss + mismatch_penalty + pe_penalty + comp_penalty
             
         elif self.loss_strategy == 'strategy_B':
             # Strategy B: 加权EDP损失计算
@@ -140,7 +146,7 @@ class BaseSearcher(ABC):
             mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
             pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
             loss = (self.loss_weights['edp_weight'] * edp_loss + 
-                   area_loss + mismatch_penalty + pe_penalty)
+                   area_loss + mismatch_penalty + pe_penalty + comp_penalty)
             
         elif self.loss_strategy == 'log_edp_plus_area':
             # 标准策略：log(EDP) + 面积惩罚
@@ -148,7 +154,7 @@ class BaseSearcher(ABC):
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
             
         elif self.loss_strategy == 'edp_plus_area':
             # EDP + 面积惩罚
@@ -156,7 +162,7 @@ class BaseSearcher(ABC):
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = edp + area_penalty + mismatch_penalty + pe_penalty
+            loss = edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
             
         else:
             # 默认策略：与log_edp_plus_area相同
@@ -164,7 +170,7 @@ class BaseSearcher(ABC):
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
         
         # 确保返回标量张量
         return loss.squeeze() if loss.dim() > 0 else loss
@@ -364,7 +370,7 @@ class FADOSASearcher(BaseSearcher):
                 optimizer_map.zero_grad()
                 
                 # 直接计算损失（保持梯度图）
-                latency, energy, area, mismatch_loss = self.perf_model(
+                latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
                     self.graph, self.hw_params, self.mapping
                 )
                 
@@ -372,7 +378,7 @@ class FADOSASearcher(BaseSearcher):
                 pe_square_penalty = self.hw_params.get_pe_square_penalty()
                 
                 # 使用统一的损失计算方法
-                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
+                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
                 
                 # 反向传播
                 loss.backward()
@@ -422,7 +428,7 @@ class FADOSASearcher(BaseSearcher):
                 optimizer_hw.zero_grad()
                 
                 # 直接计算损失（保持梯度图）
-                latency, energy, area, mismatch_loss = self.perf_model(
+                latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
                     self.graph, self.hw_params, self.mapping
                 )
                 
@@ -430,7 +436,7 @@ class FADOSASearcher(BaseSearcher):
                 pe_square_penalty = self.hw_params.get_pe_square_penalty()
                 
                 # 使用统一的损失计算方法
-                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty)
+                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
                 
                 # 反向传播
                 loss.backward()

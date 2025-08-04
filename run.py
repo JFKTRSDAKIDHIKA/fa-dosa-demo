@@ -54,7 +54,11 @@ def parse_onnx_to_graph(model_name: str) -> ComputationGraph:
             layer_dims = _convert_onnx_node_to_dims(node, tensor_shapes)
             
             if layer_dims:  # Only add if we could extract valid dimensions
-                graph.add_layer(layer_name, layer_dims, node.op_type)
+                # 提取输入和输出张量名称
+                inputs = list(node.input) if node.input else []
+                outputs = list(node.output) if node.output else []
+                
+                graph.add_layer(layer_name, layer_dims, node.op_type, inputs, outputs)
                 layer_sequence.append((layer_name, node.op_type))
         
         # Identify and add fusion groups based on common patterns
@@ -171,39 +175,94 @@ def _convert_onnx_node_to_dims(node, tensor_shapes: Dict[str, List[int]]) -> Dic
     return dims
 
 def _add_fusion_groups(graph: ComputationGraph, layer_sequence: List[Tuple[str, str]]):
-    """Identify and add fusion groups based on common patterns."""
-    # Add individual layers as single-layer fusion groups
-    for layer_name, _ in layer_sequence:
-        graph.add_fusion_group([layer_name])
+    """Identify and add fusion groups based on graph structure patterns."""
+    # 首先识别ResNet残差块模式
+    skip_patterns = graph.find_skip_connection_patterns()
     
-    # Identify common fusion patterns
-    i = 0
-    while i < len(layer_sequence) - 1:
-        current_layer, current_op = layer_sequence[i]
-        next_layer, next_op = layer_sequence[i + 1]
+    # 为每个识别出的残差块创建融合组
+    for pattern in skip_patterns:
+        main_path = pattern['main_path']
+        add_node = pattern['add_node']
         
-        # Conv -> ReLU fusion
-        if current_op == 'Conv' and next_op in ['Relu', 'ReLU']:
-            graph.add_fusion_group([current_layer, next_layer])
-            i += 2
-        # Conv -> BatchNormalization -> ReLU fusion
-        elif (current_op == 'Conv' and next_op == 'BatchNormalization' and 
-              i + 2 < len(layer_sequence) and layer_sequence[i + 2][1] in ['Relu', 'ReLU']):
-            third_layer = layer_sequence[i + 2][0]
-            graph.add_fusion_group([current_layer, next_layer, third_layer])
-            i += 3
-        # MatMul -> Add fusion
-        elif current_op in ['MatMul', 'Gemm'] and next_op == 'Add':
-            graph.add_fusion_group([current_layer, next_layer])
-            i += 2
-        # MatMul -> Add -> Activation fusion
-        elif (current_op in ['MatMul', 'Gemm'] and next_op == 'Add' and 
-              i + 2 < len(layer_sequence) and layer_sequence[i + 2][1] in ['Relu', 'ReLU', 'Gelu']):
-            third_layer = layer_sequence[i + 2][0]
-            graph.add_fusion_group([current_layer, next_layer, third_layer])
-            i += 3
+        # 创建包含主路径和Add操作的融合组
+        fusion_group = main_path + [add_node]
+        graph.add_fusion_group(fusion_group)
+        print(f"Added ResNet skip connection fusion group: {fusion_group}")
+    
+    # 识别其他常见的融合模式
+    processed_layers = set()
+    
+    # 收集已经在残差块中处理的层
+    for pattern in skip_patterns:
+        processed_layers.update(pattern['main_path'])
+        processed_layers.add(pattern['add_node'])
+    
+    # 为未处理的层识别其他融合模式
+    for layer_name, layer_type in layer_sequence:
+        if layer_name in processed_layers:
+            continue
+            
+        # 尝试识别以当前层开始的融合模式
+        fusion_group = _identify_fusion_pattern_from_layer(graph, layer_name, processed_layers)
+        
+        if len(fusion_group) > 1:
+            graph.add_fusion_group(fusion_group)
+            processed_layers.update(fusion_group)
         else:
-            i += 1
+            # 单层融合组
+            graph.add_fusion_group([layer_name])
+            processed_layers.add(layer_name)
+
+def _identify_fusion_pattern_from_layer(graph: ComputationGraph, start_layer: str, processed_layers: set) -> List[str]:
+    """从指定层开始识别融合模式。"""
+    fusion_group = [start_layer]
+    current_layer = start_layer
+    
+    # 获取当前层的输出层
+    output_layers = graph.get_layer_outputs(current_layer)
+    
+    while output_layers:
+        # 如果有多个输出，停止融合
+        if len(output_layers) > 1:
+            break
+            
+        next_layer = output_layers[0]
+        
+        # 如果下一层已经被处理，停止融合
+        if next_layer in processed_layers:
+            break
+            
+        next_layer_info = graph.layers[next_layer]
+        next_layer_type = next_layer_info['type']
+        current_layer_type = graph.layers[current_layer]['type']
+        
+        # 检查是否可以融合
+        can_fuse = False
+        
+        # Conv -> BatchNormalization
+        if current_layer_type == 'Conv' and next_layer_type == 'BatchNormalization':
+            can_fuse = True
+        # BatchNormalization -> ReLU
+        elif current_layer_type == 'BatchNormalization' and next_layer_type in ['Relu', 'ReLU']:
+            can_fuse = True
+        # Conv -> ReLU (直接连接)
+        elif current_layer_type == 'Conv' and next_layer_type in ['Relu', 'ReLU']:
+            can_fuse = True
+        # MatMul/Gemm -> Add
+        elif current_layer_type in ['MatMul', 'Gemm'] and next_layer_type == 'Add':
+            can_fuse = True
+        # Add -> Activation
+        elif current_layer_type == 'Add' and next_layer_type in ['Relu', 'ReLU', 'Gelu']:
+            can_fuse = True
+            
+        if can_fuse:
+            fusion_group.append(next_layer)
+            current_layer = next_layer
+            output_layers = graph.get_layer_outputs(current_layer)
+        else:
+            break
+    
+    return fusion_group
 
 def _create_fallback_graph() -> ComputationGraph:
     """Create a fallback graph when ONNX parsing fails."""

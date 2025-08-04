@@ -21,7 +21,7 @@ class BaseDMT(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         Estimates the performance and energy for a given fusion group.
 
@@ -37,6 +37,8 @@ class BaseDMT(nn.Module, ABC):
             - latency (torch.Tensor): The estimated latency for the group.
             - energy (torch.Tensor): The estimated energy consumption for the group.
             - buffer_mismatch_loss (torch.Tensor): The buffer mismatch loss for the group.
+            - compatibility_penalty (torch.Tensor): The compatibility penalty for the group.
+            - detailed_metrics (dict): Detailed performance metrics.
         """
         pass
 
@@ -44,7 +46,7 @@ class InPlaceFusionDMT(BaseDMT):
     """DMT for in-place fusion patterns like Conv -> ReLU."""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
         # Initialize detailed metrics dictionary - 精确复现DOSA源码结构
         detailed_metrics = {
@@ -187,7 +189,198 @@ class InPlaceFusionDMT(BaseDMT):
                 level_mismatch_loss = torch.pow(buffer_deficit, 2)
                 group_buffer_mismatch_loss += level_mismatch_loss
 
-        return latency, total_energy, group_buffer_mismatch_loss, detailed_metrics
+        # 5. Compatibility Penalty - 对于InPlaceFusionDMT，直接返回0
+        compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
+        
+        return latency, total_energy, group_buffer_mismatch_loss, compatibility_penalty, detailed_metrics
+
+
+class SkipConnectionDMT(BaseDMT):
+    """DMT for ResNet skip connection patterns like Conv -> BN -> ReLU -> Add."""
+
+    def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        
+        # Initialize detailed metrics
+        detailed_metrics = {
+            'energy_breakdown_pj': {
+                'compute': 0.0,
+                'intra_level': {
+                    'L0_Registers': 0.0,
+                    'L1_Accumulator': 0.0,
+                    'L2_Scratchpad': 0.0
+                },
+                'inter_level': {
+                    'L3_DRAM': 0.0
+                }
+            },
+            'access_counts': {
+                'intra_level': {},
+                'inter_level': {}
+            }
+        }
+        
+        # 1. 路径识别：解析Add节点的两个输入源
+        add_layer_name = group[-1]  # Add操作通常是最后一个
+        main_path = group[:-1]  # 主计算路径（Conv->BN->ReLU等）
+        
+        # 获取Add层的输入，识别主路径和旁路
+        add_layer_inputs = graph.get_layer_inputs(add_layer_name)
+        
+        # 假设主路径是group中的最后一个非Add层的输出
+        main_path_output = main_path[-1] if main_path else None
+        skip_path_source = None
+        
+        # 识别跳跃连接的源头
+        for input_layer in add_layer_inputs:
+            if input_layer not in group:
+                skip_path_source = input_layer
+                break
+        
+        # 2. 延迟建模
+        num_pes = hw_params.get_projected_num_pes()
+        
+        # 2.1 主路径延迟（复用InPlaceFusionDMT逻辑）
+        if main_path:
+            producer_layer = graph.layers[main_path[0]]
+            producer_macs = reduce(lambda x, y: x * y, producer_layer['dims'].values(), 1)
+            latency_main = producer_macs / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+        else:
+            latency_main = torch.tensor(0.0, device=config.DEVICE)
+        
+        # 2.2 旁路数据获取延迟
+        if skip_path_source:
+            skip_layer = graph.layers[skip_path_source]
+            # 假设旁路张量需要从L2_Scratchpad读取
+            skip_tensor_size = reduce(lambda x, y: x * y, skip_layer['dims'].values(), 1) * config.BYTES_PER_ELEMENT
+            l2_bandwidth_gb_s = next((level['bandwidth_gb_s'] for level in config.MEMORY_HIERARCHY 
+                                    if level['name'] == 'L2_Scratchpad'), 10.0)  # 默认带宽
+            latency_skip = skip_tensor_size / (l2_bandwidth_gb_s * 1e9 + 1e-9)
+        else:
+            latency_skip = torch.tensor(0.0, device=config.DEVICE)
+        
+        # 2.3 Add操作延迟（简化估计）
+        add_layer = graph.layers[add_layer_name]
+        add_ops = reduce(lambda x, y: x * y, add_layer['dims'].values(), 1)
+        latency_add_op = add_ops / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+        
+        # 总延迟
+        latency_total = torch.maximum(latency_main, latency_skip) + latency_add_op
+        
+        # 3. 能耗建模
+        total_energy = torch.tensor(0.0, device=config.DEVICE)
+        
+        # 3.1 主路径能耗（复用InPlaceFusionDMT逻辑）
+        group_macs = 0
+        for layer_name in main_path:
+            layer_dims = graph.layers[layer_name]['dims']
+            if 'conv' in layer_name.lower():
+                layer_macs = (layer_dims.get('N', 1) * layer_dims.get('K', 1) * 
+                             layer_dims.get('P', 1) * layer_dims.get('Q', 1) * 
+                             layer_dims.get('C', 1) * layer_dims.get('R', 1) * 
+                             layer_dims.get('S', 1))
+                group_macs += layer_macs
+        
+        energy_main = group_macs * config.PE_MAC_EPA_PJ
+        total_energy += energy_main
+        
+        # 3.2 旁路数据读取能耗
+        if skip_path_source:
+            skip_layer = graph.layers[skip_path_source]
+            skip_tensor_size = reduce(lambda x, y: x * y, skip_layer['dims'].values(), 1)
+            # 使用L2_Scratchpad的EPA
+            l2_size_kb = hw_params.get_buffer_size_kb('L2_Scratchpad')
+            l2_epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * l2_size_kb
+            energy_skip = skip_tensor_size * config.BYTES_PER_ELEMENT * l2_epa
+            total_energy += energy_skip
+        
+        # 3.3 Add操作能耗
+        add_layer = graph.layers[add_layer_name]
+        add_ops = reduce(lambda x, y: x * y, add_layer['dims'].values(), 1)
+        energy_add_op = add_ops * config.PE_MAC_EPA_PJ  # 简化为MAC能耗
+        total_energy += energy_add_op
+        
+        detailed_metrics['energy_breakdown_pj']['compute'] = float(total_energy.item())
+        
+        # 4. Buffer需求建模
+        buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
+        
+        if main_path and skip_path_source:
+            # 创建性能模型实例
+            from dosa.performance_model import HighFidelityPerformanceModel
+            perf_model = HighFidelityPerformanceModel(config)
+            perf_model.hw_params = hw_params
+            
+            all_factors = mapping.get_all_factors()
+            
+            # 计算主路径输出Tile和旁路输入Tile的总Buffer需求
+            for i, level in enumerate(config.MEMORY_HIERARCHY):
+                if level['type'] == 'buffer':
+                    # 主路径输出Tile需求
+                    main_output_layer = graph.layers[main_path[-1]]
+                    main_required_kb = perf_model.calculate_buffer_req_kb(main_output_layer['dims'], all_factors, i)
+                    
+                    # 旁路输入Tile需求
+                    skip_layer = graph.layers[skip_path_source]
+                    skip_required_kb = perf_model.calculate_buffer_req_kb(skip_layer['dims'], all_factors, i)
+                    
+                    # 总需求是两者之和（因为需要同时存在于片上缓存中）
+                    total_required_kb = main_required_kb + skip_required_kb
+                    available_kb = hw_params.get_buffer_size_kb(level['name'])
+                    buffer_deficit = torch.relu(total_required_kb - available_kb)
+                    level_mismatch_loss = torch.pow(buffer_deficit, 2)
+                    buffer_mismatch_loss += level_mismatch_loss
+        
+        # 5. 兼容性惩罚（对于SkipConnectionDMT暂时返回0）
+        compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
+        
+        return latency_total, total_energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
+
+
+class SequentialConvDMT(BaseDMT):
+    """示例DMT类，展示基于Orojenesis/FFMT思想的兼容性惩罚计算逻辑。"""
+
+    def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
+                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        
+        # 简化的性能建模（可以不完整）
+        latency = torch.tensor(1.0, device=config.DEVICE)
+        energy = torch.tensor(1.0, device=config.DEVICE)
+        buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
+        
+        detailed_metrics = {
+            'energy_breakdown_pj': {'compute': 1.0, 'intra_level': {}, 'inter_level': {}},
+            'access_counts': {'intra_level': {}, 'inter_level': {}}
+        }
+        
+        # 兼容性惩罚计算逻辑（基于Orojenesis/FFMT思想）
+        compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
+        
+        if group:  # 确保融合链非空
+            # 检查融合链中第一个Conv层（生产者）的映射
+            producer_name = group[0]
+            producer_layer = graph.layers[producer_name]
+            
+            # 检查是否为卷积层
+            if 'conv' in producer_name.lower() or producer_layer.get('type', '').lower() == 'conv':
+                all_factors = mapping.get_all_factors()
+                
+                # 检查所有归约维度(C, R, S)在L3_DRAM上的时间分块因子
+                reduction_dims = ['C', 'R', 'S']
+                
+                for dim in reduction_dims:
+                    # 构造DRAM时间分块因子的键名
+                    dram_temporal_key = f'{dim}_L3_DRAM_temporal'
+                    
+                    if dram_temporal_key in all_factors:
+                        dram_temporal_factor = all_factors[dram_temporal_key]
+                        
+                        # 如果DRAM时间分块因子大于1，说明有部分和溢出到DRAM
+                        # 这违反了融合约束，需要施加惩罚
+                        penalty_contribution = torch.relu(dram_temporal_factor - 1.0)
+                        compatibility_penalty += penalty_contribution
+        
+        return latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
 
 
 def convert_tensors_to_native(obj):

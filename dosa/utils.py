@@ -32,12 +32,123 @@ class ComputationGraph:
         self.edges = []
         self.fusion_groups = []
         self.problem_dims = {'N':1, 'C':1, 'K':1, 'P':1, 'Q':1, 'R':1, 'S':1}
-    def add_layer(self, name, dims, op_type):
-        self.layers[name] = {'dims': dims, 'type': op_type}
+        self.tensor_to_layer = {}  # 映射张量名到产生它的层
+        
+    def add_layer(self, name, dims, op_type, inputs=None, outputs=None):
+        """添加层到计算图中，支持非线性拓扑结构
+        
+        Args:
+            name: 层名称
+            dims: 维度字典
+            op_type: 操作类型
+            inputs: 输入张量名列表
+            outputs: 输出张量名列表
+        """
+        if inputs is None:
+            inputs = []
+        if outputs is None:
+            outputs = []
+            
+        self.layers[name] = {
+            'dims': dims, 
+            'type': op_type,
+            'inputs': inputs,
+            'outputs': outputs
+        }
+        
+        # 更新张量到层的映射
+        for output_tensor in outputs:
+            self.tensor_to_layer[output_tensor] = name
+            
+        # 更新问题维度
         for d, v in dims.items():
             self.problem_dims[d] = max(self.problem_dims[d], v)
+            
     def add_fusion_group(self, group):
         self.fusion_groups.append(group)
+        
+    def get_layer_inputs(self, layer_name):
+        """获取指定层的输入层列表"""
+        if layer_name not in self.layers:
+            return []
+        
+        input_layers = []
+        for input_tensor in self.layers[layer_name]['inputs']:
+            if input_tensor in self.tensor_to_layer:
+                input_layers.append(self.tensor_to_layer[input_tensor])
+        return input_layers
+        
+    def get_layer_outputs(self, layer_name):
+        """获取指定层的输出层列表"""
+        if layer_name not in self.layers:
+            return []
+            
+        output_layers = []
+        layer_outputs = self.layers[layer_name]['outputs']
+        
+        for other_layer_name, layer_info in self.layers.items():
+            if other_layer_name == layer_name:
+                continue
+            for input_tensor in layer_info['inputs']:
+                if input_tensor in layer_outputs:
+                    output_layers.append(other_layer_name)
+                    break
+        return output_layers
+        
+    def find_skip_connection_patterns(self):
+        """识别ResNet残差块模式"""
+        patterns = []
+        
+        # 查找Add节点
+        for layer_name, layer_info in self.layers.items():
+            if layer_info['type'] == 'Add':
+                input_layers = self.get_layer_inputs(layer_name)
+                if len(input_layers) >= 2:
+                    # 分析两个输入路径
+                    main_path, skip_path = self._analyze_add_inputs(layer_name, input_layers)
+                    if main_path and skip_path:
+                        patterns.append({
+                            'add_node': layer_name,
+                            'main_path': main_path,
+                            'skip_path': skip_path,
+                            'pattern_type': 'skip_connection'
+                        })
+        return patterns
+        
+    def _analyze_add_inputs(self, add_layer, input_layers):
+        """分析Add节点的输入，识别主路径和跳跃路径"""
+        # 简化的启发式：较长的路径为主路径，较短的为跳跃路径
+        paths = []
+        for input_layer in input_layers:
+            path = self._trace_path_backward(input_layer)
+            paths.append((len(path), path, input_layer))
+            
+        if len(paths) >= 2:
+            paths.sort(key=lambda x: x[0], reverse=True)
+            main_path = paths[0][1]  # 最长路径
+            skip_path = [paths[1][2]]  # 跳跃连接通常是单个层
+            return main_path, skip_path
+            
+        return None, None
+        
+    def _trace_path_backward(self, layer_name, visited=None):
+        """向后追踪路径"""
+        if visited is None:
+            visited = set()
+            
+        if layer_name in visited:
+            return []
+            
+        visited.add(layer_name)
+        path = [layer_name]
+        
+        input_layers = self.get_layer_inputs(layer_name)
+        if input_layers:
+            # 选择第一个输入继续追踪（简化处理）
+            sub_path = self._trace_path_backward(input_layers[0], visited.copy())
+            path.extend(sub_path)
+            
+        return path
 
 class FusionParameters(nn.Module):
     def __init__(self, graph):

@@ -7,7 +7,7 @@ from operator import mul
 from dosa.config import Config
 from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
-from dosa.dmt import InPlaceFusionDMT
+from dosa.dmt import InPlaceFusionDMT, SkipConnectionDMT
 
 # Define TENSOR_DIM_MAP
 TENSOR_DIM_MAP = {
@@ -27,6 +27,10 @@ class HighFidelityPerformanceModel(nn.Module):
             ('Conv', 'ReLU'): InPlaceFusionDMT(),
             ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(),
             ('MatMul', 'Add'): InPlaceFusionDMT(),
+            # ResNet skip connection patterns
+            ('Conv', 'BatchNormalization', 'ReLU', 'Add'): SkipConnectionDMT(),
+            ('Conv', 'Add'): SkipConnectionDMT(),
+            ('ReLU', 'Add'): SkipConnectionDMT(),
             # Add more patterns as needed
         }
 
@@ -198,10 +202,11 @@ class HighFidelityPerformanceModel(nn.Module):
 
         return accesses
 
-    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         total_latency = torch.tensor(0.0, device=self.config.DEVICE)
         total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
+        total_compatibility_penalty = torch.tensor(0.0, device=self.config.DEVICE)
         
         all_factors = mapping.get_all_factors()
 
@@ -210,8 +215,9 @@ class HighFidelityPerformanceModel(nn.Module):
             dmt_model = self.dmt_registry.get(current_pattern)
 
             if dmt_model:
-                latency, energy, group_buffer_mismatch_loss = dmt_model(group, graph, hw_params, mapping, self.config)
+                latency, energy, group_buffer_mismatch_loss, compatibility_penalty, detailed_metrics = dmt_model(group, graph, hw_params, mapping, self.config)
                 total_buffer_mismatch_loss += group_buffer_mismatch_loss
+                total_compatibility_penalty += compatibility_penalty
                 # For now, we assume DMT handles its own buffer requirements implicitly
                 # and doesn't contribute to the mismatch loss in this simplified model.
                 # A more advanced implementation might have DMTs also return a loss.
@@ -308,8 +314,9 @@ class HighFidelityPerformanceModel(nn.Module):
         area_cost = hw_params.get_area_cost()
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
+        total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
         
-        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss
+        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
