@@ -23,12 +23,10 @@ class Config:
         ]
         
         # 能量模型（单位：pJ）
-        # 修正：移除所有不正确的 * 1e-6 因子，使单位真正为 pJ
         self.PE_MAC_EPA_PJ = 0.845  # 0.845 pJ per MAC operation
         # 单位能耗（pJ/access）
         self.L0_REG_BASE_EPA_PJ = 9.4394
         
-        # L1 Accumulator (对标DOSA论文Table 2)
         # EPA = 1.94 + 0.1005 * (C1 / sqrt(C_PE))
         self.L1_ACCUM_BASE_EPA_PJ = 1.94
         self.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB = 0.1005
@@ -40,6 +38,12 @@ class Config:
         # 损失策略配置
         self.LOSS_STRATEGY = 'log_edp_plus_area'  # 可选: 'log_edp_plus_area', 'edp_plus_area'
         self.AREA_WEIGHT = 1e-3  # 面积权重
+        
+        # 面积模型配置（单位：mm²）
+        self.AREA_BASE_MM2 = 1.0  # 基础面积
+        self.AREA_PER_PE_MM2 = 0.01  # 每个PE的面积
+        self.AREA_PER_KB_L1_MM2 = 0.1  # L1缓存每KB的面积
+        self.AREA_PER_KB_L2_MM2 = 0.05  # L2缓存每KB的面积
 
     @staticmethod
     def get_instance():

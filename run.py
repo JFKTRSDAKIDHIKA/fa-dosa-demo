@@ -300,9 +300,37 @@ def run_experiment(
     if results['best_params'] is not None:
         final_config_filename = f"output/final_configuration_{searcher_type.replace('-', '_')}.json"
         
-        # 从最佳参数中提取映射和融合决策
-        best_mapping = results['best_params'].get('mapping', {})
-        best_fusion_decisions = results['best_params'].get('fusion_decisions', [])
+        # 重构映射参数
+        best_mapping = {}
+        best_params = results['best_params']
+        
+        # 从扁平化参数重构mapping结构
+        for key, value in best_params.items():
+            if '_temporal' in key or '_spatial' in key:
+                # 解析键名：例如 'N_L0_Registers_temporal'
+                parts = key.split('_')
+                if len(parts) >= 3:
+                    dim_name = parts[0]
+                    level_name = '_'.join(parts[1:-1])  # 处理多词level名称
+                    factor_type = parts[-1]
+                    
+                    if dim_name not in best_mapping:
+                        best_mapping[dim_name] = {}
+                    if level_name not in best_mapping[dim_name]:
+                        best_mapping[dim_name][level_name] = {}
+                    
+                    best_mapping[dim_name][level_name][factor_type] = value
+        
+        # 重构融合决策
+        best_fusion_decisions = []
+        if 'fusion_logits' in best_params:
+            fusion_logits = best_params['fusion_logits']
+            if isinstance(fusion_logits, list):
+                for i, logit in enumerate(fusion_logits):
+                    best_fusion_decisions.append({
+                        "group": f"group_{i}",
+                        "fused": logit > 0.0  # 简单的阈值判断
+                    })
         
         # 设置硬件参数到最佳配置
         if 'num_pes' in results['best_params']:

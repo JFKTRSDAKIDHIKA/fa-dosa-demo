@@ -84,7 +84,7 @@ class HighFidelityPerformanceModel(nn.Module):
         
         # Output更新次数考虑空间复用：总MAC数除以PE阵列中的空间复用因子
         pe_spatial_reuse = torch.sqrt(num_pes)  # 假设PE阵列是方形的
-        intra_accesses["L1_Accumulator"]["Output"]["updates"] = total_macs / torch.clamp(pe_spatial_reuse, min=torch.tensor(1.0, device=self.config.DEVICE))
+        intra_accesses["L1_Accumulator"]["Output"]["updates"] = total_macs / torch.clamp(pe_spatial_reuse, min=torch.tensor(1.0, device=pe_spatial_reuse.device))
         
         # 6. L2_Scratchpad 访问计算
         # 读取次数 = 从DRAM加载到L2的数据量 / 数据位宽
