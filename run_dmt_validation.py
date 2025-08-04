@@ -5,7 +5,51 @@ import itertools
 import pandas as pd
 import random
 import argparse
-from dosa.utils import get_divisors
+import math
+import yaml
+from pathlib import Path
+
+# FA-DOSA core modules
+import torch
+from dosa.config import Config as DosaConfig
+from dosa.hardware_parameters import HardwareParameters
+from dosa.mapping import FineGrainedMapping
+from dosa.utils import ComputationGraph, get_divisors
+from dosa.dmt import InPlaceFusionDMT, convert_tensors_to_native
+
+# Timeloop integration
+import pytimeloop.timeloopfe.v4 as tl
+
+# Timeloop YAML node classes
+class Component(dict):
+    """Represents a Timeloop Component node (leaf node)."""
+    pass
+
+class Container(dict):
+    """Represents a Timeloop Container node (leaf node)."""
+    pass
+
+class Hierarchical(dict):
+    """Represents a Timeloop Hierarchical node (branch node)."""
+    pass
+
+# YAML representers
+def represent_component(dumper, data):
+    """YAML representer for Component class."""
+    return dumper.represent_mapping('!Component', data.items())
+
+def represent_container(dumper, data):
+    """YAML representer for Container class."""
+    return dumper.represent_mapping('!Container', data.items())
+
+def represent_hierarchical(dumper, data):
+    """YAML representer for Hierarchical class."""
+    return dumper.represent_mapping('!Hierarchical', data.items())
+
+# Register the representers globally
+yaml.add_representer(Component, represent_component)
+yaml.add_representer(Container, represent_container)
+yaml.add_representer(Hierarchical, represent_hierarchical)
 
 # Set up environment variables for Timeloop
 os.environ['PATH'] = os.environ.get('PATH', '') + ':/root/accelergy-timeloop-infrastructure/src/timeloop/bin:/root/accelergy-timeloop-infrastructure/src/timeloop/build'
@@ -155,8 +199,15 @@ def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     
     return factors
 
-def generate_configurations():
-    """Generates a stream of unique configurations with complete dimension factorization."""
+def generate_configurations(num_configs: int):
+    """Generates a stream of unique configurations with complete dimension factorization.
+    
+    Args:
+        num_configs (int): Number of configurations to generate.
+        
+    Yields:
+        dict: Configuration dictionary containing fusion_group_info, hardware_config, mapping_config, workload_dims.
+    """
     hw_keys, hw_values = zip(*HW_CONFIG_SPACE.items())
     
     # Define some typical permutation patterns
@@ -167,63 +218,440 @@ def generate_configurations():
         'K N C P Q S R'
     ]
     
-    for group in FUSION_GROUPS_TO_TEST:
+    # Main loop for generating configurations
+    for i in range(num_configs):
+        # Randomly select a fusion group
+        group = random.choice(FUSION_GROUPS_TO_TEST)
         producer_layer = group["producer_layer"]
         dims = WORKLOAD_DIMS[producer_layer]
         
-        for hw_instance in itertools.product(*hw_values):
-            hardware_config = dict(zip(hw_keys, hw_instance))
-            
-            # Calculate PE mesh size for spatial constraints
-            pe_mesh_size = int(hardware_config['num_pes'] ** 0.5)
-            
-            # Generate multiple mapping configurations for each hardware config
-            for _ in range(2):  # Generate 2 mapping variants per hardware config
-                
-                # Generate complete factorization for each dimension
-                dim_factors = {}
-                for dim_name, dim_size in dims.items():
-                    if dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
-                        dim_factors[dim_name] = generate_complete_dimension_factors(dim_size, pe_mesh_size)
-                
-                # Build mapping config with complete factors
-                mapping_config = {
-                    producer_layer: {
-                        'DRAM': {
-                            'temporal': {dim: factors['DRAM'] for dim, factors in dim_factors.items()},
-                            'permutation': random.choice(permutation_patterns)
-                        },
-                        'L2_Scratchpad': {
-                            'temporal': {dim: factors['L2'] for dim, factors in dim_factors.items()},
-                            'permutation': random.choice(permutation_patterns)
-                        },
-                        'L1_Accumulator': {
-                            'temporal': {dim: factors['L1'] for dim, factors in dim_factors.items()},
-                            'permutation': random.choice(permutation_patterns)
-                        },
-                        'L0_Registers': {
-                            'temporal': {dim: factors['L0'] for dim, factors in dim_factors.items()},
-                            'permutation': random.choice(permutation_patterns)
-                        },
-                        'PE_array': {
-                            'spatial': {
-                                dim: factors['spatial']
-                                for dim, factors in dim_factors.items()
-                                if dim in ['K', 'C']
-                            },
-                            'permutation': random.choice(permutation_patterns)
-                        }
-                    }
+        # Randomly sample hardware configuration
+        hardware_config = {}
+        for hw_key, hw_value_list in HW_CONFIG_SPACE.items():
+            hardware_config[hw_key] = random.choice(hw_value_list)
+        
+        # Calculate PE mesh size for spatial constraints
+        pe_mesh_size = int(hardware_config['num_pes'] ** 0.5)
+        
+        # Generate complete factorization for each dimension
+        dim_factors = {}
+        for dim_name, dim_size in dims.items():
+            if dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
+                dim_factors[dim_name] = generate_complete_dimension_factors(dim_size, pe_mesh_size)
+        
+        # Build mapping config with complete factors
+        mapping_config = {
+            producer_layer: {
+                'DRAM': {
+                    'temporal': {dim: factors['DRAM'] for dim, factors in dim_factors.items()},
+                    'permutation': random.choice(permutation_patterns)
+                },
+                'L2_Scratchpad': {
+                    'temporal': {dim: factors['L2'] for dim, factors in dim_factors.items()},
+                    'permutation': random.choice(permutation_patterns)
+                },
+                'L1_Accumulator': {
+                    'temporal': {dim: factors['L1'] for dim, factors in dim_factors.items()},
+                    'permutation': random.choice(permutation_patterns)
+                },
+                'L0_Registers': {
+                    'temporal': {dim: factors['L0'] for dim, factors in dim_factors.items()},
+                    'permutation': random.choice(permutation_patterns)
+                },
+                'PE_array': {
+                    'spatial': {
+                        dim: factors['spatial']
+                        for dim, factors in dim_factors.items()
+                        if dim in ['K', 'C']
+                    },
+                    'permutation': random.choice(permutation_patterns)
                 }
-                
-                # No need to adjust spatial factors as they are already constrained in generate_complete_dimension_factors
+            }
+        }
+        
+        yield {
+             "fusion_group_info": group,
+             "hardware_config": hardware_config,
+             "mapping_config": mapping_config,
+             "workload_dims": WORKLOAD_DIMS
+         }
 
-                yield {
-                    "fusion_group_info": group,
-                    "hardware_config": hardware_config,
-                    "mapping_config": mapping_config,
-                    "workload_dims": WORKLOAD_DIMS
-                }
+def run_dosa_prediction(config: dict) -> dict:
+    """
+    使用FA-DOSA的内部分析模型，为给定的配置计算PPA预测值。
+
+    Args:
+        config (dict): 包含'hardware_config', 'mapping_config', 等信息的完整配置字典。
+
+    Returns:
+        dict: 包含预测结果的字典，例如 {'predicted_latency_s': 0.001, 'predicted_energy_pj': 5000.0}
+    """
+    print("[INFO] Running FA-DOSA analytical model...")
+    try:
+        hw_config = config['hardware_config']
+        mapping_config = config['mapping_config']
+        fusion_group_info = config['fusion_group_info']
+        workload_dims = config['workload_dims']
+
+        if fusion_group_info['pattern'] != ['Conv', 'ReLU']:
+            raise ValueError(f"Unsupported DMT pattern for validation: {fusion_group_info['pattern']}")
+        
+        dmt_model = InPlaceFusionDMT()
+
+        hw_params = HardwareParameters(
+            initial_num_pes=hw_config['num_pes'],
+            initial_l0_kb=hw_config.get('l0_registers_size_kb', 2.0),
+            initial_l1_kb=hw_config.get('l1_accumulator_size_kb', 4.0),
+            initial_l2_kb=hw_config['l2_scratchpad_size_kb']
+        )
+        
+        dosa_config = DosaConfig()
+        
+        producer_layer = fusion_group_info['producer_layer']
+        problem_dims = workload_dims[producer_layer]
+        hierarchy = dosa_config.MEMORY_HIERARCHY
+        
+        mapping = FineGrainedMapping(problem_dims, hierarchy)
+
+        with torch.no_grad():
+            producer_mapping = mapping_config.get(producer_layer, {})
+            for level_name, level_mapping in producer_mapping.items():
+                if level_name in mapping.factors:
+                    temporal_factors = level_mapping.get('temporal', {})
+                    spatial_factors = level_mapping.get('spatial', {})
+                    for dim_name in mapping.factors[level_name]:
+                        t_factor = temporal_factors.get(dim_name, 1.0)
+                        s_factor = spatial_factors.get(dim_name, 1.0)
+                        mapping.factors[level_name][dim_name]['temporal'].data = torch.log(torch.tensor(float(t_factor), device=dosa_config.DEVICE))
+                        mapping.factors[level_name][dim_name]['spatial'].data = torch.log(torch.tensor(float(s_factor), device=dosa_config.DEVICE))
+
+        hw_params.to(dosa_config.DEVICE)
+        mapping.to(dosa_config.DEVICE)
+        
+        graph = ComputationGraph()
+        graph.add_layer(producer_layer, problem_dims, fusion_group_info['pattern'][0])
+        consumer_layer = fusion_group_info['consumer_layer']
+        graph.add_layer(consumer_layer, workload_dims[consumer_layer], fusion_group_info['pattern'][1])
+        
+        group = (producer_layer, consumer_layer)
+        
+        with torch.no_grad():
+            result = dmt_model(
+                group, graph, hw_params, mapping, dosa_config
+            )
+            # Handle different return value formats
+            if len(result) == 5:
+                predicted_latency, predicted_energy, _, _, detailed_metrics = result
+            elif len(result) == 4:
+                predicted_latency, predicted_energy, _, detailed_metrics = result
+            elif len(result) == 3:
+                predicted_latency, predicted_energy, detailed_metrics = result
+            elif len(result) == 2:
+                predicted_latency, predicted_energy = result
+                detailed_metrics = {}
+            else:
+                raise ValueError(f"Unexpected DMT model return format: {len(result)} values")
+
+        # 明确变量命名和单位
+        predicted_latency_s = predicted_latency.item()
+        predicted_energy_pj = predicted_energy.item()
+        
+        # 将detailed_metrics中的Tensor转换为Python原生数字类型
+        native_detailed_metrics = convert_tensors_to_native(detailed_metrics)
+        
+        print(f"[INFO] FA-DOSA prediction complete: latency={predicted_latency_s} s, energy={predicted_energy_pj} pJ")
+        return {
+            "predicted_latency_s": predicted_latency_s,
+            "predicted_energy_pj": predicted_energy_pj
+        }
+    except Exception as e:
+        print(f"[ERROR] FA-DOSA prediction failed: {e}")
+        return {
+            "predicted_latency_s": -1.0,
+            "predicted_energy_pj": -1.0
+        }
+
+
+def run_timeloop_simulation(config: dict, work_dir: Path) -> dict:
+    """
+    为给定配置运行Timeloop/Accelergy仿真并返回结果。
+
+    Args:
+        config (dict): 与 run_dosa_prediction 使用的完全相同的配置字典。
+        work_dir (Path): 用于存放临时YAML文件的目录路径对象。
+
+    Returns:
+        dict: 包含仿真结果的字典，例如 {'simulated_latency_s': 0.0012, 'simulated_energy_pj': 5200.0}
+    """
+    print("[INFO] Running Timeloop/Accelergy simulation...")
+    try:
+        # 确保工作目录存在
+        work_dir.mkdir(exist_ok=True)
+        
+        # 生成Timeloop配置文件
+        generate_timeloop_files(config, work_dir)
+        
+        # 定义输入文件列表
+        input_files = [
+            str(work_dir / "arch.yaml"),
+            str(work_dir / "problem.yaml"),
+            str(work_dir / "constraints.yaml"),
+            str(work_dir / "env.yaml")
+        ]
+        
+        # 从YAML文件加载规范
+        spec = tl.Specification.from_yaml_files(input_files)
+        
+        # 调用Timeloop映射器
+        stats = tl.call_mapper(spec, output_dir=str(work_dir))
+        
+        # 从stats对象中提取性能指标
+        if stats and hasattr(stats, 'cycles') and hasattr(stats, 'energy'):
+            # 获取原始值并明确单位
+            simulated_cycles = float(stats.cycles)
+            simulated_energy_uj = float(stats.energy)
+            simulated_energy_pj = simulated_energy_uj * 1e6
+            
+            # 获取DosaConfig实例以访问时钟频率
+            dosa_config = DosaConfig()
+            
+            # 计算时钟周期时长（秒）
+            cycle_time_s = 1.0 / (dosa_config.CLOCK_FREQUENCY_MHZ * 1e6)
+            
+            # 将时钟周期转换为秒
+            simulated_latency_s = simulated_cycles * cycle_time_s
+            
+            # 增强日志输出
+            print(f"[INFO] Timeloop raw output: cycles={simulated_cycles}, energy={simulated_energy_pj} pJ")
+            print(f"[INFO] Converted to: latency={simulated_latency_s} s")
+            
+            return {
+                "simulated_latency_s": simulated_latency_s,
+                "simulated_energy_pj": simulated_energy_pj
+            }
+        else:
+            print("[ERROR] Failed to extract performance metrics from Timeloop results.")
+            print(f"[DEBUG] stats object: {stats}")
+            if stats:
+                print(f"[DEBUG] stats attributes: {dir(stats)}")
+            return {
+                "simulated_latency_s": -1.0,
+                "simulated_energy_pj": -1.0
+            }
+        
+    except Exception as e:
+        print(f"[ERROR] Timeloop simulation failed: {e}")
+        return {
+            "simulated_latency_s": -1.0,
+            "simulated_energy_pj": -1.0
+        }
+
+
+def generate_timeloop_files(config, work_dir):
+    """Generates arch.yaml, problem.yaml, constraints.yaml, and env.yaml for Timeloop v0.4."""
+    hw_config = config['hardware_config']
+    mapping_config = config['mapping_config']
+    producer_layer = config['fusion_group_info']['producer_layer']
+    workload_dims = config['workload_dims'][producer_layer]
+
+    # --- 1. Generate arch.yaml (Hierarchical v0.4 format) ---
+    meshX = int(math.sqrt(hw_config['num_pes']))
+    datawidth = 16 # Assuming 16-bit data for this validation
+
+    # Helper to calculate depth from size_kb
+    def get_depth(size_kb):
+        return int(size_kb * 1024 * 8 / datawidth)
+
+    # Step 3: Reconstruct arch_dict using correct node types
+    arch_dict = {
+        'architecture': {
+            'version': '0.4',
+            'nodes': [
+                Hierarchical({
+                    'nodes': [
+                        Component({
+                            'name': 'DRAM',
+                            'class': 'DRAM',
+                            'attributes': {'depth': 1048576, 'width': 256, 'datawidth': datawidth} 
+                        }),
+                        Hierarchical({
+                            'nodes': [
+                                Component({
+                                    'name': 'L2_Scratchpad',
+                                    'class': 'SRAM',
+                                    'attributes': {'depth': get_depth(hw_config['l2_scratchpad_size_kb']), 'width': datawidth, 'datawidth': datawidth}
+                                }),
+                                Hierarchical({
+                                    'nodes': [
+                                        Container({
+                                            'name': 'PE_array_container',
+                                            'spatial': {'meshX': meshX, 'meshY': meshX}
+                                        }),
+                                        Component({
+                                            'name': 'L1_Accumulator',
+                                            'class': 'regfile',
+                                            'attributes': {'depth': get_depth(hw_config.get('l1_accumulator_size_kb', 4.0)), 'width': datawidth, 'datawidth': datawidth}
+                                        }),
+                                        Component({
+                                            'name': 'L0_Registers',
+                                            'class': 'regfile',
+                                            'attributes': {'depth': get_depth(hw_config.get('l0_registers_size_kb', 2.0)), 'width': datawidth, 'datawidth': datawidth}
+                                        }),
+                                        Component({
+                                            'name': 'MAC',
+                                            'class': 'intmac',
+                                            'attributes': {'datawidth': datawidth, 'width': 8}
+                                        })
+                                    ]
+                                })
+                            ]
+                        })
+                    ]
+                })
+            ]
+        }
+    }
+    # Step 4: Use standard yaml.dump without custom Dumper
+    with open(work_dir / 'arch.yaml', 'w') as f:
+        yaml.dump(arch_dict, f, sort_keys=False)
+
+    # --- 2. Generate problem.yaml ---
+    problem_config = {
+        'problem': {
+            'version': '0.4',
+            'shape': {
+                'name': 'CNN_Layer',
+                'dimensions': ['K', 'C', 'R', 'S', 'P', 'Q', 'N'],
+                'data_spaces': [
+                    {
+                        'name': 'Weights',
+                        'projection': [[['K']], [['C']], [['R']], [['S']]]
+                    },
+                    {
+                        'name': 'Inputs',
+                        'projection': [[['N']], [['C']], [['R'], ['P']], [['S'], ['Q']]]
+                    },
+                    {
+                        'name': 'Outputs',
+                        'projection': [[['N']], [['K']], [['P']], [['Q']]],
+                        'read_write': True
+                    }
+                ]
+            },
+            'instance': workload_dims
+        }
+    }
+
+    # 写入文件
+    with open(work_dir / 'problem.yaml', 'w') as f:
+        # 使用标准的 dump 即可，无需任何特殊格式化
+        yaml.dump(problem_config, f, sort_keys=False)
+
+    # --- 3. Generate constraints.yaml ---
+    layer_mapping = mapping_config[producer_layer]
+    all_dims = ['N', 'K', 'C', 'P', 'Q', 'R', 'S']
+    
+    # Verify and adjust factors to ensure product matches problem dimensions
+    def verify_and_adjust_factors(factors_dict, dim_name, dim_size):
+        if dim_name not in factors_dict:
+            return {dim_name: dim_size}
+        
+        # Calculate current product
+        product = 1
+        for val in factors_dict.values():
+            product *= int(val)
+        
+        # If product doesn't match, adjust DRAM factor
+        if product != dim_size and dim_size > 0:
+            # Calculate adjustment factor
+            adjustment = dim_size / product
+            # Apply adjustment to DRAM factor
+            if 'DRAM' in factors_dict:
+                factors_dict['DRAM'] = int(factors_dict['DRAM'] * adjustment)
+            else:
+                # If no DRAM factor, add it
+                factors_dict['DRAM'] = int(adjustment)
+        
+        return factors_dict
+    
+    # Collect all factors for each dimension
+    dim_factors = {dim: {} for dim in all_dims}
+    
+    # Collect spatial factors
+    for dim, val in layer_mapping['PE_array']['spatial'].items():
+        if dim in dim_factors:
+            dim_factors[dim]['spatial'] = int(val)
+    
+    # Collect temporal factors
+    for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:
+        for dim, val in layer_mapping[target_name]['temporal'].items():
+            if dim in dim_factors:
+                dim_factors[dim][target_name] = int(val)
+    
+    # Verify and adjust factors for each dimension
+    for dim in all_dims:
+        if dim in workload_dims:
+            dim_size = workload_dims[dim]
+            # Calculate current product
+            product = 1
+            for level, val in dim_factors[dim].items():
+                product *= val
+            
+            # If product doesn't match, adjust DRAM factor
+            if product != dim_size and dim_size > 0:
+                # Calculate adjustment factor
+                adjustment = dim_size / product
+                # Apply adjustment to DRAM factor
+                if 'DRAM' in dim_factors[dim]:
+                    dim_factors[dim]['DRAM'] = int(dim_factors[dim]['DRAM'] * adjustment)
+                else:
+                    # If no DRAM factor, add it
+                    dim_factors[dim]['DRAM'] = int(adjustment)
+    
+    # Format factors for constraints.yaml
+    def format_factors(level_type, level_name):
+        factors = []
+        for dim in all_dims:
+            if dim in workload_dims:
+                if level_type == 'spatial' and 'spatial' in dim_factors[dim]:
+                    if dim in ['K', 'C']:  # Only K and C have spatial factors
+                        factors.append(f"{dim}={dim_factors[dim]['spatial']}")
+                elif level_type == 'temporal' and level_name in dim_factors[dim]:
+                    factors.append(f"{dim}={dim_factors[dim][level_name]}")
+                elif level_type == 'temporal' and level_name not in dim_factors[dim]:
+                    # Default to 1 if not specified
+                    factors.append(f"{dim}=1")
+        return factors
+    
+    targets = []
+    # Spatial Target
+    targets.append({
+        'target': 'PE_array_container', 'type': 'spatial',
+        'factors': format_factors('spatial', 'PE_array'),
+        'permutation': layer_mapping['PE_array']['permutation']
+    })
+    # Temporal Targets
+    for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:
+        targets.append({
+            'target': target_name, 'type': 'temporal',
+            'factors': format_factors('temporal', target_name),
+            'permutation': layer_mapping[target_name]['permutation']
+        })
+    # Dataspace Target for Fusion
+    targets.append({'target': 'L2_Scratchpad', 'type': 'dataspace', 'keep': ['Outputs']})
+
+    with open(work_dir / 'constraints.yaml', 'w') as f:
+        yaml.dump({'constraints': {'targets': targets}}, f, sort_keys=False)
+
+    # --- 4. Generate env.yaml ---
+    env_config = {
+        'globals': {'environment_variables': {
+            'ACCELERGY_COMPONENT_LIBRARIES': '/root/accelergy-timeloop-infrastructure/src/accelergy-library-plug-in/library/'
+        }},
+        'variables': {'global_cycle_seconds': 1e-9, 'technology': "40nm"}
+    }
+    with open(work_dir / 'env.yaml', 'w') as f:
+        yaml.dump(env_config, f, sort_keys=False, default_style="'")
 
 def main():
     """Main control script to run DMT validation experiments."""
@@ -235,7 +663,6 @@ def main():
     args = parser.parse_args()
     
     output_csv_path = args.output
-    temp_config_path = "temp_config.json"
     all_results = []
     max_runs = args.max_runs
 
@@ -245,100 +672,64 @@ def main():
     else:
         print("[INFO] Running full validation sweep")
 
-    for i, config in enumerate(generate_configurations()):
-        # Check if we've reached the maximum number of runs
-        if max_runs is not None and i >= max_runs:
-            print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
-            break
-            
-        print(f"--- Running Validation Point {i+1} ---")
-        
-        # 1. Write the temporary config file
-        with open(temp_config_path, 'w') as f:
-            json.dump(config, f, indent=4)
+    # Create temporary workspace
+    work_dir = Path('./validation_workspace')
+    work_dir.mkdir(exist_ok=True)
 
-        # 2. Run the validation script
-        try:
-            # Get the absolute path to validate_dmt.py
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            validate_script = os.path.join(script_dir, 'validate_dmt.py')
+    try:
+        for i, config in enumerate(generate_configurations(max_runs if max_runs is not None else 1000)):
+            # Check if we've reached the maximum number of runs
+            if max_runs is not None and i >= max_runs:
+                print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
+                break
+                
+            print(f"--- Running Validation Point {i+1} ---")
             
-            # Use 'conda run' to ensure the script executes within the correct environment
-            cmd = [
-                'conda',
-                'run',
-                '-n',
-                'dosa',
-                '--no-capture-output',
-                'python',
-                validate_script,
-                '--config',
-                os.path.abspath(temp_config_path)
-            ]
-            result = subprocess.run(
-                cmd,
-                capture_output=True, text=True, check=True, timeout=300
-            )
-            # Extract JSON output using delimiters
-            stdout_content = result.stdout.strip()
-            start_marker = "---DMT_VALIDATION_RESULT_START---"
-            end_marker = "---DMT_VALIDATION_RESULT_END---"
-            
-            start_idx = stdout_content.find(start_marker)
-            end_idx = stdout_content.find(end_marker)
-            
-            if start_idx == -1 or end_idx == -1:
-                raise ValueError("Result delimiters not found in stdout")
-            
-            json_output = stdout_content[start_idx + len(start_marker):end_idx].strip()
-            validation_data = json.loads(json_output)
-            
-            # Save detailed JSON result to individual file
-            detailed_output_path = f"output/validation_result_{i+1}.json"
-            os.makedirs("output", exist_ok=True)
-            with open(detailed_output_path, 'w') as f:
-                json.dump(validation_data, f, indent=4)
-            print(f"[INFO] Detailed JSON result saved to {detailed_output_path}")
-            
-            # Flatten the result for CSV logging
-            flat_result = {
-                **config['fusion_group_info'],
+            # 双轨评估
+            dosa_results = run_dosa_prediction(config)
+            timeloop_results = run_timeloop_simulation(config, work_dir)
+
+            # 数据合并
+            # 将配置信息和两边的结果合并到一个字典中
+            flat_config = {
+                "validation_point_id": i + 1,
+                "group_name": config['fusion_group_info']['group_name'],
                 **config['hardware_config'],
-                "predicted_latency": validation_data['prediction']['latency_s'],
-                "simulated_latency": validation_data['simulation']['latency_s'],
-                "predicted_energy": validation_data['prediction']['energy_pj'],
-                "simulated_energy": validation_data['simulation']['energy_pj'],
+                # 可以有选择性地扁平化一些关键的mapping参数以方便分析
             }
-            all_results.append(flat_result)
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-            print(f"[ERROR] Failed to validate config {i+1}: {e}")
-            if hasattr(e, 'stderr') and e.stderr:
-                print(f"[STDERR]:\n{e.stderr}")
-            if hasattr(e, 'stdout') and e.stdout:
-                print(f"[STDOUT]:\n{e.stdout}")
-            # Add a fallback result with -1 values to continue processing
-            flat_result = {
-                **config['fusion_group_info'],
-                **config['hardware_config'],
-                "predicted_latency": -1.0,
-                "simulated_latency": -1.0,
-                "predicted_energy": -1.0,
-                "simulated_energy": -1.0,
+            
+            combined_result = {
+                **flat_config,
+                **dosa_results,
+                **timeloop_results
             }
-            all_results.append(flat_result)
+            
+            # 数据追加
+            all_results.append(combined_result)
+            print(f"[SUCCESS] Validation point {i+1} completed")
 
-    # 3. Save results to CSV
-    if all_results:
-        df = pd.DataFrame(all_results)
-        df.to_csv(output_csv_path, index=False)
-        print(f"\nValidation complete. Results saved to {output_csv_path}")
-    else:
-        print("\nValidation run finished, but no results were collected.")
-
-    # Clean up the temporary file
-    if os.path.exists(temp_config_path):
-        os.remove(temp_config_path)
+        # 结果持久化
+        if all_results:
+            df = pd.DataFrame(all_results)
+            df.to_csv(output_csv_path, index=False)
+            print(f"\nValidation complete. {len(all_results)} data points saved to {output_csv_path}")
+        else:
+            print("\nValidation run finished, but no results were collected.")
+            
+    except Exception as e:
+        print(f"[ERROR] Main validation loop failed: {e}")
+        import traceback
+        traceback.print_exc()
+            
+    finally:
+        # 可选：清理工作目录
+        import shutil
+        if work_dir.exists():
+            try:
+                shutil.rmtree(work_dir)
+                print("[INFO] Cleaned up temporary workspace")
+            except Exception as e:
+                print(f"[WARNING] Failed to clean up workspace: {e}")
 
 if __name__ == "__main__":
     main()

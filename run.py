@@ -550,29 +550,29 @@ if __name__ == "__main__":
         num_hardware_steps=5  # 减少硬件优化步数
     )
     
-    # 随机搜索实验 - 轻量级测试配置
-    random_results = run_experiment(
-        model_name="resnet18",
-        searcher_type="random_search",
-        num_trials=50  # 减少试验次数以加快测试
-    )
+    # # Random search experiment - lightweight test configuration
+    # random_results = run_experiment(
+    #     model_name="resnet18",
+    #     searcher_type="random_search",
+    #     num_trials=50  # Reduce trials to speed up testing
+    # )
     
-    # 贝叶斯优化实验 - 轻量级测试配置
-    bayesian_results = run_experiment(
-        model_name="resnet18",
-        searcher_type="bayesian_opt",
-        num_trials=50  # 减少试验次数以加快测试
-    )
+    # # Bayesian optimization experiment - lightweight test configuration
+    # bayesian_results = run_experiment(
+    #     model_name="resnet18",
+    #     searcher_type="bayesian_opt",
+    #     num_trials=50  # Reduce trials to speed up testing
+    # )
     
-    # 遗传算法实验 - 轻量级测试配置
-    genetic_results = run_experiment(
-        model_name="resnet18",
-        searcher_type="genetic_algo",
-        num_trials=50,  # 减少试验次数以加快测试
-        population_size=20,  # 减少种群大小以加快测试
-        mutation_rate=0.1,
-        crossover_rate=0.8
-    )
+    # # Genetic algorithm experiment - lightweight test configuration
+    # genetic_results = run_experiment(
+    #     model_name="resnet18",
+    #     searcher_type="genetic_algo",
+    #     num_trials=50,  # Reduce trials to speed up testing
+    #     population_size=20,  # Reduce population size to speed up testing
+    #     mutation_rate=0.1,
+    #     crossover_rate=0.8
+    # )
     
     # 示例2: 运行对比实验 - 四种算法完整对比
     # print("\n=== Comprehensive Comparison Experiment ===")
