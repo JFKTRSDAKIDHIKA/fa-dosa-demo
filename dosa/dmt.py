@@ -76,11 +76,13 @@ class InPlaceFusionDMT(BaseDMT):
         consumers = group[1:]
         producer_layer = graph.layers[producer_name]
 
-        # 2. Latency Calculation: Dominated by the producer
+        # 2. Latency Calculation: Refactored to Cycles Accumulation model based on DOSA paper Eq. (2)
         # We can reuse the logic from the main performance model for a single layer
         producer_macs = reduce(lambda x, y: x * y, producer_layer['dims'].values(), 1)
         num_pes = hw_params.get_projected_num_pes()
-        compute_latency = producer_macs / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+        
+        # Calculate compute cycles
+        compute_cycles = producer_macs / num_pes
 
         # 创建性能模型实例
         from dosa.performance_model import HighFidelityPerformanceModel
@@ -90,7 +92,8 @@ class InPlaceFusionDMT(BaseDMT):
         all_factors = mapping.get_all_factors()
         producer_accesses = perf_model.calculate_per_level_accesses(producer_layer['dims'], all_factors)
         
-        memory_latencies = []
+        # Calculate memory cycles for each interface
+        memory_cycles_list = []
         for interface, accesses in producer_accesses.items():
             upper_level_name = interface.split('_to_')[0]
             
@@ -98,12 +101,25 @@ class InPlaceFusionDMT(BaseDMT):
             from dosa.performance_model import calculate_bandwidth_gb_s
             bandwidth_gb_s = calculate_bandwidth_gb_s(upper_level_name, num_pes, config)
             
-            memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
+            # Convert bandwidth from GB/s to bytes_per_cycle
+            bytes_per_cycle = bandwidth_gb_s * 1e9 / (config.CLOCK_FREQUENCY_MHZ * 1e6)
+            
+            # Calculate memory cycles for this interface
+            memory_cycles = accesses / (bytes_per_cycle + 1e-9)
+            memory_cycles_list.append(memory_cycles)
 
-        if memory_latencies:
-            latency = torch.maximum(compute_latency, torch.max(torch.stack(memory_latencies)))
+        # Identify memory bottleneck
+        if memory_cycles_list:
+            bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
         else:
-            latency = compute_latency
+            bottleneck_memory_cycles = torch.tensor(0.0)
+        
+        # Calculate stall cycles
+        stall_cycles = torch.relu(bottleneck_memory_cycles - compute_cycles)
+        
+        # Calculate total cycles and convert to latency
+        total_cycles = compute_cycles + stall_cycles
+        latency = total_cycles / (config.CLOCK_FREQUENCY_MHZ * 1e6)
 
         # 3. Energy Calculation
         total_energy = torch.tensor(0.0, device=config.DEVICE)
