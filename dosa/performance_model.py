@@ -16,6 +16,34 @@ TENSOR_DIM_MAP = {
     'Output': ['N', 'K', 'P', 'Q']
 }
 
+def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Config) -> torch.Tensor:
+    """
+    计算指定存储层级的带宽（GB/s）。
+    
+    Args:
+        level_name: 存储层级名称 (如 'L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM')
+        num_pes: 处理单元数量
+        config: 全局配置对象
+    
+    Returns:
+        torch.Tensor: 带宽值（GB/s）
+    """
+    # 根据新的带宽模型计算 words/cycle
+    if level_name == 'L0_Registers':
+        bandwidth_words_per_cycle = 2 * num_pes
+    elif level_name in ['L1_Accumulator', 'L2_Scratchpad']:
+        bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
+    elif level_name == 'L3_DRAM':
+        bandwidth_words_per_cycle = 8
+    else:
+        # 对于未知层级，使用默认值
+        bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
+    
+    # 转换为 GB/s
+    bandwidth_gb_s = (bandwidth_words_per_cycle * config.BYTES_PER_ELEMENT * config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
+    
+    return bandwidth_gb_s
+
 class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
@@ -237,12 +265,9 @@ class HighFidelityPerformanceModel(nn.Module):
 
                 for interface, accesses in per_level_accesses.items():
                     upper_level_name = interface.split('_to_')[0]
-                    level_info = next((level for level in self.config.MEMORY_HIERARCHY if level['name'] == upper_level_name), None)
                     
-                    if upper_level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
-                        bandwidth_gb_s = (2 * num_pes_sqrt * self.config.BYTES_PER_ELEMENT * self.config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
-                    else: # L3_DRAM
-                        bandwidth_gb_s = level_info['bandwidth_gb_s']
+                    # 使用新的带宽计算函数
+                    bandwidth_gb_s = calculate_bandwidth_gb_s(upper_level_name, num_pes, self.config)
 
                     memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + torch.tensor(1e-9, device=self.config.DEVICE)))
                 

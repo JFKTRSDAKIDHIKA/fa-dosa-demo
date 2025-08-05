@@ -93,11 +93,11 @@ class InPlaceFusionDMT(BaseDMT):
         memory_latencies = []
         for interface, accesses in producer_accesses.items():
             upper_level_name = interface.split('_to_')[0]
-            level_info = next((level for level in config.MEMORY_HIERARCHY if level['name'] == upper_level_name), None)
-            if upper_level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
-                bandwidth_gb_s = (2 * torch.sqrt(num_pes) * config.BYTES_PER_ELEMENT * config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
-            else:
-                bandwidth_gb_s = level_info['bandwidth_gb_s']
+            
+            # 使用新的带宽计算函数
+            from dosa.performance_model import calculate_bandwidth_gb_s
+            bandwidth_gb_s = calculate_bandwidth_gb_s(upper_level_name, num_pes, config)
+            
             memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
 
         if memory_latencies:
