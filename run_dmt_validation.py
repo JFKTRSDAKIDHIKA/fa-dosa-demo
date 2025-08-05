@@ -204,14 +204,11 @@ def generate_configurations(num_configs: int):
     
     # Define some typical permutation patterns
     permutation_patterns = [
-        'K C N P Q S R',
-        'N K C P Q S R', 
-        'C K N P Q S R',
         'K N C P Q S R'
     ]
     
     # Define available strategies
-    strategies = ["performance", "dram_heavy", "random"]
+    strategies = ["performance"]
     
     # Main loop for generating configurations
     for i in range(num_configs):
