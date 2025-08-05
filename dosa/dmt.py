@@ -21,8 +21,21 @@ class BaseDMT(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
+        DMT前向传播方法，支持验证快车道。
+        
+        Args:
+            group: 融合组层名列表
+            graph: 计算图
+            hw_params: 硬件参数
+            mapping: FineGrainedMapping实例（用于训练路径）
+            config: 配置对象
+            direct_mapping_table: （可选）直接映射表，用于验证模式
+        
+        Returns:
+            (latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics)
+        
         Estimates the performance and energy for a given fusion group.
 
         Args:
@@ -46,7 +59,7 @@ class InPlaceFusionDMT(BaseDMT):
     """DMT for in-place fusion patterns like Conv -> ReLU."""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
         # Initialize detailed metrics dictionary - 精确复现DOSA源码结构
         detailed_metrics = {
@@ -89,7 +102,12 @@ class InPlaceFusionDMT(BaseDMT):
         perf_model = HighFidelityPerformanceModel(config)
         perf_model.hw_params = hw_params  # Temporarily attach hw_params
         
-        all_factors = mapping.get_all_factors()
+        if direct_mapping_table:
+            # [验证路径]：使用直接提供的映射表
+            all_factors = direct_mapping_table
+        else:
+            # [训练路径]：使用可微投影获取映射因子
+            all_factors = mapping.get_all_factors()
         producer_accesses = perf_model.calculate_per_level_accesses(producer_layer['dims'], all_factors)
         
         # Calculate memory cycles for each interface
@@ -215,7 +233,7 @@ class SkipConnectionDMT(BaseDMT):
     """DMT for ResNet skip connection patterns like Conv -> BN -> ReLU -> Add."""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
         # Initialize detailed metrics
         detailed_metrics = {
@@ -357,7 +375,7 @@ class SequentialConvDMT(BaseDMT):
     """示例DMT类，展示基于Orojenesis/FFMT思想的兼容性惩罚计算逻辑。"""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
         # 简化的性能建模（可以不完整）
         latency = torch.tensor(1.0, device=config.DEVICE)

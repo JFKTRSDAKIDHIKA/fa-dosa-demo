@@ -525,13 +525,37 @@ class HighFidelityPerformanceModel(nn.Module):
             return accesses, detailed_info
         return accesses
 
-    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        高保真度性能模型的前向传播方法。
+        
+        Args:
+            graph: 计算图
+            hw_params: 硬件参数
+            mapping: FineGrainedMapping实例（用于训练路径）
+            direct_mapping_table: （可选）一个离散的、嵌套的映射表字典。当提供此参数时，
+                                模型将进入'验证模式'，直接使用此映射表，并完全绕过
+                                mapping.get_all_factors()的可微投影逻辑。
+                                格式: {dim: {level: {'temporal': val, 'spatial': val}}}
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                (total_latency, total_energy, total_buffer_mismatch_loss, total_compatibility_penalty, detailed_metrics)
+        """
         total_latency = torch.tensor(0.0, device=self.config.DEVICE)
         total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
         total_compatibility_penalty = torch.tensor(0.0, device=self.config.DEVICE)
         
-        all_factors = mapping.get_all_factors()
+        if direct_mapping_table:
+            # [验证路径]：如果外部直接提供了映射表，则进入验证模式。
+            # 我们信任调用者已确保该表的格式和物理有效性。
+            all_factors = direct_mapping_table
+            # 注：此路径下，mapping 对象中的可学习参数将不会被使用。
+        else:
+            # [训练路径]：如果没有提供直接映射，则保持原有的训练模式。
+            # 通过可微投影仪从可学习参数中获取有效映射因子。
+            all_factors = mapping.get_all_factors()
 
         for group in graph.fusion_groups:
             current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)

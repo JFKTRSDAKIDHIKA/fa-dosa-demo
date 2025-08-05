@@ -251,9 +251,6 @@ def generate_configurations(num_configs: int):
                 },
                 'L0_Registers': {
                     'temporal': {dim: factors['L0'] for dim, factors in dim_factors.items()},
-                    'permutation': random.choice(permutation_patterns)
-                },
-                'PE_array': {
                     'spatial': {
                         dim: factors['spatial']
                         for dim, factors in dim_factors.items()
@@ -330,9 +327,36 @@ def run_dosa_prediction(config: dict) -> dict:
         
         group = (producer_layer, consumer_layer)
         
+        # 准备验证快车道的直接映射表
+        producer_mapping = mapping_config.get(producer_layer, {})
+        direct_mapping_table = {}
+        
+        if producer_mapping:
+            # 1. 收集所有出现过的维度和层级
+            all_dims = set()
+            all_levels = producer_mapping.keys()
+            for level_data in producer_mapping.values():
+                all_dims.update(level_data.get('temporal', {}).keys())
+                all_dims.update(level_data.get('spatial', {}).keys())
+            
+            # 2. 进行数据结构的行列转置
+            for dim_name in all_dims:
+                direct_mapping_table[dim_name] = {}
+                for level_name in all_levels:
+                    level_data = producer_mapping.get(level_name, {})
+                    # 获取temporal和spatial因子，如果不存在则默认为1.0
+                    temporal_val = level_data.get('temporal', {}).get(dim_name, 1.0)
+                    spatial_val = level_data.get('spatial', {}).get(dim_name, 1.0)
+                    
+                    direct_mapping_table[dim_name][level_name] = {
+                        'temporal': torch.tensor(float(temporal_val), device=dosa_config.DEVICE),
+                        'spatial': torch.tensor(float(spatial_val), device=dosa_config.DEVICE)
+                    }
+        
         with torch.no_grad():
             result = dmt_model(
-                group, graph, hw_params, mapping, dosa_config
+                group, graph, hw_params, mapping, dosa_config, 
+                direct_mapping_table=direct_mapping_table
             )
             # Handle different return value formats
             if len(result) == 5:
@@ -643,7 +667,7 @@ def generate_timeloop_files(config, work_dir):
     dim_factors = {dim: {} for dim in all_dims}
     
     # Collect spatial factors
-    for dim, val in layer_mapping['PE_array']['spatial'].items():
+    for dim, val in layer_mapping['L0_Registers']['spatial'].items():
         if dim in dim_factors:
             dim_factors[dim]['spatial'] = int(val)
     
@@ -692,8 +716,8 @@ def generate_timeloop_files(config, work_dir):
     # Spatial Target
     targets.append({
         'target': 'PE_array_container', 'type': 'spatial',
-        'factors': format_factors('spatial', 'PE_array'),
-        'permutation': layer_mapping['PE_array']['permutation']
+        'factors': format_factors('spatial', 'L0_Registers'),
+        'permutation': layer_mapping['L0_Registers']['permutation']
     })
     # Temporal Targets
     for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:

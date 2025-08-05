@@ -259,7 +259,7 @@ def generate_timeloop_files(config, work_dir):
     dim_factors = {dim: {} for dim in all_dims}
     
     # Collect spatial factors
-    for dim, val in layer_mapping['PE_array']['spatial'].items():
+    for dim, val in layer_mapping['L0_Registers']['spatial'].items():
         if dim in dim_factors:
             dim_factors[dim]['spatial'] = int(val)
     
@@ -308,8 +308,8 @@ def generate_timeloop_files(config, work_dir):
     # Spatial Target
     targets.append({
         'target': 'PE_array_container', 'type': 'spatial',
-        'factors': format_factors('spatial', 'PE_array'),
-        'permutation': layer_mapping['PE_array']['permutation']
+        'factors': format_factors('spatial', 'L0_Registers'),
+        'permutation': layer_mapping['L0_Registers']['permutation']
     })
     # Temporal Targets
     for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:
