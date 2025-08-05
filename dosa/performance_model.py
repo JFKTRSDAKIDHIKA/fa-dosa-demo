@@ -29,13 +29,14 @@ TENSOR_DIMS = {
     'O': D_O
 }
 
-# 定义存储矩阵 B_i,t (哪些张量存储在哪些层级)
-# B_i,t = 1 表示张量 t 存储在层级 i
+# STORAGE_MATRIX (B_i,t): 1 表示张量 t 存储在层级 i
+# 严格对齐 DOSA 论文 Table 4 for Gemmini-like architecture
 STORAGE_MATRIX = {
-    0: {'W': 1, 'I': 1, 'O': 1},  # L0_Registers: 存储所有张量
-    1: {'W': 1, 'I': 1, 'O': 1},  # L1_Accumulator: 存储所有张量
-    2: {'W': 1, 'I': 1, 'O': 1},  # L2_Scratchpad: 存储所有张量
-    3: {'W': 1, 'I': 1, 'O': 1}   # L3_DRAM: 存储所有张量
+    # Level: {'W': val, 'I': val, 'O': val}
+    0: {'W': 1, 'I': 1, 'O': 0},  # L0_Registers: Stores Weights, Inputs, but NOT Outputs
+    1: {'W': 0, 'I': 0, 'O': 1},  # L1_Accumulator: Stores ONLY Outputs
+    2: {'W': 1, 'I': 1, 'O': 1},  # L2_Scratchpad: Stores all tensors
+    3: {'W': 1, 'I': 1, 'O': 1}   # L3_DRAM: Stores all tensors
 }
 
 def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Config) -> torch.Tensor:
@@ -192,23 +193,90 @@ class HighFidelityPerformanceModel(nn.Module):
     def _calculate_data_block_size(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
         """
         计算在层级 i 必须存储的张量 tensor_type 的数据块大小 C_i,t (以word为单位)
+        严格按照论文公式实现：Equations 2, 3, 4
         """
-        size = torch.tensor(1.0, device=self.config.DEVICE)
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
         
-        # 获取与该张量相关的维度
-        relevant_dims = TENSOR_DIMS[tensor_type]
-        
-        # 对于层级 i 及其内层的所有相关维度，累乘 tiling 因子
-        for level_idx in range(i + 1):  # 从 0 到 i
-            level_name = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM'][level_idx]
+        if tensor_type == 'W':
+            # C_i,W (Equation 2 for Weights):
+            # C_i,W = Π(f_k,j,d) 其中 k ∈ {S, T}, j ∈ {0, ..., i-1}, d ∈ D_W = {R, S, C, K}
+            size = torch.tensor(1.0, device=self.config.DEVICE)
+            relevant_dims = D_W  # {R, S, C, K}
             
-            for dim_name in relevant_dims:
-                if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                    temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                    spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                    size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
-        
-        return size
+            # 遍历从 0 到 i-1 的所有内层层级
+            for j in range(i):
+                level_name = memory_levels[j]
+                # 对每个层级，遍历 D_W 中的所有维度，累乘其 temporal 和 spatial 因子
+                for dim_name in relevant_dims:
+                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                        size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+            
+            return size
+            
+        elif tensor_type == 'O':
+            # C_i,O (Equation 4 for Outputs):
+            # C_i,O = Π(f_k,j,d) 其中 k ∈ {S, T}, j ∈ M (所有内存层级), d ∈ D_O = {P, Q, K, N}
+            size = torch.tensor(1.0, device=self.config.DEVICE)
+            relevant_dims = D_O  # {P, Q, K, N}
+            
+            # 遍历所有内存层级
+            for j in range(len(memory_levels)):
+                level_name = memory_levels[j]
+                # 对每个层级，遍历 D_O 中的所有维度，累乘其 temporal 和 spatial 因子
+                for dim_name in relevant_dims:
+                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                        size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+            
+            return size
+            
+        elif tensor_type == 'I':
+            # C_i,I (Equation 3 for Inputs - 最复杂):
+            # Inner(i, d) = Π(f_k,j,d) (其中 k,j 范围同 C_i,W)
+            # C_i,I = Π_{d∈{C,N}} (f_k,j,d) × (P_stride × (Inner(i,P) - 1) + Inner(i,R)) × (Q_stride × (Inner(i,Q) - 1) + Inner(i,S))
+            
+            def calculate_inner(dim_name):
+                """计算 Inner(i, d) - 某个维度 d 在层级 i 及其内层的总 tile size"""
+                inner_size = torch.tensor(1.0, device=self.config.DEVICE)
+                for j in range(i):
+                    level_name = memory_levels[j]
+                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                        inner_size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+                return inner_size
+            
+            # 假设 P_stride 和 Q_stride 为 1
+            P_stride = 1
+            Q_stride = 1
+            
+            # 计算各个维度的 Inner 值
+            inner_P = calculate_inner('P')
+            inner_R = calculate_inner('R')
+            inner_Q = calculate_inner('Q')
+            inner_S = calculate_inner('S')
+            
+            # 计算 C 和 N 维度在所有内层层级的因子连乘积
+            cn_factors = torch.tensor(1.0, device=self.config.DEVICE)
+            for j in range(i):
+                level_name = memory_levels[j]
+                for dim_name in ['C', 'N']:
+                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                        cn_factors *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+            
+            # 根据公式组合这些部分
+            size = cn_factors * (P_stride * (inner_P - 1) + inner_R) * (Q_stride * (inner_Q - 1) + inner_S)
+            
+            return size
+            
+        else:
+            # 对于未知张量类型，返回默认值
+            return torch.tensor(1.0, device=self.config.DEVICE)
     
     def _calculate_writes(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict, C_i_t: torch.Tensor, M: int) -> torch.Tensor:
         """
@@ -229,10 +297,11 @@ class HighFidelityPerformanceModel(nn.Module):
             # 对所有与该张量相关的维度 d ∈ D_t
             for dim_name in relevant_dims:
                 if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                    # 包括 temporal 和 spatial 因子
+                    # 只累乘 temporal 因子，移除 spatial 因子的影响
+                    # 根据原始方法论，外层循环的迭代次数仅由 temporal_factor 决定
+                    # 因为空间tiling代表的是并行展开，不增加对上层存储的访问次数
                     temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                    spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                    writes *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+                    writes *= torch.tensor(temporal_factor, device=self.config.DEVICE)
         
         return writes
     
@@ -315,6 +384,15 @@ class HighFidelityPerformanceModel(nn.Module):
         """
         找到张量 tensor_type 的最内存储层级
         """
+        # 逻辑说明：该函数通过从最内层（L0）开始查找，返回第一个发现有该张量相关维度映射
+        # （即 temporal 或 spatial 因子 > 1）的层级作为 innermost_level。
+        #
+        # 设计假设：这是一个基于工程实践的合理推断 (engineering heuristic)，
+        # 其核心假设是：一个张量如果在一个层级有 tiling 行为，那么该层级就是它在计算中活跃的最深层级。
+        #
+        # 潜在局限：在某些罕见的边缘映射情况下，此启发式可能与仿真器的行为存在偏差，
+        # 但对于绝大多数典型数据流是有效且鲁棒的。
+        
         memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
         relevant_dims = TENSOR_DIMS[tensor_type]
         
