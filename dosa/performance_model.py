@@ -16,6 +16,28 @@ TENSOR_DIM_MAP = {
     'Output': ['N', 'K', 'P', 'Q']
 }
 
+# 定义维度集合 D_t (与张量 t 相关的维度)
+D_W = {'K', 'C', 'R', 'S'}  # Weight tensor dimensions
+D_I = {'N', 'C', 'P', 'Q'}  # Input tensor dimensions  
+D_O = {'N', 'K', 'P', 'Q'}  # Output tensor dimensions
+D_ALL = {'R', 'S', 'P', 'Q', 'C', 'K', 'N'}  # All problem dimensions
+
+# 张量维度映射
+TENSOR_DIMS = {
+    'W': D_W,
+    'I': D_I, 
+    'O': D_O
+}
+
+# 定义存储矩阵 B_i,t (哪些张量存储在哪些层级)
+# B_i,t = 1 表示张量 t 存储在层级 i
+STORAGE_MATRIX = {
+    0: {'W': 1, 'I': 1, 'O': 1},  # L0_Registers: 存储所有张量
+    1: {'W': 1, 'I': 1, 'O': 1},  # L1_Accumulator: 存储所有张量
+    2: {'W': 1, 'I': 1, 'O': 1},  # L2_Scratchpad: 存储所有张量
+    3: {'W': 1, 'I': 1, 'O': 1}   # L3_DRAM: 存储所有张量
+}
+
 def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Config) -> torch.Tensor:
     """
     计算指定存储层级的带宽（GB/s）。
@@ -99,61 +121,243 @@ class HighFidelityPerformanceModel(nn.Module):
         intra_accesses["L0_Registers"]["Weight"]["reads"] = total_macs  
         intra_accesses["L0_Registers"]["Output"]["updates"] = total_macs
         
-        # 4. 获取层间数据移动量，用于计算L1/L2的读写次数
-        per_level_accesses = self.calculate_per_level_accesses(layer_dims, mapping_table)
+        return intra_accesses
+    
+    def calculate_traffic_formula_native(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor) -> dict:
+        """
+        基于学术论文公式的高保真度内存访问量计算方法。
+        严格实现 Equations 6, 8, 9, 10, 11 中定义的公式体系。
         
-        # 5. L1_Accumulator 访问计算
-        # 读取次数 = 从L2加载到L1的数据量 / 数据位宽
-        if "L2_Scratchpad_to_L1_Accumulator" in per_level_accesses:
-            l1_data_bytes = per_level_accesses["L2_Scratchpad_to_L1_Accumulator"]
-            l1_data_elements = l1_data_bytes / self.config.BYTES_PER_ELEMENT
+        Args:
+            layer_dims: 层的维度信息 {R, S, P, Q, C, K, N}
+            mapping_table: 映射表 {dim: {level: {temporal: x, spatial: y}}}
+            num_pes: 处理单元数量
             
-            # 简化假设：Input、Weight、Output各占1/3的数据移动
-            intra_accesses["L1_Accumulator"]["Input"]["reads"] = l1_data_elements / 3.0
-            intra_accesses["L1_Accumulator"]["Weight"]["reads"] = l1_data_elements / 3.0
-            intra_accesses["L1_Accumulator"]["Input"]["writes"] = l1_data_elements / 3.0
-            intra_accesses["L1_Accumulator"]["Weight"]["writes"] = l1_data_elements / 3.0
+        Returns:
+            dict: 层级间数据传输量 {'L3_DRAM_to_L2_Scratchpad': bytes, ...}
+        """
+        from dosa.utils import calculate_macs
         
-        # Output更新次数考虑空间复用：总MAC数除以PE阵列中的空间复用因子
-        pe_spatial_reuse = torch.sqrt(num_pes)  # 假设PE阵列是方形的
-        intra_accesses["L1_Accumulator"]["Output"]["updates"] = total_macs / torch.clamp(pe_spatial_reuse, min=torch.tensor(1.0, device=pe_spatial_reuse.device))
+        # 计算总MAC运算次数
+        total_macs = calculate_macs(layer_dims)
         
-        # 6. L2_Scratchpad 访问计算
-        # 读取次数 = 从DRAM加载到L2的数据量 / 数据位宽
-        if "L3_DRAM_to_L2_Scratchpad" in per_level_accesses:
-            l2_data_bytes = per_level_accesses["L3_DRAM_to_L2_Scratchpad"]
-            l2_data_elements = l2_data_bytes / self.config.BYTES_PER_ELEMENT
+        # 内存层级定义 (0=Registers, 1=Accumulator, 2=Scratchpad, 3=DRAM)
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        M = len(memory_levels) - 1  # 最高层级索引
+        
+        # 初始化结果字典
+        accesses = {}
+        
+        # 为每个内存层级计算 Reads, Writes, Updates
+        for i in range(M + 1):  # i = 0, 1, 2, 3
+            level_name = memory_levels[i]
             
-            # 简化假设：Input、Weight、Output各占1/3的数据移动
-            intra_accesses["L2_Scratchpad"]["Input"]["reads"] = l2_data_elements / 3.0
-            intra_accesses["L2_Scratchpad"]["Weight"]["reads"] = l2_data_elements / 3.0
-            intra_accesses["L2_Scratchpad"]["Input"]["writes"] = l2_data_elements / 3.0
-            intra_accesses["L2_Scratchpad"]["Weight"]["writes"] = l2_data_elements / 3.0
+            # 对每种张量类型计算访问量
+            for tensor_type in ['W', 'I', 'O']:
+                
+                # 检查该张量是否存储在当前层级
+                if not STORAGE_MATRIX[i][tensor_type]:
+                    continue
+                    
+                # 计算 C_i,t: 在层级 i 存储的张量 t 的数据块大小
+                C_i_t = self._calculate_data_block_size(i, tensor_type, layer_dims, mapping_table)
+                
+                # 计算 Writes_t(i) - Equation 6
+                writes = self._calculate_writes(i, tensor_type, layer_dims, mapping_table, C_i_t, M)
+                
+                # 计算 Reads_t(i) - Equation 11  
+                reads = self._calculate_reads(i, tensor_type, layer_dims, mapping_table, total_macs, M)
+                
+                # 计算 Updates_O(i) - Equation 9 (仅对输出张量)
+                updates = torch.tensor(0.0, device=self.config.DEVICE)
+                if tensor_type == 'O':
+                    updates = self._calculate_updates(i, layer_dims, mapping_table, total_macs, M)
+                
+                # 累加到对应的层级间接口
+                if i < M:  # 不是最高层级
+                    interface_name = f"{memory_levels[i+1]}_to_{level_name}"
+                    if interface_name not in accesses:
+                        accesses[interface_name] = torch.tensor(0.0, device=self.config.DEVICE)
+                    
+                    # 总访问量 = B_i,t × (Reads_t(i) + Writes_t(i)) + B_i,O × Updates_O(i)
+                    tensor_accesses = reads + writes
+                    if tensor_type == 'O':
+                        tensor_accesses += updates
+                    
+                    # 转换为字节
+                    accesses[interface_name] += tensor_accesses * self.config.BYTES_PER_ELEMENT
         
-        # Output更新次数考虑时间和空间复用
-        # 计算L2及其内部层级的总复用因子
-        total_reuse_factor = torch.tensor(1.0, device=self.config.DEVICE)
+        return accesses
+    
+    def _calculate_data_block_size(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
+        """
+        计算在层级 i 必须存储的张量 tensor_type 的数据块大小 C_i,t (以word为单位)
+        """
+        size = torch.tensor(1.0, device=self.config.DEVICE)
         
-        # 获取L0和L1层级的时间映射因子
-        for level_name in ["L0_Registers", "L1_Accumulator"]:
-            for dim_name in ['C', 'R', 'S']:  # Output的复用维度
-                if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+        # 获取与该张量相关的维度
+        relevant_dims = TENSOR_DIMS[tensor_type]
+        
+        # 对于层级 i 及其内层的所有相关维度，累乘 tiling 因子
+        for level_idx in range(i + 1):  # 从 0 到 i
+            level_name = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM'][level_idx]
+            
+            for dim_name in relevant_dims:
+                if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
                     temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                    total_reuse_factor *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+                    spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                    size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
         
-        # 加上空间复用
-        total_reuse_factor *= pe_spatial_reuse
+        return size
+    
+    def _calculate_writes(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict, C_i_t: torch.Tensor, M: int) -> torch.Tensor:
+        """
+        计算 Writes_t(i) - Equation 6
+        Writes_t(i) = C_i,t × Π(f_k,j,d) 其中 j ∈ {i+1, ..., M}, d ∈ D_t
+        """
+        if i == M:  # 最高层级没有写入
+            return torch.tensor(0.0, device=self.config.DEVICE)
         
-        intra_accesses["L2_Scratchpad"]["Output"]["updates"] = total_macs / torch.clamp(total_reuse_factor, min=torch.tensor(1.0, device=self.config.DEVICE))
+        writes = C_i_t
+        relevant_dims = TENSOR_DIMS[tensor_type]
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        
+        # 连乘所有外层于 i 的层级 (j ∈ {i+1, ..., M})
+        for j in range(i + 1, M + 1):
+            level_name = memory_levels[j]
+            
+            # 对所有与该张量相关的维度 d ∈ D_t
+            for dim_name in relevant_dims:
+                if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                    # 包括 temporal 和 spatial 因子
+                    temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                    spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                    writes *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+        
+        return writes
+    
+    def _calculate_reads(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict, total_macs: torch.Tensor, M: int) -> torch.Tensor:
+        """
+        计算 Reads_t(i) - Equation 11
+        分段函数：
+        - if i == innermost tensor t level: Reads_t(i) = MACs / F_S,t(i)
+        - if i > innermost tensor t level: Reads_t(i) = Writes_t(i-1) / F_S,t(i)
+        """
+        # 计算空间复用修正项 F_S,t(i)
+        F_S_t_i = self._calculate_spatial_reuse_factor(i, tensor_type, layer_dims, mapping_table)
+        
+        # 判断是否为该张量的最内层级
+        innermost_level = self._find_innermost_level(tensor_type, mapping_table)
+        
+        if i == innermost_level:
+            # 最内层级：Reads_t(i) = MACs / F_S,t(i)
+            reads = total_macs / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+        else:
+            # 非最内层级：Reads_t(i) = Writes_t(i-1) / F_S,t(i)
+            if i > 0:
+                C_i_minus_1_t = self._calculate_data_block_size(i-1, tensor_type, layer_dims, mapping_table)
+                writes_i_minus_1 = self._calculate_writes(i-1, tensor_type, layer_dims, mapping_table, C_i_minus_1_t, M)
+                reads = writes_i_minus_1 / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+            else:
+                reads = torch.tensor(0.0, device=self.config.DEVICE)
+        
+        return reads
+    
+    def _calculate_updates(self, i: int, layer_dims: dict, mapping_table: dict, total_macs: torch.Tensor, M: int) -> torch.Tensor:
+        """
+        计算 Updates_O(i) - Equation 9 (仅对输出张量)
+        分段函数：
+        - if i == innermost output level: Updates_O(i) = MACs / F_S,O(i)
+        - if i > innermost output level: Updates_O(i) = Writes_O(i-1) / F_S,O(i)
+        """
+        # 计算输出张量的空间复用修正项
+        F_S_O_i = self._calculate_spatial_reuse_factor(i, 'O', layer_dims, mapping_table)
+        
+        # 判断是否为输出张量的最内层级
+        innermost_output_level = self._find_innermost_level('O', mapping_table)
+        
+        if i == innermost_output_level:
+            # 最内层级：Updates_O(i) = MACs / F_S,O(i)
+            updates = total_macs / torch.clamp(F_S_O_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+        else:
+            # 非最内层级：Updates_O(i) = Writes_O(i-1) / F_S,O(i)
+            if i > 0:
+                C_i_minus_1_O = self._calculate_data_block_size(i-1, 'O', layer_dims, mapping_table)
+                writes_O_i_minus_1 = self._calculate_writes(i-1, 'O', layer_dims, mapping_table, C_i_minus_1_O, M)
+                updates = writes_O_i_minus_1 / torch.clamp(F_S_O_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+            else:
+                updates = torch.tensor(0.0, device=self.config.DEVICE)
+        
+        return updates
+    
+    def _calculate_spatial_reuse_factor(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
+        """
+        计算空间复用修正项 F_S,t(i) - Equations 8 & 10
+        F_S,t(i) = Π(f_S,i,d) 其中 d ∈ (D - D_t) (与张量 t 无关的维度)
+        """
+        F_S = torch.tensor(1.0, device=self.config.DEVICE)
+        
+        # 获取与该张量无关的维度 (D - D_t)
+        relevant_dims = TENSOR_DIMS[tensor_type]
+        irrelevant_dims = D_ALL - relevant_dims
+        
+        level_name = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM'][i]
+        
+        # 对所有与张量无关的维度，累乘空间映射因子
+        for dim_name in irrelevant_dims:
+            if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                F_S *= torch.tensor(spatial_factor, device=self.config.DEVICE)
+        
+        return F_S
+    
+    def _find_innermost_level(self, tensor_type: str, mapping_table: dict) -> int:
+        """
+        找到张量 tensor_type 的最内存储层级
+        """
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        relevant_dims = TENSOR_DIMS[tensor_type]
+        
+        # 从最内层开始检查
+        for i in range(len(memory_levels)):
+            level_name = memory_levels[i]
+            
+            # 检查该层级是否有该张量的任何维度映射
+            has_mapping = False
+            for dim_name in relevant_dims:
+                if dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                    temporal = mapping_table[dim_name][level_name].get('temporal', 1)
+                    spatial = mapping_table[dim_name][level_name].get('spatial', 1)
+                    if temporal > 1 or spatial > 1:
+                        has_mapping = True
+                        break
+            
+            if has_mapping:
+                return i
+        
+        # 默认返回最内层
+        return 0
+        
+
         
         return intra_accesses
 
-    def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict) -> dict:
+    def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict, return_detailed_info: bool = False):
         """
         重构后的层间数据移动计算函数 - 基于数据流驱动的访存模型
         核心公式: 层级间传输字节数 = 下层数据足迹 * 外层循环总次数 * 数据位宽
+
+        Args:
+            layer_dims (dict): 层的维度信息
+            mapping_table (dict): 完整的映射表
+            return_detailed_info (bool): 如果为True，则额外返回一个包含中间计算结果的字典
+
+        Returns:
+            - accesses (dict): 一个字典，键为接口名称，值为该接口的总访问字节数
+            - detailed_info (dict, optional): 如果 return_detailed_info 为 True，则返回此字典
         """
         accesses = {}
+        detailed_info = {}
         memory_levels = [level for level in self.config.MEMORY_HIERARCHY if level['type'] in ['buffer', 'dram']]
         level_names = [level['name'] for level in memory_levels]
         
@@ -173,49 +377,51 @@ class HighFidelityPerformanceModel(nn.Module):
             interface_name = f"{upper_level_name}_to_{lower_level_name}"
             total_access_bytes_for_interface = torch.tensor(0.0, device=self.config.DEVICE)
 
+            if return_detailed_info:
+                detailed_info[interface_name] = {}
+
             # 对每种张量类型计算数据移动量
             for tensor_type, relevant_dims in TENSOR_DIM_MAP.items():
                 # 步骤1: 计算下层数据足迹 (Data_Footprint_at_Lower_Level)
                 # 这代表为了完成一次外层循环，需要加载到LowerLevel的数据块大小
                 data_footprint_elements = torch.tensor(1.0, device=self.config.DEVICE)
                 
-                for dim_name in relevant_dims:
-                    if dim_name in layer_dims:
-                        # 累乘该维度在LowerLevel及其内部所有层级的temporal和spatial映射因子
-                        dim_footprint = torch.tensor(1.0, device=self.config.DEVICE)
-                        for level_idx in range(lower_level_idx + 1):
-                            level_name = level_names[level_idx]
-                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                                temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                                spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                                dim_footprint *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
-                        data_footprint_elements *= dim_footprint
+                # 遍历所有内部层级（从最内层到LowerLevel）
+                for level_idx in range(lower_level_idx + 1):
+                    level_name = level_names[level_idx]
+                    # 对于每个内部层级，累乘所有相关维度的temporal和spatial映射因子
+                    for dim_name in relevant_dims:
+                        if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                            temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                            spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+                            data_footprint_elements *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
 
                 # 步骤2: 计算外层循环总次数 (Outer_Loop_Iterations)
                 # 这代表需要多少次从UpperLevel加载数据块到LowerLevel
+                # 外部循环次数 = 所有比UpperLevel更外层的相关维度temporal因子的乘积
                 outer_loop_iterations = torch.tensor(1.0, device=self.config.DEVICE)
                 
-                for dim_name in relevant_dims:
-                    if dim_name in layer_dims:
-                        # 累乘该维度在UpperLevel及其外部所有层级的temporal映射因子
-                        for level_idx in range(upper_level_idx, len(memory_levels)):
-                            level_name = level_names[level_idx]
-                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                                temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                                outer_loop_iterations *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+                # 遍历所有比UpperLevel更外的层级
+                for level_idx in range(upper_level_idx + 1, len(memory_levels)):
+                    level_name = level_names[level_idx]
+                    # 对于每个更外层级，累乘所有相关维度的temporal映射因子
+                    for dim_name in relevant_dims:
+                        if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                            temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                            outer_loop_iterations *= torch.tensor(temporal_factor, device=self.config.DEVICE)
 
                 # 步骤3: 引入数据复用修正 (Reuse_Factor)
                 # 考虑该张量在LowerLevel的数据可以被其他张量的循环复用
                 reuse_factor = torch.tensor(1.0, device=self.config.DEVICE)
                 
-                for dim_name in reuse_dims[tensor_type]:
-                    if dim_name in layer_dims:
-                        # 累乘复用维度在LowerLevel及其内部所有层级的temporal映射因子
-                        for level_idx in range(lower_level_idx + 1):
-                            level_name = level_names[level_idx]
-                            if dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                                temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                                reuse_factor *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+                # 遍历所有内部层级（从最内层到LowerLevel）
+                for level_idx in range(lower_level_idx + 1):
+                    level_name = level_names[level_idx]
+                    # 对于每个内部层级，累乘所有复用维度的temporal映射因子
+                    for dim_name in reuse_dims[tensor_type]:
+                        if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                            temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                            reuse_factor *= torch.tensor(temporal_factor, device=self.config.DEVICE)
                 
                 # 应用复用修正
                 effective_outer_iterations = outer_loop_iterations / torch.clamp(reuse_factor, min=torch.tensor(1e-9, device=self.config.DEVICE))
@@ -226,8 +432,19 @@ class HighFidelityPerformanceModel(nn.Module):
                                        self.config.BYTES_PER_ELEMENT)
                 total_access_bytes_for_interface += tensor_transfer_bytes
 
+                if return_detailed_info:
+                    detailed_info[interface_name][tensor_type] = {
+                        'data_footprint_elements': data_footprint_elements.clone().detach(),
+                        'outer_loop_iterations': outer_loop_iterations.clone().detach(),
+                        'reuse_factor': reuse_factor.clone().detach(),
+                        'effective_outer_iterations': effective_outer_iterations.clone().detach(),
+                        'tensor_transfer_bytes': tensor_transfer_bytes.clone().detach()
+                    }
+
             accesses[interface_name] = total_access_bytes_for_interface
 
+        if return_detailed_info:
+            return accesses, detailed_info
         return accesses
 
     def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -262,7 +479,8 @@ class HighFidelityPerformanceModel(nn.Module):
                 # Calculate compute cycles
                 compute_cycles = macs / num_pes
                 
-                per_level_accesses = self.calculate_per_level_accesses(layer['dims'], all_factors)
+                # 使用新的高保真度公式原生计算方法
+                per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes)
                 
                 # Calculate memory cycles for each interface
                 memory_cycles_list = []
