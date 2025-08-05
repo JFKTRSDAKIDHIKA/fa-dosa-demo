@@ -314,9 +314,8 @@ class HighFidelityPerformanceModel(nn.Module):
         area_cost = hw_params.get_area_cost()
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
-        total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
         
-        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
+        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)

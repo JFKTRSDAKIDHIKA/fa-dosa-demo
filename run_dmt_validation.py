@@ -7,6 +7,7 @@ import random
 import argparse
 import math
 import yaml
+import multiprocessing
 from pathlib import Path
 
 # FA-DOSA core modules
@@ -57,8 +58,9 @@ os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + ':/root/
 
 # --- Define Search Spaces ---
 
-# Configuration for number of validation runs
+# Configuration for number of validation runs# Global configuration
 MAX_VALIDATION_RUNS = None  # Set to None for full sweep, or specify a number (e.g., 1, 2, 4) for quick testing
+VALIDATION_TIMEOUT_SECONDS = 600  # 10 minutes timeout for each validation point
 
 # 1. Fused Groups to be tested (example from ResNet-18)
 FUSION_GROUPS_TO_TEST = [
@@ -109,8 +111,76 @@ def generate_dynamic_mapping_space(workload_dims, producer_layer):
     
     return mapping_space
 
+def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str) -> dict:
+    """根据指定的策略，为单个维度生成跨存储层级的tiling因子。
+
+    Args:
+        dim_size (int): 需要分解的维度大小。
+        num_pes_sqrt (int): PE数量的平方根，用于约束空间因子。
+        strategy (str): 生成策略，可选值为 "performance", "dram_heavy", "random"。
+
+    Returns:
+        dict: 包含 'spatial', 'L0', 'L1', 'L2', 'DRAM' 因子的字典。
+    """
+    if dim_size == 1:
+        return {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
+
+    # 1. 首先，确定空间因子 (spatial factor)
+    # 逻辑保持不变：从所有约数中，找到一个小于等于 num_pes_sqrt 的最大可能值
+    divisors = get_divisors(dim_size).tolist()
+    spatial_candidates = [d for d in divisors if d <= num_pes_sqrt]
+    spatial_factor = random.choice(spatial_candidates) if spatial_candidates else 1
+    
+    remaining_size = dim_size // spatial_factor
+    
+    # 2. 根据策略分配剩余的时间因子 (temporal factors)
+    factors = {'spatial': int(spatial_factor), 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
+    
+    if remaining_size > 1:
+        remaining_divisors = get_divisors(remaining_size).tolist()
+        
+        if strategy == "performance":
+            # 性能优先：从L0开始，从剩余约数中随机选一个最大的，然后迭代
+            temp_size = remaining_size
+            for level in ['L0', 'L1', 'L2']:
+                if temp_size == 1: break
+                level_divs = [d for d in get_divisors(temp_size).tolist() if d > 1]
+                if not level_divs: continue
+                factor_for_level = random.choice(level_divs) # 引入随机性
+                factors[level] = int(factor_for_level)
+                temp_size //= factor_for_level
+            factors['DRAM'] = int(temp_size)
+
+        elif strategy == "dram_heavy":
+            # DRAM主导：将所有剩余因子全部分配给DRAM
+            factors['DRAM'] = int(remaining_size)
+
+        elif strategy == "random":
+            # 均衡随机：将剩余尺寸随机分解给 L0, L1, L2, DRAM
+            temp_size = remaining_size
+            levels = ['L0', 'L1', 'L2', 'DRAM']
+            random.shuffle(levels) # 随机化分配顺序
+            for level in levels:
+                if temp_size == 1: break
+                level_divs = [d for d in get_divisors(temp_size).tolist() if d > 1]
+                if not level_divs: continue
+                factor_for_level = random.choice(level_divs)
+                factors[level] = int(factor_for_level)
+                temp_size //= factor_for_level
+            # 确保乘积正确，将余数给最后一个分配的level
+            if temp_size > 1:
+                 factors[levels[-1]] *= int(temp_size)
+
+    # 3. 验证所有因子的乘积是否等于原始维度大小
+    product = 1
+    for val in factors.values(): product *= val
+    assert product == dim_size, f"Factor product check failed for strategy {strategy}!"
+
+    return factors
+
 def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     """Generate complete factor decomposition for a dimension across all levels.
+    保留此函数以保持向后兼容性。
     
     Args:
         dim_size (int): The problem dimension size to factorize.
@@ -119,88 +189,10 @@ def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     Returns:
         dict: A dictionary with factors for each level ['spatial', 'L0', 'L1', 'L2', 'DRAM'].
     """
-    if dim_size == 1:
-        return {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
-    
-    # Initialize factors with default values
-    factors = {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
-    
-    # Get all prime factors of the dimension size
-    def get_prime_factors(n):
-        i = 2
-        factors = []
-        while i * i <= n:
-            if n % i:
-                i += 1
-            else:
-                n //= i
-                factors.append(i)
-        if n > 1:
-            factors.append(n)
-        return factors
-    
-    prime_factors = get_prime_factors(dim_size)
-    
-    # If no prime factors (dim_size is 1), return default factors
-    if not prime_factors:
-        return factors
-    
-    # Sort prime factors in descending order for better distribution
-    prime_factors.sort(reverse=True)
-    
-    # First, assign spatial factors (limited by num_pes_sqrt)
-    spatial_product = 1
-    remaining_factors = []
-    
-    for factor in prime_factors:
-        if spatial_product * factor <= num_pes_sqrt:
-            spatial_product *= factor
-        else:
-            remaining_factors.append(factor)
-    
-    factors['spatial'] = spatial_product
-    
-    # If there are no remaining factors, assign 1 to all memory levels
-    if not remaining_factors:
-        return factors
-    
-    # Distribute remaining factors among memory levels
-    # We'll use a more deterministic approach to ensure all factors are used
-    memory_levels = ['L0', 'L1', 'L2', 'DRAM']
-    level_index = 0
-    
-    for factor in remaining_factors:
-        factors[memory_levels[level_index]] *= factor
-        level_index = (level_index + 1) % len(memory_levels)
-    
-    # Verification
-    product = 1
-    for val in factors.values():
-        product *= val
-    
-    # If verification fails, use a direct approach to ensure correctness
-    if product != dim_size:
-        # Reset factors
-        factors = {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': dim_size}
-        
-        # Try to assign a valid spatial factor
-        divisors = get_divisors(dim_size).tolist()
-        spatial_candidates = [d for d in divisors if d <= num_pes_sqrt]
-        
-        if spatial_candidates:
-            factors['spatial'] = spatial_candidates[-1]  # Take the largest valid divisor
-            factors['DRAM'] = dim_size // factors['spatial']
-    
-    # Final verification
-    product = 1
-    for val in factors.values():
-        product *= val
-    assert product == dim_size, f"Factor product {product} does not match dim_size {dim_size}"
-    
-    return factors
+    return generate_factors_by_strategy(dim_size, num_pes_sqrt, "random")
 
 def generate_configurations(num_configs: int):
-    """Generates a stream of unique configurations with complete dimension factorization.
+    """Generates a stream of unique configurations with complete dimension factorization using strategy-driven approach.
     
     Args:
         num_configs (int): Number of configurations to generate.
@@ -218,6 +210,9 @@ def generate_configurations(num_configs: int):
         'K N C P Q S R'
     ]
     
+    # Define available strategies
+    strategies = ["performance", "dram_heavy", "random"]
+    
     # Main loop for generating configurations
     for i in range(num_configs):
         # Randomly select a fusion group
@@ -233,11 +228,14 @@ def generate_configurations(num_configs: int):
         # Calculate PE mesh size for spatial constraints
         pe_mesh_size = int(hardware_config['num_pes'] ** 0.5)
         
-        # Generate complete factorization for each dimension
+        # Randomly select a strategy for this configuration
+        chosen_strategy = random.choice(strategies)
+        
+        # Generate complete factorization for each dimension using the chosen strategy
         dim_factors = {}
         for dim_name, dim_size in dims.items():
             if dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
-                dim_factors[dim_name] = generate_complete_dimension_factors(dim_size, pe_mesh_size)
+                dim_factors[dim_name] = generate_factors_by_strategy(dim_size, pe_mesh_size, chosen_strategy)
         
         # Build mapping config with complete factors
         mapping_config = {
@@ -447,6 +445,76 @@ def run_timeloop_simulation(config: dict, work_dir: Path) -> dict:
         }
 
 
+def validate_one_point(config: dict, result_queue: multiprocessing.Queue, validation_point_id: int):
+    """
+    Worker function to validate a single design point with complete error handling.
+    
+    This function encapsulates the entire validation process for one configuration,
+    including both FA-DOSA prediction and Timeloop simulation. It runs in a separate
+    process to enable timeout functionality.
+    
+    Args:
+        config (dict): Complete configuration dictionary
+        result_queue (multiprocessing.Queue): Queue to return results to main process
+        validation_point_id (int): ID of the validation point for logging
+    """
+    try:
+        print(f"[WORKER] Starting validation for point {validation_point_id}")
+        
+        # Create temporary workspace for this worker
+        work_dir = Path(f'./validation_workspace_{validation_point_id}')
+        work_dir.mkdir(exist_ok=True)
+        
+        # Run dual-track evaluation
+        dosa_results = run_dosa_prediction(config)
+        timeloop_results = run_timeloop_simulation(config, work_dir)
+        
+        # Combine configuration info and results
+        flat_config = {
+            "validation_point_id": validation_point_id,
+            "group_name": config['fusion_group_info']['group_name'],
+            **config['hardware_config'],
+        }
+        
+        combined_result = {
+            **flat_config,
+            **dosa_results,
+            **timeloop_results,
+            "status": "success"
+        }
+        
+        # Clean up worker workspace
+        import shutil
+        if work_dir.exists():
+            try:
+                shutil.rmtree(work_dir)
+            except Exception as cleanup_error:
+                print(f"[WARNING] Worker cleanup failed: {cleanup_error}")
+        
+        # Send result back to main process
+        result_queue.put(combined_result)
+        print(f"[WORKER] Validation point {validation_point_id} completed successfully")
+        
+    except Exception as e:
+        print(f"[ERROR] Worker validation failed for point {validation_point_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Send error result back to main process
+        error_result = {
+            "validation_point_id": validation_point_id,
+            "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
+            **config.get('hardware_config', {}),
+            "predicted_latency_s": -1.0,
+            "predicted_energy_pj": -1.0,
+            "simulated_latency_s": -1.0,
+            "simulated_energy_pj": -1.0,
+            "status": "error",
+            "error_message": str(e)
+        }
+        result_queue.put(error_result)
+
+
 def generate_timeloop_files(config, work_dir):
     """Generates arch.yaml, problem.yaml, constraints.yaml, and env.yaml for Timeloop v0.4."""
     hw_config = config['hardware_config']
@@ -654,27 +722,31 @@ def generate_timeloop_files(config, work_dir):
         yaml.dump(env_config, f, sort_keys=False, default_style="'")
 
 def main():
-    """Main control script to run DMT validation experiments."""
+    """Main control script to run DMT validation experiments with timeout support."""
     parser = argparse.ArgumentParser(description="Run DMT validation experiments")
     parser.add_argument('--max-runs', type=int, default=MAX_VALIDATION_RUNS,
                        help='Maximum number of validation runs (default: None for full sweep)')
     parser.add_argument('--output', type=str, default="dmt_validation_results.csv",
                        help='Output CSV file path (default: dmt_validation_results.csv)')
+    parser.add_argument('--timeout', type=int, default=VALIDATION_TIMEOUT_SECONDS,
+                       help=f'Timeout in seconds for each validation point (default: {VALIDATION_TIMEOUT_SECONDS})')
     args = parser.parse_args()
     
-    output_csv_path = args.output
     all_results = []
     max_runs = args.max_runs
+    timeout_seconds = args.timeout
+    
+    # Statistics counters
+    success_count = 0
+    error_count = 0
+    timeout_count = 0
 
-    print("Starting DMT validation run...")
+    print("Starting DMT validation run with timeout support...")
+    print(f"[INFO] Timeout per validation point: {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)")
     if max_runs is not None:
         print(f"[INFO] Limited to {max_runs} validation runs for quick testing")
     else:
         print("[INFO] Running full validation sweep")
-
-    # Create temporary workspace
-    work_dir = Path('./validation_workspace')
-    work_dir.mkdir(exist_ok=True)
 
     try:
         for i, config in enumerate(generate_configurations(max_runs if max_runs is not None else 1000)):
@@ -683,44 +755,110 @@ def main():
                 print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
                 break
                 
-            print(f"--- Running Validation Point {i+1} ---")
+            validation_point_id = i + 1
+            print(f"--- Running Validation Point {validation_point_id} ---")
             
-            # 双轨评估
-            dosa_results = run_dosa_prediction(config)
-            timeloop_results = run_timeloop_simulation(config, work_dir)
+            # Create multiprocessing queue for result communication
+            result_queue = multiprocessing.Queue()
+            
+            # Create and start worker process
+            worker_process = multiprocessing.Process(
+                target=validate_one_point,
+                args=(config, result_queue, validation_point_id)
+            )
+            
+            worker_process.start()
+            
+            # Wait for process to complete with timeout
+            worker_process.join(timeout_seconds)
+            
+            # Check if process is still running (timeout occurred)
+            if worker_process.is_alive():
+                print(f"[TIMEOUT] Validation for point {validation_point_id} exceeded {timeout_seconds}s. Terminating.")
+                
+                # Force terminate the worker process
+                worker_process.terminate()
+                worker_process.join()  # Ensure cleanup
+                
+                # Create timeout result record
+                timeout_result = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
+                    **config.get('hardware_config', {}),
+                    "predicted_latency_s": -1.0,
+                    "predicted_energy_pj": -1.0,
+                    "simulated_latency_s": -1.0,
+                    "simulated_energy_pj": -1.0,
+                    "status": "timeout"
+                }
+                
+                all_results.append(timeout_result)
+                timeout_count += 1
+                
+                # Write timeout result to CSV
+                df = pd.DataFrame([timeout_result])
+                if len(all_results) == 1:  # First result (including timeouts)
+                    df.to_csv(args.output, index=False, mode='w')
+                else:
+                    df.to_csv(args.output, index=False, mode='a', header=False)
+                
+                print(f"[TIMEOUT] Validation point {validation_point_id} marked as timeout and saved to {args.output}")
+                continue
+            
+            # Process completed normally, get result from queue
+            try:
+                combined_result = result_queue.get(timeout=5)  # Short timeout for queue get
+                
+                # Check result status
+                if combined_result.get('status') == 'success':
+                    success_count += 1
+                    print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
+                else:
+                    error_count += 1
+                    print(f"[ERROR] Validation point {validation_point_id} completed with errors")
+                
+                all_results.append(combined_result)
+                
+                # Write result to CSV
+                df = pd.DataFrame([combined_result])
+                if len(all_results) == 1:  # First result
+                    df.to_csv(args.output, index=False, mode='w')
+                else:
+                    df.to_csv(args.output, index=False, mode='a', header=False)
+                
+                print(f"[SUCCESS] Validation point {validation_point_id} saved to {args.output}")
+                
+            except Exception as queue_error:
+                print(f"[ERROR] Failed to get result from worker process: {queue_error}")
+                error_count += 1
+                
+                # Create error result
+                error_result = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
+                    **config.get('hardware_config', {}),
+                    "predicted_latency_s": -1.0,
+                    "predicted_energy_pj": -1.0,
+                    "simulated_latency_s": -1.0,
+                    "simulated_energy_pj": -1.0,
+                    "status": "queue_error",
+                    "error_message": str(queue_error)
+                }
+                
+                all_results.append(error_result)
+                
+                # Write error result to CSV
+                df = pd.DataFrame([error_result])
+                if len(all_results) == 1:  # First result
+                    df.to_csv(args.output, index=False, mode='w')
+                else:
+                    df.to_csv(args.output, index=False, mode='a', header=False)
 
-            # 数据合并
-            # 将配置信息和两边的结果合并到一个字典中
-            flat_config = {
-                "validation_point_id": i + 1,
-                "group_name": config['fusion_group_info']['group_name'],
-                **config['hardware_config'],
-                # 可以有选择性地扁平化一些关键的mapping参数以方便分析
-            }
-            
-            combined_result = {
-                **flat_config,
-                **dosa_results,
-                **timeloop_results
-            }
-            
-            # 数据追加
-            all_results.append(combined_result)
-
-            # 增量写入CSV文件
-            df = pd.DataFrame([combined_result])
-            if i == 0:
-                # 第一次写入，包含表头
-                df.to_csv(args.output, index=False, mode='w')
-            else:
-                # 后续写入，追加模式，不包含表头
-                df.to_csv(args.output, index=False, mode='a', header=False)
-            
-            print(f"[SUCCESS] Validation point {i+1} completed and saved to {args.output}")
-
-        # 结果持久化
-        if all_results:
-            print(f"\nValidation complete. {len(all_results)} data points saved to {args.output}")
+        # Final statistics
+        total_points = len(all_results)
+        if total_points > 0:
+            print(f"\nValidation complete. Total: {total_points}, Succeeded: {success_count}, Failed: {error_count}, Timed out: {timeout_count}")
+            print(f"Results saved to {args.output}")
         else:
             print("\nValidation run finished, but no results were collected.")
             
@@ -730,14 +868,20 @@ def main():
         traceback.print_exc()
             
     finally:
-        # 可选：清理工作目录
+        # Clean up any remaining worker workspaces
         import shutil
-        if work_dir.exists():
+        import glob
+        
+        workspace_pattern = './validation_workspace_*'
+        for workspace_path in glob.glob(workspace_pattern):
             try:
-                shutil.rmtree(work_dir)
-                print("[INFO] Cleaned up temporary workspace")
-            except Exception as e:
-                print(f"[WARNING] Failed to clean up workspace: {e}")
+                if Path(workspace_path).exists():
+                    shutil.rmtree(workspace_path)
+                    print(f"[INFO] Cleaned up worker workspace: {workspace_path}")
+            except Exception as cleanup_error:
+                print(f"[WARNING] Failed to clean up workspace {workspace_path}: {cleanup_error}")
+        
+        print("[INFO] Cleanup complete")
 
 if __name__ == "__main__":
     main()
