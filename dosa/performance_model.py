@@ -9,35 +9,27 @@ from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
 from dosa.dmt import InPlaceFusionDMT, SkipConnectionDMT
 
-# Define TENSOR_DIM_MAP
+# 获取全局配置实例
+_config = Config.get_instance()
+
+# 从Config类获取物理概念体系定义
 TENSOR_DIM_MAP = {
     'Input':  ['N', 'C', 'P', 'Q'],
     'Weight': ['K', 'C', 'R', 'S'],
     'Output': ['N', 'K', 'P', 'Q']
 }
 
-# 定义维度集合 D_t (与张量 t 相关的维度)
-D_W = {'K', 'C', 'R', 'S'}  # Weight tensor dimensions
-D_I = {'N', 'C', 'P', 'Q'}  # Input tensor dimensions  
-D_O = {'N', 'K', 'P', 'Q'}  # Output tensor dimensions
-D_ALL = {'R', 'S', 'P', 'Q', 'C', 'K', 'N'}  # All problem dimensions
+# 使用Config中的张量维度定义
+D_W = _config.TENSOR_DIMENSIONS['W']  # Weight tensor dimensions
+D_I = _config.TENSOR_DIMENSIONS['I']  # Input tensor dimensions  
+D_O = _config.TENSOR_DIMENSIONS['O']  # Output tensor dimensions
+D_ALL = _config.D_ALL  # All problem dimensions
 
-# 张量维度映射
-TENSOR_DIMS = {
-    'W': D_W,
-    'I': D_I, 
-    'O': D_O
-}
+# 张量维度映射 - 使用Config中的定义
+TENSOR_DIMS = _config.TENSOR_DIMENSIONS
 
-# STORAGE_MATRIX (B_i,t): 1 表示张量 t 存储在层级 i
-# 严格对齐 DOSA 论文 Table 4 for Gemmini-like architecture
-STORAGE_MATRIX = {
-    # Level: {'W': val, 'I': val, 'O': val}
-    0: {'W': 1, 'I': 1, 'O': 0},  # L0_Registers: Stores Weights, Inputs, but NOT Outputs
-    1: {'W': 0, 'I': 0, 'O': 1},  # L1_Accumulator: Stores ONLY Outputs
-    2: {'W': 1, 'I': 1, 'O': 1},  # L2_Scratchpad: Stores all tensors
-    3: {'W': 1, 'I': 1, 'O': 1}   # L3_DRAM: Stores all tensors
-}
+# 存储矩阵 - 使用Config中的定义
+STORAGE_MATRIX = _config.STORAGE_MATRIX
 
 def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Config) -> torch.Tensor:
     """
@@ -57,7 +49,7 @@ def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Con
     elif level_name in ['L1_Accumulator', 'L2_Scratchpad']:
         bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
     elif level_name == 'L3_DRAM':
-        bandwidth_words_per_cycle = 8
+        bandwidth_words_per_cycle = torch.tensor(8.0, device=config.DEVICE)
     else:
         # 对于未知层级，使用默认值
         bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
@@ -66,6 +58,33 @@ def calculate_bandwidth_gb_s(level_name: str, num_pes: torch.Tensor, config: Con
     bandwidth_gb_s = (bandwidth_words_per_cycle * config.BYTES_PER_ELEMENT * config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
     
     return bandwidth_gb_s
+
+def calculate_bandwidth_bytes_per_cycle(level_name: str, num_pes: torch.Tensor, config: Config) -> torch.Tensor:
+    """
+    计算指定存储层级的带宽（bytes/cycle）。
+    
+    Args:
+        level_name: 存储层级名称
+        num_pes: 处理单元数量
+        config: 全局配置对象
+    
+    Returns:
+        torch.Tensor: 带宽值（bytes/cycle）
+    """
+    # 根据带宽模型计算 words/cycle
+    if level_name == 'L0_Registers':
+        bandwidth_words_per_cycle = 2 * num_pes
+    elif level_name in ['L1_Accumulator', 'L2_Scratchpad']:
+        bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
+    elif level_name == 'L3_DRAM':
+        bandwidth_words_per_cycle = torch.tensor(8.0, device=config.DEVICE)
+    else:
+        bandwidth_words_per_cycle = 2 * torch.sqrt(num_pes)
+    
+    # 转换为 bytes/cycle
+    bandwidth_bytes_per_cycle = bandwidth_words_per_cycle * torch.tensor(config.BYTES_PER_ELEMENT, device=config.DEVICE)
+    
+    return bandwidth_bytes_per_cycle
 
 class HighFidelityPerformanceModel(nn.Module):
     """
@@ -415,10 +434,6 @@ class HighFidelityPerformanceModel(nn.Module):
         
         # 默认返回最内层
         return 0
-        
-
-        
-        return intra_accesses
 
     def calculate_per_level_accesses(self, layer_dims: dict, mapping_table: dict, return_detailed_info: bool = False):
         """
@@ -527,139 +542,133 @@ class HighFidelityPerformanceModel(nn.Module):
 
     def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        高保真度性能模型的前向传播方法。
+        高保真度性能模型的前向传播方法 - 实现完整的PPA计算逻辑。
+        
+        严格遵循DOSA论文的屋顶线时延模型（公式12）和三段式能耗模型（公式13）。
         
         Args:
             graph: 计算图
             hw_params: 硬件参数
             mapping: FineGrainedMapping实例（用于训练路径）
-            direct_mapping_table: （可选）一个离散的、嵌套的映射表字典。当提供此参数时，
-                                模型将进入'验证模式'，直接使用此映射表，并完全绕过
-                                mapping.get_all_factors()的可微投影逻辑。
-                                格式: {dim: {level: {'temporal': val, 'spatial': val}}}
+            direct_mapping_table: （可选）离散映射表，用于验证模式
         
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                (total_latency, total_energy, total_buffer_mismatch_loss, total_compatibility_penalty, detailed_metrics)
+                (total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty)
         """
         total_latency = torch.tensor(0.0, device=self.config.DEVICE)
         total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
         total_compatibility_penalty = torch.tensor(0.0, device=self.config.DEVICE)
         
+        # 确定映射表来源
         if direct_mapping_table:
-            # [验证路径]：如果外部直接提供了映射表，则进入验证模式。
-            # 我们信任调用者已确保该表的格式和物理有效性。
             all_factors = direct_mapping_table
-            # 注：此路径下，mapping 对象中的可学习参数将不会被使用。
         else:
-            # [训练路径]：如果没有提供直接映射，则保持原有的训练模式。
-            # 通过可微投影仪从可学习参数中获取有效映射因子。
             all_factors = mapping.get_all_factors()
 
+        # 以计算组为单位进行PPA计算
         for group in graph.fusion_groups:
             current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
             dmt_model = self.dmt_registry.get(current_pattern)
 
             if dmt_model:
+                # 使用DMT处理融合模式
                 latency, energy, group_buffer_mismatch_loss, compatibility_penalty, detailed_metrics = dmt_model(group, graph, hw_params, mapping, self.config)
                 total_buffer_mismatch_loss += group_buffer_mismatch_loss
                 total_compatibility_penalty += compatibility_penalty
-                # For now, we assume DMT handles its own buffer requirements implicitly
-                # and doesn't contribute to the mismatch loss in this simplified model.
-                # A more advanced implementation might have DMTs also return a loss.
             else:
-                # Fallback to original logic for single layers or unsupported patterns
+                # 单层计算：实现完整的PPA计算逻辑
                 layer_name = group[0]
                 layer = graph.layers[layer_name]
-                # Refactored to Cycles Accumulation model based on DOSA paper Eq. (2)
-                from dosa.utils import calculate_macs # 确保导入
-                macs = calculate_macs(layer['dims'])
                 
+                # 导入必要的工具函数
+                from dosa.utils import calculate_macs
+                
+                # 基础参数计算
+                total_macs = calculate_macs(layer['dims'])
                 num_pes = hw_params.get_projected_num_pes()
                 
-                # Calculate compute cycles
-                compute_cycles = macs / num_pes
+                # ===== 2.1 时延模型实现 (屋顶线模型 - 公式12) =====
                 
-                # 使用新的高保真度公式原生计算方法
+                # 步骤1: 计算Compute_Cycles
+                compute_cycles = total_macs / num_pes
+                
+                # 步骤2: 计算Memory_Cycles
+                # 调用高保真访存计算引擎
                 per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes)
                 
-                # Calculate memory cycles for each interface
                 memory_cycles_list = []
-                num_pes_sqrt = torch.sqrt(num_pes)
-
-                for interface, accesses in per_level_accesses.items():
+                for interface, accesses_bytes in per_level_accesses.items():
                     upper_level_name = interface.split('_to_')[0]
                     
-                    # 使用新的带宽计算函数
-                    bandwidth_gb_s = calculate_bandwidth_gb_s(upper_level_name, num_pes, self.config)
+                    # 计算该接口的带宽（bytes/cycle）
+                    bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(upper_level_name, num_pes, self.config)
                     
-                    # Convert bandwidth from GB/s to bytes_per_cycle
-                    bytes_per_cycle = bandwidth_gb_s * 1e9 / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
-                    
-                    # Calculate memory cycles for this interface
-                    memory_cycles = accesses / (bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
+                    # 计算该接口的内存周期数
+                    memory_cycles = accesses_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
                     memory_cycles_list.append(memory_cycles)
                 
-                # Identify memory bottleneck
+                # 步骤3: 确定瓶颈并计算总延迟
                 if memory_cycles_list:
                     bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
                 else:
                     bottleneck_memory_cycles = torch.tensor(0.0, device=self.config.DEVICE)
                 
-                # Calculate stall cycles
+                # 计算停滞周期
                 stall_cycles = torch.relu(bottleneck_memory_cycles - compute_cycles)
                 
-                # Calculate total cycles and convert to latency
+                # 计算总周期数和延迟
                 total_cycles = compute_cycles + stall_cycles
                 latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
-
-                # 计算总能耗：compute_energy + inter_level_energy + intra_level_energy
+                
+                # ===== 2.2 能耗模型实现 (三段式成本核算 - 公式13) =====
+                
                 energy = torch.tensor(0.0, device=self.config.DEVICE)
                 
-                # 1. Compute Energy (MAC运算能耗)
-                energy += macs * self.config.PE_MAC_EPA_PJ
+                # 步骤1: 计算Compute_Energy
+                energy_compute = total_macs * self.config.PE_MAC_EPA_PJ
+                energy += energy_compute
                 
-                # 2. Inter-level Energy (层间数据移动能耗)
+                # 步骤2: 计算Inter-level_Energy (层间能耗)
+                energy_inter_level = torch.tensor(0.0, device=self.config.DEVICE)
+                
                 for interface, accesses_bytes in per_level_accesses.items():
                     lower_level_name = interface.split('_to_')[1]
-                    accesses_4bytes = accesses_bytes / 4.0
-
+                    accesses_words = accesses_bytes / self.config.BYTES_PER_ELEMENT
+                    
+                    # 根据目的地层级查找对应的EPA模型
                     if lower_level_name == 'L0_Registers':
-                        energy += accesses_4bytes * self.config.L0_REG_BASE_EPA_PJ
+                        epa = self.config.L0_REG_BASE_EPA_PJ
                     elif lower_level_name == 'L1_Accumulator':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
+                        num_pes_sqrt = torch.sqrt(num_pes)
                         epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                        energy += accesses_4bytes * epa
                     elif lower_level_name == 'L2_Scratchpad':
                         size_kb = hw_params.get_buffer_size_kb(lower_level_name)
                         epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                        energy += accesses_4bytes * epa
                     elif lower_level_name == 'L3_DRAM':
-                        energy += accesses_4bytes * self.config.L3_DRAM_EPA_PJ
+                        epa = self.config.L3_DRAM_EPA_PJ
+                    else:
+                        epa = torch.tensor(0.0, device=self.config.DEVICE)
+                    
+                    energy_inter_level += accesses_words * epa
                 
-                # 3. Intra-level Energy (片上高频访问能耗)
-                intra_level_accesses = self.calculate_intra_level_accesses(layer['dims'], all_factors, num_pes)
+                energy += energy_inter_level
                 
-                for level_name, tensors in intra_level_accesses.items():
-                    for tensor_type, operations in tensors.items():
-                        for op_type, access_count in operations.items():
-                            # 将访问次数转换为字节数
-                            access_bytes = access_count * self.config.BYTES_PER_ELEMENT
-                            
-                            # 根据存储层级计算能耗
-                            if level_name == 'L0_Registers':
-                                energy += access_bytes * self.config.L0_REG_BASE_EPA_PJ
-                            elif level_name == 'L1_Accumulator':
-                                size_kb = hw_params.get_buffer_size_kb(level_name)
-                                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                                energy += access_bytes * epa
-                            elif level_name == 'L2_Scratchpad':
-                                size_kb = hw_params.get_buffer_size_kb(level_name)
-                                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                                energy += access_bytes * epa
-
-                # Calculate buffer mismatch loss for this layer
+                # 步骤3: 计算Intra-level_Energy (层内能耗)
+                energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
+                
+                # 对于L0寄存器，reads和updates次数都等于Total_MACs
+                accesses_reads_l0 = total_macs
+                accesses_updates_l0 = total_macs
+                
+                energy_intra_level = (accesses_reads_l0 + accesses_updates_l0) * self.config.L0_REG_BASE_EPA_PJ
+                energy += energy_intra_level
+                
+                # ===== 2.3 面积模型与其他损失项 =====
+                
+                # 计算缓冲区不匹配损失
                 for i, level in enumerate(self.config.MEMORY_HIERARCHY):
                     if level['type'] == 'buffer':
                         required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
@@ -671,14 +680,17 @@ class HighFidelityPerformanceModel(nn.Module):
             total_latency += latency
             total_energy += energy
 
+        # 面积成本
+        area_cost = hw_params.get_area_cost()
+        
         # 确保所有返回值都是标量张量
         total_latency = total_latency.squeeze() if total_latency.dim() > 0 else total_latency
         total_energy = total_energy.squeeze() if total_energy.dim() > 0 else total_energy
-        area_cost = hw_params.get_area_cost()
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
+        total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
         
-        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss
+        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
@@ -692,9 +704,17 @@ class HighFidelityPerformanceModel(nn.Module):
                     for i in range(level_idx + 1):
                         inner_level_name = self.config.MEMORY_HIERARCHY[i]['name']
                         if inner_level_name in factors[dim_name]:
-                            tile_dims[dim_name] = tile_dims[dim_name] * \
-                                factors[dim_name][inner_level_name]['temporal'].squeeze() * \
-                                factors[dim_name][inner_level_name]['spatial'].squeeze()
+                            # 安全地处理不同数据类型
+                            temporal_factor = factors[dim_name][inner_level_name]['temporal']
+                            spatial_factor = factors[dim_name][inner_level_name]['spatial']
+                            
+                            # 确保因子是张量类型
+                            if not isinstance(temporal_factor, torch.Tensor):
+                                temporal_factor = torch.tensor(float(temporal_factor), device=self.config.DEVICE)
+                            if not isinstance(spatial_factor, torch.Tensor):
+                                spatial_factor = torch.tensor(float(spatial_factor), device=self.config.DEVICE)
+                            
+                            tile_dims[dim_name] = tile_dims[dim_name] * temporal_factor * spatial_factor
             
             tensor_tile_size = reduce(mul, [tile_dims.get(d, torch.tensor(1.0, device=self.config.DEVICE)) for d in tensor_dims if d in dims], torch.tensor(1.0, device=self.config.DEVICE))
             total_buffer_bytes += tensor_tile_size * self.config.BYTES_PER_ELEMENT
