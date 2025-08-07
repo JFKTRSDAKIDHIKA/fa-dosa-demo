@@ -144,44 +144,42 @@ class HighFidelityPerformanceModel(nn.Module):
         
         return intra_accesses
     
-    def calculate_traffic_formula_native(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
+    def calculate_inter_level_fill_traffic(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
         """
-        基于学术论文公式的高保真度内存访问量计算方法。
-        严格实现 Equations 6, 8, 9, 10, 11 中定义的公式体系。
+        计算跨层级数据填充流量（Inter-Level Data Fill Traffic）。
+        
+        此函数专门负责计算所有跨层级接口上，因缓存未命中而产生的"数据填充"流量。
+        严格遵循论文公式(11)中的路径A (i > innermost_level)，即流量由 Writes_t(i) 驱动。
         
         Args:
             layer_dims: 层的维度信息 {R, S, P, Q, C, K, N}
             mapping_table: 映射表 {dim: {level: {temporal: x, spatial: y}}}
             num_pes: 处理单元数量
+            debug_data: 调试数据收集容器
             
         Returns:
-            dict: 层级间数据传输量 {'L3_DRAM_to_L2_Scratchpad': bytes, ...}
+            dict: 跨层级填充流量 {'L3_DRAM_to_L2_Scratchpad': bytes, ...}
         """
-        from dosa.utils import calculate_macs
-        
-        # 计算总MAC运算次数
-        total_macs = calculate_macs(layer_dims)
-        
         # 内存层级定义 (0=Registers, 1=Accumulator, 2=Scratchpad, 3=DRAM)
         memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
         M = len(memory_levels) - 1  # 最高层级索引
         
         # 初始化结果字典
-        accesses = {}
+        fill_traffic = {}
         
         # 初始化调试数据收集
         if debug_data is not None:
-            debug_data["detailed_traffic_formula_trace"] = {}
+            debug_data["inter_level_fill_traffic_trace"] = {}
         
-        # 为每个内存层级计算 Reads, Writes, Updates
+        # 为每个内存层级计算填充流量（基于 Writes）
         for i in range(M + 1):  # i = 0, 1, 2, 3
             level_name = memory_levels[i]
             
             # 初始化当前层级的调试数据
             if debug_data is not None:
-                debug_data["detailed_traffic_formula_trace"][f"{level_name} (i={i})"] = {}
+                debug_data["inter_level_fill_traffic_trace"][f"{level_name} (i={i})"] = {}
             
-            # 对每种张量类型计算访问量
+            # 对每种张量类型计算填充流量
             for tensor_type in ['W', 'I', 'O']:
                 
                 # 检查该张量是否存储在当前层级
@@ -191,62 +189,41 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 计算 C_i,t: 在层级 i 存储的张量 t 的数据块大小
                 C_i_t = self._calculate_data_block_size(i, tensor_type, layer_dims, mapping_table)
                 
-                # 计算空间复用因子
-                F_S_t_i = self._calculate_spatial_reuse_factor(i, tensor_type, layer_dims, mapping_table)
-                
                 # 计算最内层活跃层级
                 innermost_level = self._find_innermost_level(tensor_type, mapping_table)
                 
-                # 计算 Writes_t(i) - Equation 6
+                # 计算 Writes_t(i) - 这是填充流量的驱动因子
                 writes = self._calculate_writes(i, tensor_type, layer_dims, mapping_table, C_i_t, M)
-                
-                # 计算 Reads_t(i) - Equation 11  
-                reads = self._calculate_reads(i, tensor_type, layer_dims, mapping_table, total_macs, M)
-                
-                # 计算 Updates_O(i) - Equation 9 (仅对输出张量)
-                updates = torch.tensor(0.0, device=self.config.DEVICE)
-                if tensor_type == 'O':
-                    updates = self._calculate_updates(i, layer_dims, mapping_table, total_macs, M)
                 
                 # 收集详细的调试数据
                 if debug_data is not None:
                     tensor_debug_data = {
                         "C_i,t": C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
-                        "F_S,t(i)": F_S_t_i.detach().cpu().item() if isinstance(F_S_t_i, torch.Tensor) else F_S_t_i,
                         "innermost_level": innermost_level,
-                        "Reads_t(i)": reads.detach().cpu().item() if isinstance(reads, torch.Tensor) else reads,
                         "Writes_t(i)": writes.detach().cpu().item() if isinstance(writes, torch.Tensor) else writes
                     }
-                    if tensor_type == 'O':
-                        tensor_debug_data["Updates_O(i)"] = updates.detach().cpu().item() if isinstance(updates, torch.Tensor) else updates
                     
-                    debug_data["detailed_traffic_formula_trace"][f"{level_name} (i={i})"][tensor_type] = tensor_debug_data
+                    debug_data["inter_level_fill_traffic_trace"][f"{level_name} (i={i})"][tensor_type] = tensor_debug_data
                 
-                # 累加到对应的层级间接口
+                # 累加到对应的层级间接口（仅基于 Writes）
                 if i < M:  # 不是最高层级
                     interface_name = f"{memory_levels[i+1]}_to_{level_name}"
-                    if interface_name not in accesses:
-                        accesses[interface_name] = torch.tensor(0.0, device=self.config.DEVICE)
+                    if interface_name not in fill_traffic:
+                        fill_traffic[interface_name] = torch.tensor(0.0, device=self.config.DEVICE)
                     
-                    # 总访问量 = B_i,t × (Reads_t(i) + Writes_t(i)) + B_i,O × Updates_O(i)
-                    tensor_accesses = reads + writes
-                    if tensor_type == 'O':
-                        tensor_accesses += updates
-                    
-                    # 转换为字节
-                    accesses[interface_name] += tensor_accesses * self.config.BYTES_PER_ELEMENT
+                    # 填充流量 = Writes_t(i) × BYTES_PER_ELEMENT
+                    fill_traffic[interface_name] += writes * self.config.BYTES_PER_ELEMENT
         
-        # === 第三步：为权重(W)实现真实的L1->L0层间填充流量计算 ===
+        # === 特殊处理：为权重(W)实现真实的L1->L0层间填充流量计算 ===
         # 当i=1(L1)时，单独计算写往L0的权重填充流量
-        if 'L1_Accumulator_to_L0_Registers' in accesses:
+        if 'L1_Accumulator_to_L0_Registers' in fill_traffic:
             # 重置L1->L0接口的流量，只包含真实的权重填充流量
-            accesses['L1_Accumulator_to_L0_Registers'] = torch.tensor(0.0, device=self.config.DEVICE)
+            fill_traffic['L1_Accumulator_to_L0_Registers'] = torch.tensor(0.0, device=self.config.DEVICE)
             
             # 计算权重在L0的数据足迹 (Data_Footprint_at_L0)
             weight_data_footprint_l0 = self._calculate_data_block_size(0, 'W', layer_dims, mapping_table)
             
-            # 计算驱动L0数据重载的外层循环总次数 (参考calculate_per_level_accesses的思想)
-            # 外层循环次数 = 所有比L0更外层的权重相关维度temporal因子的乘积
+            # 计算驱动L0数据重载的外层循环总次数
             outer_loop_iterations = torch.tensor(1.0, device=self.config.DEVICE)
             weight_dims = ['K', 'C', 'R', 'S']  # 权重张量的相关维度
             
@@ -278,7 +255,7 @@ class HighFidelityPerformanceModel(nn.Module):
                                          self.config.BYTES_PER_ELEMENT)
             
             # 更新L1->L0接口的流量（只包含权重填充流量）
-            accesses['L1_Accumulator_to_L0_Registers'] = l1_to_l0_weight_fills_bytes
+            fill_traffic['L1_Accumulator_to_L0_Registers'] = l1_to_l0_weight_fills_bytes
             
             # 收集调试数据
             if debug_data is not None:
@@ -290,7 +267,99 @@ class HighFidelityPerformanceModel(nn.Module):
                     "l1_to_l0_weight_fills_bytes": l1_to_l0_weight_fills_bytes.detach().cpu().item() if isinstance(l1_to_l0_weight_fills_bytes, torch.Tensor) else l1_to_l0_weight_fills_bytes
                 }
         
-        return accesses
+        return fill_traffic
+    
+    def calculate_intra_level_consumption_accesses(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
+        """
+        计算层级内部数据消耗访问（Intra-Level Data Consumption Accesses）。
+        
+        此函数专门负责计算每个存储层级发生的"层级内部"的"数据消耗"访问次数。
+        严格遵循论文公式(11)中的路径B (i = innermost_level)，即访问次数与 total_macs 成正比。
+        
+        Args:
+            layer_dims: 层的维度信息 {R, S, P, Q, C, K, N}
+            mapping_table: 映射表 {dim: {level: {temporal: x, spatial: y}}}
+            num_pes: 处理单元数量
+            debug_data: 调试数据收集容器
+            
+        Returns:
+            dict: 嵌套字典，描述每个层级、每种张量的"消耗性"读/写/更新次数
+                 {'L2_Scratchpad': {'Input': {'reads': 1.15e8}}, 'L1_Accumulator': {'Output': {'updates': ...}}, ...}
+        """
+        from dosa.utils import calculate_macs
+        
+        # 计算总MAC运算次数
+        total_macs = calculate_macs(layer_dims)
+        
+        # 内存层级定义 (0=Registers, 1=Accumulator, 2=Scratchpad, 3=DRAM)
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        M = len(memory_levels) - 1  # 最高层级索引
+        
+        # 初始化结果字典
+        consumption_accesses = {}
+        
+        # 初始化调试数据收集
+        if debug_data is not None:
+            debug_data["intra_level_consumption_trace"] = {}
+        
+        # 为每个内存层级计算消耗性访问
+        for i in range(M + 1):  # i = 0, 1, 2, 3
+            level_name = memory_levels[i]
+            consumption_accesses[level_name] = {}
+            
+            # 初始化当前层级的调试数据
+            if debug_data is not None:
+                debug_data["intra_level_consumption_trace"][f"{level_name} (i={i})"] = {}
+            
+            # 对每种张量类型计算消耗性访问
+            for tensor_type in ['W', 'I', 'O']:
+                
+                # 检查该张量是否存储在当前层级
+                if not STORAGE_MATRIX[i][tensor_type]:
+                    continue
+                
+                # 计算最内层活跃层级
+                innermost_level = self._find_innermost_level(tensor_type, mapping_table)
+                
+                # 只有在 innermost_level 才会发生消耗性访问
+                if i == innermost_level:
+                    # 计算空间复用因子
+                    F_S_t_i = self._calculate_spatial_reuse_factor(i, tensor_type, layer_dims, mapping_table)
+                    
+                    # 初始化张量访问字典
+                    tensor_name = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}[tensor_type]
+                    consumption_accesses[level_name][tensor_name] = {}
+                    
+                    if tensor_type in ['W', 'I']:
+                        # 对于权重和输入张量，计算消耗性读取
+                        consumption_reads = total_macs / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+                        consumption_accesses[level_name][tensor_name]['reads'] = consumption_reads
+                        
+                        # 收集调试数据
+                        if debug_data is not None:
+                            debug_data["intra_level_consumption_trace"][f"{level_name} (i={i})"][tensor_type] = {
+                                "F_S,t(i)": F_S_t_i.detach().cpu().item() if isinstance(F_S_t_i, torch.Tensor) else F_S_t_i,
+                                "innermost_level": innermost_level,
+                                "consumption_reads": consumption_reads.detach().cpu().item() if isinstance(consumption_reads, torch.Tensor) else consumption_reads
+                            }
+                    
+                    elif tensor_type == 'O':
+                        # 对于输出张量，计算消耗性更新
+                        consumption_updates = total_macs / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+                        consumption_accesses[level_name][tensor_name]['updates'] = consumption_updates
+                        
+                        # 收集调试数据
+                        if debug_data is not None:
+                            debug_data["intra_level_consumption_trace"][f"{level_name} (i={i})"][tensor_type] = {
+                                "F_S,t(i)": F_S_t_i.detach().cpu().item() if isinstance(F_S_t_i, torch.Tensor) else F_S_t_i,
+                                "innermost_level": innermost_level,
+                                "consumption_updates": consumption_updates.detach().cpu().item() if isinstance(consumption_updates, torch.Tensor) else consumption_updates
+                            }
+        
+        # 清理空的层级
+        consumption_accesses = {level: tensors for level, tensors in consumption_accesses.items() if tensors}
+        
+        return consumption_accesses
     
     def _calculate_data_block_size(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
         """
@@ -722,25 +791,25 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 步骤2: 计算Compute_Cycles (使用实际利用的PE数量)
                 compute_cycles = total_macs / effective_pes
                 
-                # 步骤3: 计算Memory_Cycles
-                # 调用高保真访存计算引擎
-                per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes, debug_data)
+                # 步骤3: 计算Memory_Cycles（仅基于跨层级数据填充流量）
+                # 调用跨层级填充流量计算引擎
+                inter_level_fill_traffic_bytes = self.calculate_inter_level_fill_traffic(layer['dims'], all_factors, num_pes, debug_data)
                 
                 memory_cycles_list = []
-                for interface, accesses_bytes in per_level_accesses.items():
+                for interface, fill_bytes in inter_level_fill_traffic_bytes.items():
                     upper_level_name = interface.split('_to_')[0]
                     
                     # 计算该接口的带宽（bytes/cycle）
                     bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(upper_level_name, num_pes, self.config)
                     
-                    # 计算该接口的内存周期数
-                    memory_cycles = accesses_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
+                    # 计算该接口的内存周期数（仅基于填充流量）
+                    memory_cycles = fill_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
                     memory_cycles_list.append(memory_cycles)
                     
                     # 收集内存接口分析数据
                     if debug_data is not None:
                         debug_data["memory_interface_analysis"][interface] = {
-                            "accesses_bytes": accesses_bytes.detach().cpu().item() if isinstance(accesses_bytes, torch.Tensor) else accesses_bytes,
+                            "fill_bytes": fill_bytes.detach().cpu().item() if isinstance(fill_bytes, torch.Tensor) else fill_bytes,
                             "bandwidth_bytes_per_cycle": bandwidth_bytes_per_cycle.detach().cpu().item() if isinstance(bandwidth_bytes_per_cycle, torch.Tensor) else bandwidth_bytes_per_cycle,
                             "memory_cycles": memory_cycles.detach().cpu().item() if isinstance(memory_cycles, torch.Tensor) else memory_cycles
                         }
@@ -765,7 +834,7 @@ class HighFidelityPerformanceModel(nn.Module):
                     debug_data["memory_interface_analysis"]["L2_to_MAC"] = {
                         "F_S_I_2": F_S_I_2.detach().cpu().item() if isinstance(F_S_I_2, torch.Tensor) else F_S_I_2,
                         "L2_to_MAC_traffic_elements": L2_to_MAC_traffic_elements.detach().cpu().item() if isinstance(L2_to_MAC_traffic_elements, torch.Tensor) else L2_to_MAC_traffic_elements,
-                        "accesses_bytes": L2_to_MAC_traffic_bytes.detach().cpu().item() if isinstance(L2_to_MAC_traffic_bytes, torch.Tensor) else L2_to_MAC_traffic_bytes,
+                        "fill_bytes": L2_to_MAC_traffic_bytes.detach().cpu().item() if isinstance(L2_to_MAC_traffic_bytes, torch.Tensor) else L2_to_MAC_traffic_bytes,
                         "bandwidth_bytes_per_cycle": L2_to_MAC_bandwidth.detach().cpu().item() if isinstance(L2_to_MAC_bandwidth, torch.Tensor) else L2_to_MAC_bandwidth,
                         "memory_cycles": l2_to_mac_cycles.detach().cpu().item() if isinstance(l2_to_mac_cycles, torch.Tensor) else l2_to_mac_cycles
                     }
@@ -804,12 +873,12 @@ class HighFidelityPerformanceModel(nn.Module):
                 energy_compute = total_macs * self.config.PE_MAC_EPA_PJ
                 energy += energy_compute
                 
-                # 步骤2: 计算Inter-level_Energy (层间能耗)
+                # 步骤2: 计算Inter-level_Energy (层间填充能耗)
                 energy_inter_level = torch.tensor(0.0, device=self.config.DEVICE)
                 
-                for interface, accesses_bytes in per_level_accesses.items():
+                for interface, fill_bytes in inter_level_fill_traffic_bytes.items():
                     lower_level_name = interface.split('_to_')[1]
-                    accesses_words = accesses_bytes / self.config.BYTES_PER_ELEMENT
+                    fill_words = fill_bytes / self.config.BYTES_PER_ELEMENT
                     
                     # 根据目的地层级查找对应的EPA模型
                     if lower_level_name == 'L0_Registers':
@@ -826,18 +895,37 @@ class HighFidelityPerformanceModel(nn.Module):
                     else:
                         epa = torch.tensor(0.0, device=self.config.DEVICE)
                     
-                    energy_inter_level += accesses_words * epa
+                    energy_inter_level += fill_words * epa
                 
                 energy += energy_inter_level
                 
-                # 步骤3: 计算Intra-level_Energy (层内能耗)
+                # 步骤3: 计算Intra-level_Energy (层级内部消耗能耗)
                 energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
                 
-                # 对于L0寄存器，reads和updates次数都等于Total_MACs
-                accesses_reads_l0 = total_macs
-                accesses_updates_l0 = total_macs
+                # 调用层级内部消耗访问计算引擎
+                intra_level_consumption_accesses = self.calculate_intra_level_consumption_accesses(layer['dims'], all_factors, num_pes, debug_data)
                 
-                energy_intra_level = (accesses_reads_l0 + accesses_updates_l0) * self.config.L0_REG_BASE_EPA_PJ
+                for level_name, tensors in intra_level_consumption_accesses.items():
+                    # 根据层级名称获取对应的EPA
+                    if level_name == 'L0_Registers':
+                        epa = self.config.L0_REG_BASE_EPA_PJ
+                    elif level_name == 'L1_Accumulator':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        num_pes_sqrt = torch.sqrt(num_pes)
+                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+                    elif level_name == 'L2_Scratchpad':
+                        size_kb = hw_params.get_buffer_size_kb(level_name)
+                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+                    elif level_name == 'L3_DRAM':
+                        epa = self.config.L3_DRAM_EPA_PJ
+                    else:
+                        epa = torch.tensor(0.0, device=self.config.DEVICE)
+                    
+                    # 累加该层级所有张量的所有操作的能耗
+                    for tensor_type, operations in tensors.items():
+                        for op_type, count in operations.items():
+                            energy_intra_level += count * epa
+                
                 energy += energy_intra_level
                 
                 # ===== 2.3 面积模型与其他损失项 =====
