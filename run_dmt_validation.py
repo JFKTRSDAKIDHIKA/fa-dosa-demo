@@ -504,13 +504,14 @@ def validate_one_point(config: dict, result_queue: multiprocessing.Queue, valida
             "status": "success"
         }
         
-        # Clean up worker workspace
-        import shutil
-        if work_dir.exists():
-            try:
-                shutil.rmtree(work_dir)
-            except Exception as cleanup_error:
-                print(f"[WARNING] Worker cleanup failed: {cleanup_error}")
+        # Clean up worker workspace (DISABLED to preserve Timeloop reports)
+        # import shutil
+        # if work_dir.exists():
+        #     try:
+        #         shutil.rmtree(work_dir)
+        #     except Exception as cleanup_error:
+        #         print(f"[WARNING] Worker cleanup failed: {cleanup_error}")
+        print(f"[INFO] Timeloop reports preserved in: {work_dir.resolve()}")
         
         # Send result back to main process
         result_queue.put(combined_result)
@@ -751,9 +752,12 @@ def main():
                        help='Output CSV file path (default: dmt_validation_results.csv)')
     parser.add_argument('--timeout', type=int, default=VALIDATION_TIMEOUT_SECONDS,
                        help=f'Timeout in seconds for each validation point (default: {VALIDATION_TIMEOUT_SECONDS})')
+    parser.add_argument('--config-output', type=str, default="validation_configs.json",
+                       help='Output JSON file for validation configurations (default: validation_configs.json)')
     args = parser.parse_args()
     
     all_results = []
+    master_configs = {}  # Dictionary to store all validation point configurations
     max_runs = args.max_runs
     timeout_seconds = args.timeout
     
@@ -778,6 +782,18 @@ def main():
                 
             validation_point_id = i + 1
             print(f"--- Running Validation Point {validation_point_id} ---")
+            
+            # Collect complete configuration information for this validation point
+            config_object = {
+                "hw_config": config.get('hardware_config', {}),
+                "mapping_config": config.get('mapping_config', {}),
+                "fusion_group_info": config.get('fusion_group_info', {}),
+                "workload_dims": config.get('workload_dims', {})
+            }
+            
+            # Store configuration in master dictionary
+            master_configs[str(validation_point_id)] = config_object
+            print(f"[INFO] Configuration for validation point {validation_point_id} collected and stored")
             
             # Create multiprocessing queue for result communication
             result_queue = multiprocessing.Queue()
@@ -883,26 +899,43 @@ def main():
         else:
             print("\nValidation run finished, but no results were collected.")
             
+        # Save configuration information to JSON file
+        try:
+            with open(args.config_output, 'w') as f:
+                json.dump(master_configs, f, indent=4)
+            print(f"[INFO] Configuration information saved to {args.config_output}")
+            print(f"[INFO] Total configurations saved: {len(master_configs)}")
+        except Exception as json_error:
+            print(f"[ERROR] Failed to save configuration JSON: {json_error}")
+            
     except Exception as e:
         print(f"[ERROR] Main validation loop failed: {e}")
         import traceback
         traceback.print_exc()
             
     finally:
-        # Clean up any remaining worker workspaces
-        import shutil
+        # Clean up any remaining worker workspaces (DISABLED to preserve Timeloop reports)
+        # import shutil
+        # import glob
+        # 
+        # workspace_pattern = './validation_workspace_*'
+        # for workspace_path in glob.glob(workspace_pattern):
+        #     try:
+        #         if Path(workspace_path).exists():
+        #             shutil.rmtree(workspace_path)
+        #             print(f"[INFO] Cleaned up worker workspace: {workspace_path}")
+        #     except Exception as cleanup_error:
+        #         print(f"[WARNING] Failed to clean up workspace {workspace_path}: {cleanup_error}")
+        # 
+        # print("[INFO] Cleanup complete")
+        
         import glob
-        
         workspace_pattern = './validation_workspace_*'
-        for workspace_path in glob.glob(workspace_pattern):
-            try:
-                if Path(workspace_path).exists():
-                    shutil.rmtree(workspace_path)
-                    print(f"[INFO] Cleaned up worker workspace: {workspace_path}")
-            except Exception as cleanup_error:
-                print(f"[WARNING] Failed to clean up workspace {workspace_path}: {cleanup_error}")
-        
-        print("[INFO] Cleanup complete")
+        preserved_workspaces = glob.glob(workspace_pattern)
+        if preserved_workspaces:
+            print(f"[INFO] Timeloop reports preserved in: {', '.join(preserved_workspaces)}")
+        else:
+            print("[INFO] No workspace directories found to preserve")
 
 if __name__ == "__main__":
     main()
