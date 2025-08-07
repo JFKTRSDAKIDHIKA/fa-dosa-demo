@@ -90,13 +90,14 @@ class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
     """
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, debug_latency: bool = False):
         super().__init__()
         self.config = config
+        self.debug_latency = debug_latency
         self.dmt_registry = {
-            ('Conv', 'ReLU'): InPlaceFusionDMT(),
-            ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(),
-            ('MatMul', 'Add'): InPlaceFusionDMT(),
+            ('Conv', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
+            ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
+            ('MatMul', 'Add'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
             # ResNet skip connection patterns
             ('Conv', 'BatchNormalization', 'ReLU', 'Add'): SkipConnectionDMT(),
             ('Conv', 'Add'): SkipConnectionDMT(),
@@ -143,7 +144,7 @@ class HighFidelityPerformanceModel(nn.Module):
         
         return intra_accesses
     
-    def calculate_traffic_formula_native(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor) -> dict:
+    def calculate_traffic_formula_native(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
         """
         基于学术论文公式的高保真度内存访问量计算方法。
         严格实现 Equations 6, 8, 9, 10, 11 中定义的公式体系。
@@ -168,9 +169,17 @@ class HighFidelityPerformanceModel(nn.Module):
         # 初始化结果字典
         accesses = {}
         
+        # 初始化调试数据收集
+        if debug_data is not None:
+            debug_data["detailed_traffic_formula_trace"] = {}
+        
         # 为每个内存层级计算 Reads, Writes, Updates
         for i in range(M + 1):  # i = 0, 1, 2, 3
             level_name = memory_levels[i]
+            
+            # 初始化当前层级的调试数据
+            if debug_data is not None:
+                debug_data["detailed_traffic_formula_trace"][f"{level_name} (i={i})"] = {}
             
             # 对每种张量类型计算访问量
             for tensor_type in ['W', 'I', 'O']:
@@ -182,6 +191,12 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 计算 C_i,t: 在层级 i 存储的张量 t 的数据块大小
                 C_i_t = self._calculate_data_block_size(i, tensor_type, layer_dims, mapping_table)
                 
+                # 计算空间复用因子
+                F_S_t_i = self._calculate_spatial_reuse_factor(i, tensor_type, layer_dims, mapping_table)
+                
+                # 计算最内层活跃层级
+                innermost_level = self._find_innermost_level(tensor_type, mapping_table)
+                
                 # 计算 Writes_t(i) - Equation 6
                 writes = self._calculate_writes(i, tensor_type, layer_dims, mapping_table, C_i_t, M)
                 
@@ -192,6 +207,20 @@ class HighFidelityPerformanceModel(nn.Module):
                 updates = torch.tensor(0.0, device=self.config.DEVICE)
                 if tensor_type == 'O':
                     updates = self._calculate_updates(i, layer_dims, mapping_table, total_macs, M)
+                
+                # 收集详细的调试数据
+                if debug_data is not None:
+                    tensor_debug_data = {
+                        "C_i,t": C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
+                        "F_S,t(i)": F_S_t_i.detach().cpu().item() if isinstance(F_S_t_i, torch.Tensor) else F_S_t_i,
+                        "innermost_level": innermost_level,
+                        "Reads_t(i)": reads.detach().cpu().item() if isinstance(reads, torch.Tensor) else reads,
+                        "Writes_t(i)": writes.detach().cpu().item() if isinstance(writes, torch.Tensor) else writes
+                    }
+                    if tensor_type == 'O':
+                        tensor_debug_data["Updates_O(i)"] = updates.detach().cpu().item() if isinstance(updates, torch.Tensor) else updates
+                    
+                    debug_data["detailed_traffic_formula_trace"][f"{level_name} (i={i})"][tensor_type] = tensor_debug_data
                 
                 # 累加到对应的层级间接口
                 if i < M:  # 不是最高层级
@@ -206,6 +235,60 @@ class HighFidelityPerformanceModel(nn.Module):
                     
                     # 转换为字节
                     accesses[interface_name] += tensor_accesses * self.config.BYTES_PER_ELEMENT
+        
+        # === 第三步：为权重(W)实现真实的L1->L0层间填充流量计算 ===
+        # 当i=1(L1)时，单独计算写往L0的权重填充流量
+        if 'L1_Accumulator_to_L0_Registers' in accesses:
+            # 重置L1->L0接口的流量，只包含真实的权重填充流量
+            accesses['L1_Accumulator_to_L0_Registers'] = torch.tensor(0.0, device=self.config.DEVICE)
+            
+            # 计算权重在L0的数据足迹 (Data_Footprint_at_L0)
+            weight_data_footprint_l0 = self._calculate_data_block_size(0, 'W', layer_dims, mapping_table)
+            
+            # 计算驱动L0数据重载的外层循环总次数 (参考calculate_per_level_accesses的思想)
+            # 外层循环次数 = 所有比L0更外层的权重相关维度temporal因子的乘积
+            outer_loop_iterations = torch.tensor(1.0, device=self.config.DEVICE)
+            weight_dims = ['K', 'C', 'R', 'S']  # 权重张量的相关维度
+            
+            # 遍历L1及以上层级
+            for level_idx in range(1, M + 1):
+                level_name = memory_levels[level_idx]
+                for dim_name in weight_dims:
+                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                        outer_loop_iterations *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+            
+            # 计算权重复用因子 (在L0层级的复用)
+            weight_reuse_factor = torch.tensor(1.0, device=self.config.DEVICE)
+            weight_reuse_dims = ['N', 'P', 'Q']  # 权重在这些维度上被复用
+            
+            # 只考虑L0层级的复用
+            level_name = memory_levels[0]  # L0_Registers
+            for dim_name in weight_reuse_dims:
+                if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
+                    temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
+                    weight_reuse_factor *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+            
+            # 应用复用修正
+            effective_outer_iterations = outer_loop_iterations / torch.clamp(weight_reuse_factor, min=torch.tensor(1e-9, device=self.config.DEVICE))
+            
+            # 计算L1->L0的权重填充流量
+            l1_to_l0_weight_fills_bytes = (weight_data_footprint_l0 * 
+                                         effective_outer_iterations * 
+                                         self.config.BYTES_PER_ELEMENT)
+            
+            # 更新L1->L0接口的流量（只包含权重填充流量）
+            accesses['L1_Accumulator_to_L0_Registers'] = l1_to_l0_weight_fills_bytes
+            
+            # 收集调试数据
+            if debug_data is not None:
+                debug_data["L1_to_L0_weight_fills_calculation"] = {
+                    "weight_data_footprint_l0": weight_data_footprint_l0.detach().cpu().item() if isinstance(weight_data_footprint_l0, torch.Tensor) else weight_data_footprint_l0,
+                    "outer_loop_iterations": outer_loop_iterations.detach().cpu().item() if isinstance(outer_loop_iterations, torch.Tensor) else outer_loop_iterations,
+                    "weight_reuse_factor": weight_reuse_factor.detach().cpu().item() if isinstance(weight_reuse_factor, torch.Tensor) else weight_reuse_factor,
+                    "effective_outer_iterations": effective_outer_iterations.detach().cpu().item() if isinstance(effective_outer_iterations, torch.Tensor) else effective_outer_iterations,
+                    "l1_to_l0_weight_fills_bytes": l1_to_l0_weight_fills_bytes.detach().cpu().item() if isinstance(l1_to_l0_weight_fills_bytes, torch.Tensor) else l1_to_l0_weight_fills_bytes
+                }
         
         return accesses
     
@@ -338,8 +421,16 @@ class HighFidelityPerformanceModel(nn.Module):
         innermost_level = self._find_innermost_level(tensor_type, mapping_table)
         
         if i == innermost_level:
-            # 最内层级：Reads_t(i) = MACs / F_S,t(i)
-            reads = total_macs / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+            # --- 开始重构 ---
+            if tensor_type == 'W':
+                # 对于权重(W)，其在最内层(L0)的'Reads'是内部供给，不产生对上一级的物理读取流量。
+                # 返回一个极小值或零，以确保它不贡献 L1->L0 的 traffic。
+                reads = torch.tensor(0.0, device=self.config.DEVICE)
+            else:
+                # 对于其他张量（如输入I），其在最内层的'Reads'是真实的物理读取。
+                # 维持原公式，因为它现在描述的是从其最内层存储（如L2 for I）到MAC的流量。
+                reads = total_macs / torch.clamp(F_S_t_i, min=torch.tensor(1e-9, device=self.config.DEVICE))
+            # --- 结束重构 ---
         else:
             # 非最内层级：Reads_t(i) = Writes_t(i-1) / F_S,t(i)
             if i > 0:
@@ -403,6 +494,12 @@ class HighFidelityPerformanceModel(nn.Module):
         """
         找到张量 tensor_type 的最内存储层级
         """
+        # --- 开始重构 ---
+        # 根据论文(表4)的设定，强制输入张量(I)的最内层存储为 L2 Scratchpad (index=2)
+        if tensor_type == 'I':
+            return 2
+        # --- 结束重构 ---
+        
         # 逻辑说明：该函数通过从最内层（L0）开始查找，返回第一个发现有该张量相关维度映射
         # （即 temporal 或 spatial 因子 > 1）的层级作为 innermost_level。
         #
@@ -540,7 +637,7 @@ class HighFidelityPerformanceModel(nn.Module):
             return accesses, detailed_info
         return accesses
 
-    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None, debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         高保真度性能模型的前向传播方法 - 实现完整的PPA计算逻辑。
         
@@ -560,6 +657,15 @@ class HighFidelityPerformanceModel(nn.Module):
         total_energy = torch.tensor(0.0, device=self.config.DEVICE)
         total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
         total_compatibility_penalty = torch.tensor(0.0, device=self.config.DEVICE)
+        
+        # 初始化调试数据容器
+        debug_data = None
+        if self.debug_latency and debug_output_path:
+            debug_data = {
+                "calculation_summary": {},
+                "memory_interface_analysis": {},
+                "detailed_traffic_formula_trace": {}
+            }
         
         # 确定映射表来源
         if direct_mapping_table:
@@ -612,7 +718,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 # 步骤3: 计算Memory_Cycles
                 # 调用高保真访存计算引擎
-                per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes)
+                per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes, debug_data)
                 
                 memory_cycles_list = []
                 for interface, accesses_bytes in per_level_accesses.items():
@@ -624,6 +730,39 @@ class HighFidelityPerformanceModel(nn.Module):
                     # 计算该接口的内存周期数
                     memory_cycles = accesses_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
                     memory_cycles_list.append(memory_cycles)
+                    
+                    # 收集内存接口分析数据
+                    if debug_data is not None:
+                        debug_data["memory_interface_analysis"][interface] = {
+                            "accesses_bytes": accesses_bytes.detach().cpu().item() if isinstance(accesses_bytes, torch.Tensor) else accesses_bytes,
+                            "bandwidth_bytes_per_cycle": bandwidth_bytes_per_cycle.detach().cpu().item() if isinstance(bandwidth_bytes_per_cycle, torch.Tensor) else bandwidth_bytes_per_cycle,
+                            "memory_cycles": memory_cycles.detach().cpu().item() if isinstance(memory_cycles, torch.Tensor) else memory_cycles
+                        }
+                
+                # === 第四步：建模L2_to_MAC接口 ===
+                # 为从L2到MAC的输入数据流建立独立的成本核算
+                
+                # 计算L2_to_MAC的流量
+                F_S_I_2 = self._calculate_spatial_reuse_factor(2, 'I', layer['dims'], all_factors)
+                L2_to_MAC_traffic_elements = total_macs / torch.clamp(F_S_I_2, min=torch.tensor(1e-9, device=self.config.DEVICE))
+                L2_to_MAC_traffic_bytes = L2_to_MAC_traffic_elements * self.config.BYTES_PER_ELEMENT
+                
+                # 根据论文，L2带宽与L1相同
+                L2_to_MAC_bandwidth = calculate_bandwidth_bytes_per_cycle('L1_Accumulator', num_pes, self.config)
+                l2_to_mac_cycles = L2_to_MAC_traffic_bytes / (L2_to_MAC_bandwidth + torch.tensor(1e-9, device=self.config.DEVICE))
+                
+                # 将L2_to_MAC周期加入到memory_cycles_list中
+                memory_cycles_list.append(l2_to_mac_cycles)
+                
+                # 收集L2_to_MAC接口分析数据
+                if debug_data is not None:
+                    debug_data["memory_interface_analysis"]["L2_to_MAC"] = {
+                        "F_S_I_2": F_S_I_2.detach().cpu().item() if isinstance(F_S_I_2, torch.Tensor) else F_S_I_2,
+                        "L2_to_MAC_traffic_elements": L2_to_MAC_traffic_elements.detach().cpu().item() if isinstance(L2_to_MAC_traffic_elements, torch.Tensor) else L2_to_MAC_traffic_elements,
+                        "accesses_bytes": L2_to_MAC_traffic_bytes.detach().cpu().item() if isinstance(L2_to_MAC_traffic_bytes, torch.Tensor) else L2_to_MAC_traffic_bytes,
+                        "bandwidth_bytes_per_cycle": L2_to_MAC_bandwidth.detach().cpu().item() if isinstance(L2_to_MAC_bandwidth, torch.Tensor) else L2_to_MAC_bandwidth,
+                        "memory_cycles": l2_to_mac_cycles.detach().cpu().item() if isinstance(l2_to_mac_cycles, torch.Tensor) else l2_to_mac_cycles
+                    }
                 
                 # 步骤4: 确定瓶颈并计算总延迟
                 if memory_cycles_list:
@@ -637,6 +776,19 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 计算总周期数和延迟
                 total_cycles = compute_cycles + stall_cycles
                 latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
+                
+                # 收集计算总结数据
+                if debug_data is not None:
+                    debug_data["calculation_summary"] = {
+                        "total_macs": total_macs.detach().cpu().item() if isinstance(total_macs, torch.Tensor) else total_macs,
+                        "utilized_pes": utilized_pes.detach().cpu().item() if isinstance(utilized_pes, torch.Tensor) else utilized_pes,
+                        "effective_pes": effective_pes.detach().cpu().item() if isinstance(effective_pes, torch.Tensor) else effective_pes,
+                        "compute_cycles": compute_cycles.detach().cpu().item() if isinstance(compute_cycles, torch.Tensor) else compute_cycles,
+                        "bottleneck_memory_cycles": bottleneck_memory_cycles.detach().cpu().item() if isinstance(bottleneck_memory_cycles, torch.Tensor) else bottleneck_memory_cycles,
+                        "stall_cycles": stall_cycles.detach().cpu().item() if isinstance(stall_cycles, torch.Tensor) else stall_cycles,
+                        "total_cycles": total_cycles.detach().cpu().item() if isinstance(total_cycles, torch.Tensor) else total_cycles,
+                        "final_latency_s": latency.detach().cpu().item() if isinstance(latency, torch.Tensor) else latency
+                    }
                 
                 # ===== 2.2 能耗模型实现 (三段式成本核算 - 公式13) =====
                 
@@ -698,6 +850,13 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # 面积成本
         area_cost = hw_params.get_area_cost()
+        
+        # 写入调试数据到JSON文件
+        if debug_data is not None and debug_output_path is not None:
+            import json
+            with torch.no_grad():
+                with open(debug_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(debug_data, f, indent=4, ensure_ascii=False)
         
         # 确保所有返回值都是标量张量
         total_latency = total_latency.squeeze() if total_latency.dim() > 0 else total_latency

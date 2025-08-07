@@ -268,12 +268,13 @@ def generate_configurations(num_configs: int):
              "workload_dims": WORKLOAD_DIMS
          }
 
-def run_dosa_prediction(config: dict) -> dict:
+def run_dosa_prediction(config: dict, validation_point_id: int = None) -> dict:
     """
     使用FA-DOSA的内部分析模型，为给定的配置计算PPA预测值。
 
     Args:
         config (dict): 包含'hardware_config', 'mapping_config', 等信息的完整配置字典。
+        validation_point_id (int): 验证点ID，用于生成唯一的调试文件名
 
     Returns:
         dict: 包含预测结果的字典，例如 {'predicted_latency_s': 0.001, 'predicted_energy_pj': 5000.0}
@@ -288,7 +289,9 @@ def run_dosa_prediction(config: dict) -> dict:
         if fusion_group_info['pattern'] != ['Conv', 'ReLU']:
             raise ValueError(f"Unsupported DMT pattern for validation: {fusion_group_info['pattern']}")
         
-        dmt_model = InPlaceFusionDMT()
+        # 为每个验证点生成唯一的调试文件名
+        debug_filename = f"debug_performance_model_point_{validation_point_id}.json" if validation_point_id is not None else "debug_performance_model.json"
+        dmt_model = InPlaceFusionDMT(debug_latency=True, debug_output_path=debug_filename)
 
         hw_params = HardwareParameters(
             initial_num_pes=hw_config['num_pes'],
@@ -487,7 +490,7 @@ def validate_one_point(config: dict, result_queue: multiprocessing.Queue, valida
         work_dir.mkdir(exist_ok=True)
         
         # Run dual-track evaluation
-        dosa_results = run_dosa_prediction(config)
+        dosa_results = run_dosa_prediction(config, validation_point_id)
         timeloop_results = run_timeloop_simulation(config, work_dir)
         
         # Combine configuration info and results

@@ -61,6 +61,11 @@ class InPlaceFusionDMT(BaseDMT):
     重构后的InPlaceFusionDMT作为任务分派器，将融合组的计算任务
     分派给HighFidelityPerformanceModel核心引擎进行统一的PPA计算。
     """
+    
+    def __init__(self, debug_latency: bool = False, debug_output_path: str = None):
+        super().__init__()
+        self.debug_latency = debug_latency
+        self.debug_output_path = debug_output_path
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
                 mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
@@ -78,14 +83,15 @@ class InPlaceFusionDMT(BaseDMT):
         
         # 步骤3: 调用核心引擎 - 实例化并调用HighFidelityPerformanceModel
         from dosa.performance_model import HighFidelityPerformanceModel
-        perf_model = HighFidelityPerformanceModel(config)
+        perf_model = HighFidelityPerformanceModel(config, debug_latency=self.debug_latency)
         
         # 调用核心引擎的forward方法进行统一PPA计算
         latency, energy, area, buffer_mismatch_loss, compatibility_penalty = perf_model.forward(
             graph=pseudo_graph,
             hw_params=hw_params,
             mapping=mapping,
-            direct_mapping_table=direct_mapping_table
+            direct_mapping_table=direct_mapping_table,
+            debug_output_path=self.debug_output_path
         )
         
         # 步骤4: 返回结果 - 直接返回核心引擎的计算结果
@@ -154,12 +160,13 @@ class SkipConnectionDMT(BaseDMT):
         from dosa.performance_model import HighFidelityPerformanceModel
         
         if main_pseudo_graph:
-            perf_model_main = HighFidelityPerformanceModel(config)
+            perf_model_main = HighFidelityPerformanceModel(config, debug_latency=True)
             latency_main, energy_main, area_main, buffer_loss_main, compat_penalty_main = perf_model_main.forward(
                 graph=main_pseudo_graph,
                 hw_params=hw_params,
                 mapping=mapping,
-                direct_mapping_table=direct_mapping_table
+                direct_mapping_table=direct_mapping_table,
+                debug_output_path="debug_performance_model.json"
             )
         else:
             latency_main = torch.tensor(0.0, device=config.DEVICE)
