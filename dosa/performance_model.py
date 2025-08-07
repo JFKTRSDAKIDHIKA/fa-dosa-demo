@@ -591,10 +591,26 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 # ===== 2.1 时延模型实现 (屋顶线模型 - 公式12) =====
                 
-                # 步骤1: 计算Compute_Cycles
-                compute_cycles = total_macs / num_pes
+                # 步骤1: 计算实际利用的PE数量 (utilized_pes)
+                utilized_pes = torch.tensor(1.0, device=self.config.DEVICE)
                 
-                # 步骤2: 计算Memory_Cycles
+                # 从 all_factors 中提取所有 spatial 因子并累乘
+                for dim_name, dim_mapping in all_factors.items():
+                    for level_name, level_factors in dim_mapping.items():
+                        if 'spatial' in level_factors:
+                            spatial_factor = level_factors['spatial']
+                            # 确保 spatial_factor 是张量类型
+                            if not isinstance(spatial_factor, torch.Tensor):
+                                spatial_factor = torch.tensor(float(spatial_factor), device=self.config.DEVICE)
+                            utilized_pes *= spatial_factor
+                
+                # 边界条件检查：确保 utilized_pes 至少为 1，防止除以零错误
+                effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
+                
+                # 步骤2: 计算Compute_Cycles (使用实际利用的PE数量)
+                compute_cycles = total_macs / effective_pes
+                
+                # 步骤3: 计算Memory_Cycles
                 # 调用高保真访存计算引擎
                 per_level_accesses = self.calculate_traffic_formula_native(layer['dims'], all_factors, num_pes)
                 
@@ -609,7 +625,7 @@ class HighFidelityPerformanceModel(nn.Module):
                     memory_cycles = accesses_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
                     memory_cycles_list.append(memory_cycles)
                 
-                # 步骤3: 确定瓶颈并计算总延迟
+                # 步骤4: 确定瓶颈并计算总延迟
                 if memory_cycles_list:
                     bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
                 else:
