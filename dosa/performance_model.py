@@ -472,7 +472,11 @@ class HighFidelityPerformanceModel(nn.Module):
     def _calculate_spatial_reuse_factor(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
         """
         计算空间复用修正项 F_S,t(i) - Equations 8 & 10
-        F_S,t(i) = Π(f_S,i,d) 其中 d ∈ (D - D_t) (与张量 t 无关的维度)
+        F_S,t(i) = Π(f_S,0,d) 其中 d ∈ (D - D_t) (与张量 t 无关的维度)
+        
+        重要修正：空间并行性是由PE阵列的物理结构决定的全局效应，
+        其大小由最内层L0_Registers的spatial映射唯一决定，
+        并且这个效应会影响所有为PE阵列供给数据的上层存储。
         """
         F_S = torch.tensor(1.0, device=self.config.DEVICE)
         
@@ -480,12 +484,14 @@ class HighFidelityPerformanceModel(nn.Module):
         relevant_dims = TENSOR_DIMS[tensor_type]
         irrelevant_dims = D_ALL - relevant_dims
         
-        level_name = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM'][i]
+        # 修正：空间映射的唯一来源层级 - 始终从最内层L0_Registers查找
+        SPATIAL_MAPPING_LEVEL = 'L0_Registers'
         
         # 对所有与张量无关的维度，累乘空间映射因子
         for dim_name in irrelevant_dims:
-            if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
+            if dim_name in layer_dims and dim_name in mapping_table and SPATIAL_MAPPING_LEVEL in mapping_table[dim_name]:
+                # 修正：始终在固定的SPATIAL_MAPPING_LEVEL中查找spatial因子
+                spatial_factor = mapping_table[dim_name][SPATIAL_MAPPING_LEVEL].get('spatial', 1)
                 F_S *= torch.tensor(spatial_factor, device=self.config.DEVICE)
         
         return F_S
