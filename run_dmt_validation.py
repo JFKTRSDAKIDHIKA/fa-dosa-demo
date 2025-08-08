@@ -191,6 +191,35 @@ def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     """
     return generate_factors_by_strategy(dim_size, num_pes_sqrt, "random")
 
+def get_fixed_validation_config():
+    """返回 validation_point_id=1 的固定配置字典"""
+    config_vp1 = {
+        "hardware_config": {
+            "num_pes": 64,
+            "l2_scratchpad_size_kb": 256
+        },
+        "mapping_config": {
+            "layer1.0.conv1": {
+                "DRAM": {"temporal": {"N":1,"C":1,"K":1,"P":1,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L2_Scratchpad": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L1_Accumulator": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L0_Registers": {"temporal": {"N":1,"C":32,"K":2,"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":2,"K":8}, "permutation": "K N C P Q S R"}
+            }
+        },
+        "fusion_group_info": {
+            "group_name": "layer1.0.conv1_relu",
+            "layers": ["layer1.0.conv1", "layer1.0.relu"],
+            "pattern": ["Conv", "ReLU"],
+            "producer_layer": "layer1.0.conv1",
+            "consumer_layer": "layer1.0.relu"
+        },
+        "workload_dims": {
+            "layer1.0.conv1": {"N":1,"C":64,"K":64,"P":56,"Q":56,"R":3,"S":3},
+            "layer1.0.relu": {"N":1,"C":64,"K":64,"P":56,"Q":56,"R":1,"S":1}
+        }
+    }
+    return config_vp1
+
 def generate_configurations(num_configs: int):
     """Generates a stream of unique configurations with complete dimension factorization using strategy-driven approach.
     
@@ -777,122 +806,50 @@ def main():
         print("[INFO] Running full validation sweep")
 
     try:
-        for i, config in enumerate(generate_configurations(max_runs if max_runs is not None else 1000)):
-            # Check if we've reached the maximum number of runs
-            if max_runs is not None and i >= max_runs:
-                print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
-                break
-                
-            validation_point_id = i + 1
-            print(f"--- Running Validation Point {validation_point_id} ---")
+        # 获取固定的验证配置
+        fixed_config = get_fixed_validation_config()
+        validation_point_id = 1
+        print(f"--- Running FIXED Validation Point {validation_point_id} ---")
+        
+        # Store configuration in master dictionary
+        master_configs[str(validation_point_id)] = fixed_config
+        print(f"[INFO] Fixed configuration for validation point {validation_point_id} loaded")
+        
+        # 为简化调试，直接调用worker函数而不使用多进程
+        print("[INFO] Running in single-process debug mode.")
+        work_dir = Path(f'./validation_workspace_{validation_point_id}')
+        
+        try:
+            # 直接运行双轨评估
+            dosa_results = run_dosa_prediction(fixed_config, validation_point_id)
+            timeloop_results = run_timeloop_simulation(fixed_config, work_dir)
             
-            # Collect complete configuration information for this validation point
-            config_object = {
-                "hw_config": config.get('hardware_config', {}),
-                "mapping_config": config.get('mapping_config', {}),
-                "fusion_group_info": config.get('fusion_group_info', {}),
-                "workload_dims": config.get('workload_dims', {})
+            # 合并结果
+            flat_config = {
+                "validation_point_id": validation_point_id,
+                "group_name": fixed_config['fusion_group_info']['group_name'],
+                **fixed_config['hardware_config']
             }
+            combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success_fixed_run"}
+            all_results.append(combined_result)
+            success_count += 1
             
-            # Store configuration in master dictionary
-            master_configs[str(validation_point_id)] = config_object
-            print(f"[INFO] Configuration for validation point {validation_point_id} collected and stored")
+            print(f"[SUCCESS] Fixed validation point {validation_point_id} completed successfully")
             
-            # Create multiprocessing queue for result communication
-            result_queue = multiprocessing.Queue()
+        except Exception as e:
+            print(f"[ERROR] Fixed validation point {validation_point_id} failed: {e}")
+            import traceback
+            traceback.print_exc()
             
-            # Create and start worker process
-            worker_process = multiprocessing.Process(
-                target=validate_one_point,
-                args=(config, result_queue, validation_point_id)
-            )
-            
-            worker_process.start()
-            
-            # Wait for process to complete with timeout
-            worker_process.join(timeout_seconds)
-            
-            # Check if process is still running (timeout occurred)
-            if worker_process.is_alive():
-                print(f"[TIMEOUT] Validation for point {validation_point_id} exceeded {timeout_seconds}s. Terminating.")
-                
-                # Force terminate the worker process
-                worker_process.terminate()
-                worker_process.join()  # Ensure cleanup
-                
-                # Create timeout result record
-                timeout_result = {
-                    "validation_point_id": validation_point_id,
-                    "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
-                    **config.get('hardware_config', {}),
-                    "predicted_latency_s": -1.0,
-                    "predicted_energy_pj": -1.0,
-                    "simulated_latency_s": -1.0,
-                    "simulated_energy_pj": -1.0,
-                    "status": "timeout"
-                }
-                
-                all_results.append(timeout_result)
-                timeout_count += 1
-                
-                # Write timeout result to CSV
-                df = pd.DataFrame([timeout_result])
-                if len(all_results) == 1:  # First result (including timeouts)
-                    df.to_csv(args.output, index=False, mode='w')
-                else:
-                    df.to_csv(args.output, index=False, mode='a', header=False)
-                
-                print(f"[TIMEOUT] Validation point {validation_point_id} marked as timeout and saved to {args.output}")
-                continue
-            
-            # Process completed normally, get result from queue
-            try:
-                combined_result = result_queue.get(timeout=5)  # Short timeout for queue get
-                
-                # Check result status
-                if combined_result.get('status') == 'success':
-                    success_count += 1
-                    print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
-                else:
-                    error_count += 1
-                    print(f"[ERROR] Validation point {validation_point_id} completed with errors")
-                
-                all_results.append(combined_result)
-                
-                # Write result to CSV
-                df = pd.DataFrame([combined_result])
-                if len(all_results) == 1:  # First result
-                    df.to_csv(args.output, index=False, mode='w')
-                else:
-                    df.to_csv(args.output, index=False, mode='a', header=False)
-                
-                print(f"[SUCCESS] Validation point {validation_point_id} saved to {args.output}")
-                
-            except Exception as queue_error:
-                print(f"[ERROR] Failed to get result from worker process: {queue_error}")
-                error_count += 1
-                
-                # Create error result
-                error_result = {
-                    "validation_point_id": validation_point_id,
-                    "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
-                    **config.get('hardware_config', {}),
-                    "predicted_latency_s": -1.0,
-                    "predicted_energy_pj": -1.0,
-                    "simulated_latency_s": -1.0,
-                    "simulated_energy_pj": -1.0,
-                    "status": "queue_error",
-                    "error_message": str(queue_error)
-                }
-                
-                all_results.append(error_result)
-                
-                # Write error result to CSV
-                df = pd.DataFrame([error_result])
-                if len(all_results) == 1:  # First result
-                    df.to_csv(args.output, index=False, mode='w')
-                else:
-                    df.to_csv(args.output, index=False, mode='a', header=False)
+            # 添加错误结果
+            flat_config = {
+                "validation_point_id": validation_point_id,
+                "group_name": fixed_config['fusion_group_info']['group_name'],
+                **fixed_config['hardware_config']
+            }
+            error_result = {**flat_config, "status": "error_fixed_run", "error_message": str(e)}
+            all_results.append(error_result)
+            error_count += 1
 
         # Final statistics
         total_points = len(all_results)
