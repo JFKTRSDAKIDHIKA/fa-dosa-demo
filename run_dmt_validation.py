@@ -297,13 +297,14 @@ def generate_configurations(num_configs: int):
              "workload_dims": WORKLOAD_DIMS
          }
 
-def run_dosa_prediction(config: dict, validation_point_id: int = None) -> dict:
+def run_dosa_prediction(config: dict, validation_point_id: int = None, output_dir: Path = None) -> dict:
     """
     使用FA-DOSA的内部分析模型，为给定的配置计算PPA预测值。
 
     Args:
         config (dict): 包含'hardware_config', 'mapping_config', 等信息的完整配置字典。
         validation_point_id (int): 验证点ID，用于生成唯一的调试文件名
+        output_dir (Path): 输出目录路径，用于保存调试文件
 
     Returns:
         dict: 包含预测结果的字典，例如 {'predicted_latency_s': 0.001, 'predicted_energy_pj': 5000.0}
@@ -318,8 +319,10 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None) -> dict:
         if fusion_group_info['pattern'] != ['Conv', 'ReLU']:
             raise ValueError(f"Unsupported DMT pattern for validation: {fusion_group_info['pattern']}")
         
-        # 为每个验证点生成唯一的调试文件名
+        # 为每个验证点生成唯一的调试文件名，保存到output目录
         debug_filename = f"debug_performance_model_point_{validation_point_id}.json" if validation_point_id is not None else "debug_performance_model.json"
+        if output_dir is not None:
+            debug_filename = str(output_dir / debug_filename)
         dmt_model = InPlaceFusionDMT(debug_latency=True, debug_output_path=debug_filename)
 
         hw_params = HardwareParameters(
@@ -775,18 +778,67 @@ def generate_timeloop_files(config, work_dir):
     with open(work_dir / 'env.yaml', 'w') as f:
         yaml.dump(env_config, f, sort_keys=False, default_style="'")
 
+def generate_validation_configs(max_runs=None):
+    """Generate validation configurations for multiple data points."""
+    configs = []
+    validation_point_id = 1
+    
+    # Generate configurations based on configuration space
+    for fusion_group in FUSION_GROUPS_TO_TEST:
+        for num_pes in HW_CONFIG_SPACE["num_pes"]:
+            for l2_size in HW_CONFIG_SPACE["l2_scratchpad_size_kb"]:
+                # Generate dynamic mapping space for this workload
+                producer_layer = fusion_group["producer_layer"]
+                mapping_space = generate_dynamic_mapping_space(WORKLOAD_DIMS, producer_layer)
+                
+                # Generate a few mapping configurations
+                for k_factor in mapping_space.get("K", [1])[:2]:  # Limit to 2 for efficiency
+                    for c_factor in mapping_space.get("C", [1])[:2]:
+                        # Generate complete factor decomposition
+                        num_pes_sqrt = int(math.sqrt(num_pes))
+                        k_factors = generate_factors_by_strategy(WORKLOAD_DIMS[producer_layer]["K"], num_pes_sqrt, "performance")
+                        c_factors = generate_factors_by_strategy(WORKLOAD_DIMS[producer_layer]["C"], num_pes_sqrt, "random")
+                        
+                        config = {
+                            "hardware_config": {
+                                "num_pes": num_pes,
+                                "l2_scratchpad_size_kb": l2_size
+                            },
+                            "mapping_config": {
+                                producer_layer: {
+                                    "DRAM": {"temporal": {"N":1,"C":c_factors["DRAM"],"K":k_factors["DRAM"],"P":1,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L2_Scratchpad": {"temporal": {"N":1,"C":c_factors["L2"],"K":k_factors["L2"],"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L1_Accumulator": {"temporal": {"N":1,"C":c_factors["L1"],"K":k_factors["L1"],"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L0_Registers": {"temporal": {"N":1,"C":c_factors["L0"],"K":k_factors["L0"],"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":c_factors["spatial"],"K":k_factors["spatial"]}, "permutation": "K N C P Q S R"}
+                                }
+                            },
+                            "fusion_group_info": fusion_group,
+                            "workload_dims": WORKLOAD_DIMS
+                        }
+                        
+                        configs.append((validation_point_id, config))
+                        validation_point_id += 1
+                        
+                        # Limit total configurations if max_runs is specified
+                        if max_runs is not None and len(configs) >= max_runs:
+                            return configs
+    
+    return configs
+
 def main():
     """Main control script to run DMT validation experiments with timeout support."""
     parser = argparse.ArgumentParser(description="Run DMT validation experiments")
     parser.add_argument('--max-runs', type=int, default=MAX_VALIDATION_RUNS,
                        help='Maximum number of validation runs (default: None for full sweep)')
-    parser.add_argument('--output', type=str, default="dmt_validation_results.csv",
-                       help='Output CSV file path (default: dmt_validation_results.csv)')
+    parser.add_argument('--output-dir', type=str, default="output",
+                       help='Output directory for all generated files (default: output)')
     parser.add_argument('--timeout', type=int, default=VALIDATION_TIMEOUT_SECONDS,
                        help=f'Timeout in seconds for each validation point (default: {VALIDATION_TIMEOUT_SECONDS})')
-    parser.add_argument('--config-output', type=str, default="validation_configs.json",
-                       help='Output JSON file for validation configurations (default: validation_configs.json)')
     args = parser.parse_args()
+    
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
     
     all_results = []
     master_configs = {}  # Dictionary to store all validation point configurations
@@ -799,6 +851,7 @@ def main():
     timeout_count = 0
 
     print("Starting DMT validation run with timeout support...")
+    print(f"[INFO] Output directory: {output_dir.resolve()}")
     print(f"[INFO] Timeout per validation point: {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)")
     if max_runs is not None:
         print(f"[INFO] Limited to {max_runs} validation runs for quick testing")
@@ -806,64 +859,83 @@ def main():
         print("[INFO] Running full validation sweep")
 
     try:
-        # 获取固定的验证配置
-        fixed_config = get_fixed_validation_config()
-        validation_point_id = 1
-        print(f"--- Running FIXED Validation Point {validation_point_id} ---")
+        # Generate validation configurations
+        validation_configs = generate_validation_configs(max_runs)
+        print(f"[INFO] Generated {len(validation_configs)} validation configurations")
         
-        # Store configuration in master dictionary
-        master_configs[str(validation_point_id)] = fixed_config
-        print(f"[INFO] Fixed configuration for validation point {validation_point_id} loaded")
-        
-        # 为简化调试，直接调用worker函数而不使用多进程
-        print("[INFO] Running in single-process debug mode.")
-        work_dir = Path(f'./validation_workspace_{validation_point_id}')
-        
-        try:
-            # 直接运行双轨评估
-            dosa_results = run_dosa_prediction(fixed_config, validation_point_id)
-            timeloop_results = run_timeloop_simulation(fixed_config, work_dir)
+        for validation_point_id, config in validation_configs:
+            print(f"--- Running Validation Point {validation_point_id} ---")
             
-            # 合并结果
-            flat_config = {
-                "validation_point_id": validation_point_id,
-                "group_name": fixed_config['fusion_group_info']['group_name'],
-                **fixed_config['hardware_config']
-            }
-            combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success_fixed_run"}
-            all_results.append(combined_result)
-            success_count += 1
+            # Store configuration in master dictionary
+            master_configs[str(validation_point_id)] = config
             
-            print(f"[SUCCESS] Fixed validation point {validation_point_id} completed successfully")
+            # Create workspace directory in output folder
+            work_dir = output_dir / f'validation_workspace_{validation_point_id}'
+            work_dir.mkdir(exist_ok=True)
             
-        except Exception as e:
-            print(f"[ERROR] Fixed validation point {validation_point_id} failed: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # 添加错误结果
-            flat_config = {
-                "validation_point_id": validation_point_id,
-                "group_name": fixed_config['fusion_group_info']['group_name'],
-                **fixed_config['hardware_config']
-            }
-            error_result = {**flat_config, "status": "error_fixed_run", "error_message": str(e)}
-            all_results.append(error_result)
-            error_count += 1
+            try:
+                # Run dual-track evaluation
+                dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
+                timeloop_results = run_timeloop_simulation(config, work_dir)
+                
+                # Combine results
+                flat_config = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config['fusion_group_info']['group_name'],
+                    **config['hardware_config']
+                }
+                combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success"}
+                all_results.append(combined_result)
+                success_count += 1
+                
+                print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
+                
+            except Exception as e:
+                print(f"[ERROR] Validation point {validation_point_id} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Add error result
+                flat_config = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config['fusion_group_info']['group_name'],
+                    **config['hardware_config']
+                }
+                error_result = {**flat_config, "predicted_latency_s": -1.0, "predicted_energy_pj": -1.0, 
+                               "simulated_latency_s": -1.0, "simulated_energy_pj": -1.0, 
+                               "status": "error", "error_message": str(e)}
+                all_results.append(error_result)
+                error_count += 1
 
+        # Save results to CSV file
+        if all_results:
+            csv_file = output_dir / "dmt_validation_results.csv"
+            df = pd.DataFrame(all_results)
+            # Ensure all required columns are present
+            required_columns = ['validation_point_id', 'group_name', 'num_pes', 'l2_scratchpad_size_kb', 
+                               'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 'status']
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = -1.0 if 'latency' in col or 'energy' in col else 'unknown'
+            
+            df.to_csv(csv_file, index=False)
+            print(f"[INFO] Results saved to {csv_file}")
+        
+        # Debug JSON files are already saved directly to output directory
+        
         # Final statistics
         total_points = len(all_results)
         if total_points > 0:
             print(f"\nValidation complete. Total: {total_points}, Succeeded: {success_count}, Failed: {error_count}, Timed out: {timeout_count}")
-            print(f"Results saved to {args.output}")
         else:
             print("\nValidation run finished, but no results were collected.")
             
-        # Save configuration information to JSON file
+        # Save configuration information to JSON file in output directory
         try:
-            with open(args.config_output, 'w') as f:
+            config_file = output_dir / "validation_configs.json"
+            with open(config_file, 'w') as f:
                 json.dump(master_configs, f, indent=4)
-            print(f"[INFO] Configuration information saved to {args.config_output}")
+            print(f"[INFO] Configuration information saved to {config_file}")
             print(f"[INFO] Total configurations saved: {len(master_configs)}")
         except Exception as json_error:
             print(f"[ERROR] Failed to save configuration JSON: {json_error}")
@@ -874,28 +946,8 @@ def main():
         traceback.print_exc()
             
     finally:
-        # Clean up any remaining worker workspaces (DISABLED to preserve Timeloop reports)
-        # import shutil
-        # import glob
-        # 
-        # workspace_pattern = './validation_workspace_*'
-        # for workspace_path in glob.glob(workspace_pattern):
-        #     try:
-        #         if Path(workspace_path).exists():
-        #             shutil.rmtree(workspace_path)
-        #             print(f"[INFO] Cleaned up worker workspace: {workspace_path}")
-        #     except Exception as cleanup_error:
-        #         print(f"[WARNING] Failed to clean up workspace {workspace_path}: {cleanup_error}")
-        # 
-        # print("[INFO] Cleanup complete")
-        
-        import glob
-        workspace_pattern = './validation_workspace_*'
-        preserved_workspaces = glob.glob(workspace_pattern)
-        if preserved_workspaces:
-            print(f"[INFO] Timeloop reports preserved in: {', '.join(preserved_workspaces)}")
-        else:
-            print("[INFO] No workspace directories found to preserve")
+        # All files are now organized in the output directory
+        print(f"[INFO] All validation results and workspaces are preserved in: {output_dir.resolve()}")
 
 if __name__ == "__main__":
     main()

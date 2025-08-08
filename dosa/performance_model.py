@@ -221,20 +221,67 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 计算最内层活跃层级（用于调试）
                 innermost_level = self._find_innermost_level(tensor_type, mapping_table)
                 
-                # 计算外层循环因子乘积 (Outer_Temporal_Product)
-                # 【核心修复】外层循环范围是从目的地层级i+1到最高层级M
+                # --- 开始重构区域 ---
+                
                 outer_temporal_product = torch.tensor(1.0, device=self.config.DEVICE)
                 relevant_dims = TENSOR_DIMS[tensor_type]
                 
-                # 【核心修复】连乘所有外层于目的地层级i的层级 (k ∈ {i+1, ..., M})
-                for k in range(i + 1, M + 1):
-                    level_name_k = memory_levels[k]
+                # 遍历与当前张量相关的所有维度
+                for dim_name in relevant_dims:
+                    # 检查该维度是否存在于当前层的定义中
+                    if dim_name not in layer_dims:
+                        continue
+                
+                    # 1. 获取该维度的总问题大小
+                    total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                
+                    # 2. 计算该维度在所有层级（0到M）的 temporal 映射因子总乘积
+                    total_temporal_factor = torch.tensor(1.0, device=self.config.DEVICE)
+                    for k in range(len(memory_levels)):
+                        level_name_k = memory_levels[k]
+                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
+                            total_temporal_factor *= torch.tensor(mapping_table[dim_name][level_name_k].get('temporal', 1), device=self.config.DEVICE)
+                
+                    # 3. 计算所有内层（0到i）的 temporal 映射因子乘积
+                    inner_temporal_factor = torch.tensor(1.0, device=self.config.DEVICE)
+                    for j in range(i + 1):
+                        level_name_j = memory_levels[j]
+                        if dim_name in mapping_table and level_name_j in mapping_table[dim_name]:
+                            inner_temporal_factor *= torch.tensor(mapping_table[dim_name][level_name_j].get('temporal', 1), device=self.config.DEVICE)
+                
+                    # 4. 计算外层循环因子乘积 (Outer_Temporal_Product)
+                    # 外层循环范围是从目的地层级 i+1 到最高层级 M
                     
-                    # 对所有与该张量相关的维度 d ∈ D_t
-                    for dim_name in relevant_dims:
-                        if dim_name in layer_dims and dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
+                    # 重新初始化，并采用最直接的累乘逻辑
+                    current_dim_outer_product = torch.tensor(1.0, device=self.config.DEVICE)
+                    
+                    # 连乘所有外层于目的地层级 i 的层级 (k ∈ {i+1, ..., M})
+                    for k in range(i + 1, M + 1):
+                        level_name_k = memory_levels[k]
+                        
+                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
+                            # 只累乘 temporal 因子，因为它决定了对上层存储的访问次数
                             temporal_factor = mapping_table[dim_name][level_name_k].get('temporal', 1)
-                            outer_temporal_product *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+                            current_dim_outer_product *= torch.tensor(temporal_factor, device=self.config.DEVICE)
+                
+                    # 一个维度的总大小，必须等于其在所有层级 temporal 和 spatial 因子的总乘积
+                    # total_size = Product(temporal_factors) * Product(spatial_factors)
+                    # 我们需要找到那些没有被 temporal 或 spatial 完全分解的剩余部分，它们也属于外层循环
+                    
+                    all_mapped_factors = torch.tensor(1.0, device=self.config.DEVICE)
+                    for k in range(len(memory_levels)):
+                        level_name_k = memory_levels[k]
+                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
+                             all_mapped_factors *= torch.tensor(mapping_table[dim_name][level_name_k].get('temporal', 1), device=self.config.DEVICE)
+                             all_mapped_factors *= torch.tensor(mapping_table[dim_name][level_name_k].get('spatial', 1), device=self.config.DEVICE)
+                
+                    # 剩余的、未在映射表中分配的迭代次数，也必须在外层（DRAM）执行
+                    remaining_factor = total_dim_size / torch.clamp(all_mapped_factors, min=1e-9)
+                    
+                    # 最终，该维度的外层总迭代次数，是外层显式定义的temporal因子和剩余因子的乘积
+                    outer_temporal_product *= (current_dim_outer_product * remaining_factor)
+                
+                # --- 结束重构区域 ---
                 
                 # 计算填充流量 = C_i,t × Outer_Temporal_Product
                 tensor_fill_accesses = C_i_t * outer_temporal_product
