@@ -87,11 +87,11 @@ class Config:
         
         # L1累加器能耗模型: EPA_L1 = Base + Coeff * (Capacity_KB / sqrt(Num_PE))
         self.L1_ACCUM_BASE_EPA_PJ = 1.94
-        self.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB = 0.1005
+        self.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB = 0.01005
         
         # L2缓存能耗模型: EPA_L2 = Base + Coeff * Capacity_KB
         self.L2_SPM_BASE_EPA_PJ = 31.0663
-        self.L2_SPM_CAPACITY_COEFF_PJ_PER_KB = 0.3
+        self.L2_SPM_CAPACITY_COEFF_PJ_PER_KB = 0.0001
         
         # L3 DRAM访问能耗
         self.L3_DRAM_EPA_PJ = 128.0
