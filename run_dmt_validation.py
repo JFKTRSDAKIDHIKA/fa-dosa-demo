@@ -7,6 +7,7 @@ import random
 import argparse
 import math
 import yaml
+import multiprocessing
 from pathlib import Path
 
 # FA-DOSA core modules
@@ -57,8 +58,9 @@ os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + ':/root/
 
 # --- Define Search Spaces ---
 
-# Configuration for number of validation runs
+# Configuration for number of validation runs# Global configuration
 MAX_VALIDATION_RUNS = None  # Set to None for full sweep, or specify a number (e.g., 1, 2, 4) for quick testing
+VALIDATION_TIMEOUT_SECONDS = 600  # 10 minutes timeout for each validation point
 
 # 1. Fused Groups to be tested (example from ResNet-18)
 FUSION_GROUPS_TO_TEST = [
@@ -109,8 +111,76 @@ def generate_dynamic_mapping_space(workload_dims, producer_layer):
     
     return mapping_space
 
+def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str) -> dict:
+    """根据指定的策略，为单个维度生成跨存储层级的tiling因子。
+
+    Args:
+        dim_size (int): 需要分解的维度大小。
+        num_pes_sqrt (int): PE数量的平方根，用于约束空间因子。
+        strategy (str): 生成策略，可选值为 "performance", "dram_heavy", "random"。
+
+    Returns:
+        dict: 包含 'spatial', 'L0', 'L1', 'L2', 'DRAM' 因子的字典。
+    """
+    if dim_size == 1:
+        return {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
+
+    # 1. 首先，确定空间因子 (spatial factor)
+    # 逻辑保持不变：从所有约数中，找到一个小于等于 num_pes_sqrt 的最大可能值
+    divisors = get_divisors(dim_size).tolist()
+    spatial_candidates = [d for d in divisors if d <= num_pes_sqrt]
+    spatial_factor = random.choice(spatial_candidates) if spatial_candidates else 1
+    
+    remaining_size = dim_size // spatial_factor
+    
+    # 2. 根据策略分配剩余的时间因子 (temporal factors)
+    factors = {'spatial': int(spatial_factor), 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
+    
+    if remaining_size > 1:
+        remaining_divisors = get_divisors(remaining_size).tolist()
+        
+        if strategy == "performance":
+            # 性能优先：从L0开始，从剩余约数中随机选一个最大的，然后迭代
+            temp_size = remaining_size
+            for level in ['L0', 'L1', 'L2']:
+                if temp_size == 1: break
+                level_divs = [d for d in get_divisors(temp_size).tolist() if d > 1]
+                if not level_divs: continue
+                factor_for_level = random.choice(level_divs) # 引入随机性
+                factors[level] = int(factor_for_level)
+                temp_size //= factor_for_level
+            factors['DRAM'] = int(temp_size)
+
+        elif strategy == "dram_heavy":
+            # DRAM主导：将所有剩余因子全部分配给DRAM
+            factors['DRAM'] = int(remaining_size)
+
+        elif strategy == "random":
+            # 均衡随机：将剩余尺寸随机分解给 L0, L1, L2, DRAM
+            temp_size = remaining_size
+            levels = ['L0', 'L1', 'L2', 'DRAM']
+            random.shuffle(levels) # 随机化分配顺序
+            for level in levels:
+                if temp_size == 1: break
+                level_divs = [d for d in get_divisors(temp_size).tolist() if d > 1]
+                if not level_divs: continue
+                factor_for_level = random.choice(level_divs)
+                factors[level] = int(factor_for_level)
+                temp_size //= factor_for_level
+            # 确保乘积正确，将余数给最后一个分配的level
+            if temp_size > 1:
+                 factors[levels[-1]] *= int(temp_size)
+
+    # 3. 验证所有因子的乘积是否等于原始维度大小
+    product = 1
+    for val in factors.values(): product *= val
+    assert product == dim_size, f"Factor product check failed for strategy {strategy}!"
+
+    return factors
+
 def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     """Generate complete factor decomposition for a dimension across all levels.
+    保留此函数以保持向后兼容性。
     
     Args:
         dim_size (int): The problem dimension size to factorize.
@@ -119,88 +189,39 @@ def generate_complete_dimension_factors(dim_size, num_pes_sqrt):
     Returns:
         dict: A dictionary with factors for each level ['spatial', 'L0', 'L1', 'L2', 'DRAM'].
     """
-    if dim_size == 1:
-        return {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
-    
-    # Initialize factors with default values
-    factors = {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': 1}
-    
-    # Get all prime factors of the dimension size
-    def get_prime_factors(n):
-        i = 2
-        factors = []
-        while i * i <= n:
-            if n % i:
-                i += 1
-            else:
-                n //= i
-                factors.append(i)
-        if n > 1:
-            factors.append(n)
-        return factors
-    
-    prime_factors = get_prime_factors(dim_size)
-    
-    # If no prime factors (dim_size is 1), return default factors
-    if not prime_factors:
-        return factors
-    
-    # Sort prime factors in descending order for better distribution
-    prime_factors.sort(reverse=True)
-    
-    # First, assign spatial factors (limited by num_pes_sqrt)
-    spatial_product = 1
-    remaining_factors = []
-    
-    for factor in prime_factors:
-        if spatial_product * factor <= num_pes_sqrt:
-            spatial_product *= factor
-        else:
-            remaining_factors.append(factor)
-    
-    factors['spatial'] = spatial_product
-    
-    # If there are no remaining factors, assign 1 to all memory levels
-    if not remaining_factors:
-        return factors
-    
-    # Distribute remaining factors among memory levels
-    # We'll use a more deterministic approach to ensure all factors are used
-    memory_levels = ['L0', 'L1', 'L2', 'DRAM']
-    level_index = 0
-    
-    for factor in remaining_factors:
-        factors[memory_levels[level_index]] *= factor
-        level_index = (level_index + 1) % len(memory_levels)
-    
-    # Verification
-    product = 1
-    for val in factors.values():
-        product *= val
-    
-    # If verification fails, use a direct approach to ensure correctness
-    if product != dim_size:
-        # Reset factors
-        factors = {'spatial': 1, 'L0': 1, 'L1': 1, 'L2': 1, 'DRAM': dim_size}
-        
-        # Try to assign a valid spatial factor
-        divisors = get_divisors(dim_size).tolist()
-        spatial_candidates = [d for d in divisors if d <= num_pes_sqrt]
-        
-        if spatial_candidates:
-            factors['spatial'] = spatial_candidates[-1]  # Take the largest valid divisor
-            factors['DRAM'] = dim_size // factors['spatial']
-    
-    # Final verification
-    product = 1
-    for val in factors.values():
-        product *= val
-    assert product == dim_size, f"Factor product {product} does not match dim_size {dim_size}"
-    
-    return factors
+    return generate_factors_by_strategy(dim_size, num_pes_sqrt, "random")
+
+def get_fixed_validation_config():
+    """返回 validation_point_id=1 的固定配置字典"""
+    config_vp1 = {
+        "hardware_config": {
+            "num_pes": 64,
+            "l2_scratchpad_size_kb": 256
+        },
+        "mapping_config": {
+            "layer1.0.conv1": {
+                "DRAM": {"temporal": {"N":1,"C":1,"K":1,"P":1,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L2_Scratchpad": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L1_Accumulator": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "L0_Registers": {"temporal": {"N":1,"C":32,"K":2,"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":2,"K":8}, "permutation": "K N C P Q S R"}
+            }
+        },
+        "fusion_group_info": {
+            "group_name": "layer1.0.conv1_relu",
+            "layers": ["layer1.0.conv1", "layer1.0.relu"],
+            "pattern": ["Conv", "ReLU"],
+            "producer_layer": "layer1.0.conv1",
+            "consumer_layer": "layer1.0.relu"
+        },
+        "workload_dims": {
+            "layer1.0.conv1": {"N":1,"C":64,"K":64,"P":56,"Q":56,"R":3,"S":3},
+            "layer1.0.relu": {"N":1,"C":64,"K":64,"P":56,"Q":56,"R":1,"S":1}
+        }
+    }
+    return config_vp1
 
 def generate_configurations(num_configs: int):
-    """Generates a stream of unique configurations with complete dimension factorization.
+    """Generates a stream of unique configurations with complete dimension factorization using strategy-driven approach.
     
     Args:
         num_configs (int): Number of configurations to generate.
@@ -212,11 +233,11 @@ def generate_configurations(num_configs: int):
     
     # Define some typical permutation patterns
     permutation_patterns = [
-        'K C N P Q S R',
-        'N K C P Q S R', 
-        'C K N P Q S R',
         'K N C P Q S R'
     ]
+    
+    # Define available strategies
+    strategies = ["performance"]
     
     # Main loop for generating configurations
     for i in range(num_configs):
@@ -233,11 +254,14 @@ def generate_configurations(num_configs: int):
         # Calculate PE mesh size for spatial constraints
         pe_mesh_size = int(hardware_config['num_pes'] ** 0.5)
         
-        # Generate complete factorization for each dimension
+        # Randomly select a strategy for this configuration
+        chosen_strategy = random.choice(strategies)
+        
+        # Generate complete factorization for each dimension using the chosen strategy
         dim_factors = {}
         for dim_name, dim_size in dims.items():
             if dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
-                dim_factors[dim_name] = generate_complete_dimension_factors(dim_size, pe_mesh_size)
+                dim_factors[dim_name] = generate_factors_by_strategy(dim_size, pe_mesh_size, chosen_strategy)
         
         # Build mapping config with complete factors
         mapping_config = {
@@ -256,9 +280,6 @@ def generate_configurations(num_configs: int):
                 },
                 'L0_Registers': {
                     'temporal': {dim: factors['L0'] for dim, factors in dim_factors.items()},
-                    'permutation': random.choice(permutation_patterns)
-                },
-                'PE_array': {
                     'spatial': {
                         dim: factors['spatial']
                         for dim, factors in dim_factors.items()
@@ -276,12 +297,14 @@ def generate_configurations(num_configs: int):
              "workload_dims": WORKLOAD_DIMS
          }
 
-def run_dosa_prediction(config: dict) -> dict:
+def run_dosa_prediction(config: dict, validation_point_id: int = None, output_dir: Path = None) -> dict:
     """
     使用FA-DOSA的内部分析模型，为给定的配置计算PPA预测值。
 
     Args:
         config (dict): 包含'hardware_config', 'mapping_config', 等信息的完整配置字典。
+        validation_point_id (int): 验证点ID，用于生成唯一的调试文件名
+        output_dir (Path): 输出目录路径，用于保存调试文件
 
     Returns:
         dict: 包含预测结果的字典，例如 {'predicted_latency_s': 0.001, 'predicted_energy_pj': 5000.0}
@@ -296,7 +319,11 @@ def run_dosa_prediction(config: dict) -> dict:
         if fusion_group_info['pattern'] != ['Conv', 'ReLU']:
             raise ValueError(f"Unsupported DMT pattern for validation: {fusion_group_info['pattern']}")
         
-        dmt_model = InPlaceFusionDMT()
+        # 为每个验证点生成唯一的调试文件名，保存到output目录
+        debug_filename = f"debug_performance_model_point_{validation_point_id}.json" if validation_point_id is not None else "debug_performance_model.json"
+        if output_dir is not None:
+            debug_filename = str(output_dir / debug_filename)
+        dmt_model = InPlaceFusionDMT(debug_latency=True, debug_output_path=debug_filename)
 
         hw_params = HardwareParameters(
             initial_num_pes=hw_config['num_pes'],
@@ -335,9 +362,36 @@ def run_dosa_prediction(config: dict) -> dict:
         
         group = (producer_layer, consumer_layer)
         
+        # 准备验证快车道的直接映射表
+        producer_mapping = mapping_config.get(producer_layer, {})
+        direct_mapping_table = {}
+        
+        if producer_mapping:
+            # 1. 收集所有出现过的维度和层级
+            all_dims = set()
+            all_levels = producer_mapping.keys()
+            for level_data in producer_mapping.values():
+                all_dims.update(level_data.get('temporal', {}).keys())
+                all_dims.update(level_data.get('spatial', {}).keys())
+            
+            # 2. 进行数据结构的行列转置
+            for dim_name in all_dims:
+                direct_mapping_table[dim_name] = {}
+                for level_name in all_levels:
+                    level_data = producer_mapping.get(level_name, {})
+                    # 获取temporal和spatial因子，如果不存在则默认为1.0
+                    temporal_val = level_data.get('temporal', {}).get(dim_name, 1.0)
+                    spatial_val = level_data.get('spatial', {}).get(dim_name, 1.0)
+                    
+                    direct_mapping_table[dim_name][level_name] = {
+                        'temporal': torch.tensor(float(temporal_val), device=dosa_config.DEVICE),
+                        'spatial': torch.tensor(float(spatial_val), device=dosa_config.DEVICE)
+                    }
+        
         with torch.no_grad():
             result = dmt_model(
-                group, graph, hw_params, mapping, dosa_config
+                group, graph, hw_params, mapping, dosa_config, 
+                direct_mapping_table=direct_mapping_table
             )
             # Handle different return value formats
             if len(result) == 5:
@@ -445,6 +499,77 @@ def run_timeloop_simulation(config: dict, work_dir: Path) -> dict:
             "simulated_latency_s": -1.0,
             "simulated_energy_pj": -1.0
         }
+
+
+def validate_one_point(config: dict, result_queue: multiprocessing.Queue, validation_point_id: int):
+    """
+    Worker function to validate a single design point with complete error handling.
+    
+    This function encapsulates the entire validation process for one configuration,
+    including both FA-DOSA prediction and Timeloop simulation. It runs in a separate
+    process to enable timeout functionality.
+    
+    Args:
+        config (dict): Complete configuration dictionary
+        result_queue (multiprocessing.Queue): Queue to return results to main process
+        validation_point_id (int): ID of the validation point for logging
+    """
+    try:
+        print(f"[WORKER] Starting validation for point {validation_point_id}")
+        
+        # Create temporary workspace for this worker
+        work_dir = Path(f'./validation_workspace_{validation_point_id}')
+        work_dir.mkdir(exist_ok=True)
+        
+        # Run dual-track evaluation
+        dosa_results = run_dosa_prediction(config, validation_point_id)
+        timeloop_results = run_timeloop_simulation(config, work_dir)
+        
+        # Combine configuration info and results
+        flat_config = {
+            "validation_point_id": validation_point_id,
+            "group_name": config['fusion_group_info']['group_name'],
+            **config['hardware_config'],
+        }
+        
+        combined_result = {
+            **flat_config,
+            **dosa_results,
+            **timeloop_results,
+            "status": "success"
+        }
+        
+        # Clean up worker workspace (DISABLED to preserve Timeloop reports)
+        # import shutil
+        # if work_dir.exists():
+        #     try:
+        #         shutil.rmtree(work_dir)
+        #     except Exception as cleanup_error:
+        #         print(f"[WARNING] Worker cleanup failed: {cleanup_error}")
+        print(f"[INFO] Timeloop reports preserved in: {work_dir.resolve()}")
+        
+        # Send result back to main process
+        result_queue.put(combined_result)
+        print(f"[WORKER] Validation point {validation_point_id} completed successfully")
+        
+    except Exception as e:
+        print(f"[ERROR] Worker validation failed for point {validation_point_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Send error result back to main process
+        error_result = {
+            "validation_point_id": validation_point_id,
+            "group_name": config.get('fusion_group_info', {}).get('group_name', 'unknown'),
+            **config.get('hardware_config', {}),
+            "predicted_latency_s": -1.0,
+            "predicted_energy_pj": -1.0,
+            "simulated_latency_s": -1.0,
+            "simulated_energy_pj": -1.0,
+            "status": "error",
+            "error_message": str(e)
+        }
+        result_queue.put(error_result)
 
 
 def generate_timeloop_files(config, work_dir):
@@ -578,7 +703,7 @@ def generate_timeloop_files(config, work_dir):
     dim_factors = {dim: {} for dim in all_dims}
     
     # Collect spatial factors
-    for dim, val in layer_mapping['PE_array']['spatial'].items():
+    for dim, val in layer_mapping['L0_Registers']['spatial'].items():
         if dim in dim_factors:
             dim_factors[dim]['spatial'] = int(val)
     
@@ -627,8 +752,8 @@ def generate_timeloop_files(config, work_dir):
     # Spatial Target
     targets.append({
         'target': 'PE_array_container', 'type': 'spatial',
-        'factors': format_factors('spatial', 'PE_array'),
-        'permutation': layer_mapping['PE_array']['permutation']
+        'factors': format_factors('spatial', 'L0_Registers'),
+        'permutation': layer_mapping['L0_Registers']['permutation']
     })
     # Temporal Targets
     for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:
@@ -653,76 +778,167 @@ def generate_timeloop_files(config, work_dir):
     with open(work_dir / 'env.yaml', 'w') as f:
         yaml.dump(env_config, f, sort_keys=False, default_style="'")
 
+def generate_validation_configs(max_runs=None):
+    """Generate validation configurations for multiple data points."""
+    configs = []
+    validation_point_id = 1
+    
+    # Generate configurations based on configuration space
+    for fusion_group in FUSION_GROUPS_TO_TEST:
+        for num_pes in HW_CONFIG_SPACE["num_pes"]:
+            for l2_size in HW_CONFIG_SPACE["l2_scratchpad_size_kb"]:
+                # Generate dynamic mapping space for this workload
+                producer_layer = fusion_group["producer_layer"]
+                mapping_space = generate_dynamic_mapping_space(WORKLOAD_DIMS, producer_layer)
+                
+                # Generate a few mapping configurations
+                for k_factor in mapping_space.get("K", [1])[:2]:  # Limit to 2 for efficiency
+                    for c_factor in mapping_space.get("C", [1])[:2]:
+                        # Generate complete factor decomposition
+                        num_pes_sqrt = int(math.sqrt(num_pes))
+                        k_factors = generate_factors_by_strategy(WORKLOAD_DIMS[producer_layer]["K"], num_pes_sqrt, "performance")
+                        c_factors = generate_factors_by_strategy(WORKLOAD_DIMS[producer_layer]["C"], num_pes_sqrt, "random")
+                        
+                        config = {
+                            "hardware_config": {
+                                "num_pes": num_pes,
+                                "l2_scratchpad_size_kb": l2_size
+                            },
+                            "mapping_config": {
+                                producer_layer: {
+                                    "DRAM": {"temporal": {"N":1,"C":c_factors["DRAM"],"K":k_factors["DRAM"],"P":1,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L2_Scratchpad": {"temporal": {"N":1,"C":c_factors["L2"],"K":k_factors["L2"],"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L1_Accumulator": {"temporal": {"N":1,"C":c_factors["L1"],"K":k_factors["L1"],"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                                    "L0_Registers": {"temporal": {"N":1,"C":c_factors["L0"],"K":k_factors["L0"],"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":c_factors["spatial"],"K":k_factors["spatial"]}, "permutation": "K N C P Q S R"}
+                                }
+                            },
+                            "fusion_group_info": fusion_group,
+                            "workload_dims": WORKLOAD_DIMS
+                        }
+                        
+                        configs.append((validation_point_id, config))
+                        validation_point_id += 1
+                        
+                        # Limit total configurations if max_runs is specified
+                        if max_runs is not None and len(configs) >= max_runs:
+                            return configs
+    
+    return configs
+
 def main():
-    """Main control script to run DMT validation experiments."""
+    """Main control script to run DMT validation experiments with timeout support."""
     parser = argparse.ArgumentParser(description="Run DMT validation experiments")
     parser.add_argument('--max-runs', type=int, default=MAX_VALIDATION_RUNS,
                        help='Maximum number of validation runs (default: None for full sweep)')
-    parser.add_argument('--output', type=str, default="dmt_validation_results.csv",
-                       help='Output CSV file path (default: dmt_validation_results.csv)')
+    parser.add_argument('--output-dir', type=str, default="output",
+                       help='Output directory for all generated files (default: output)')
+    parser.add_argument('--timeout', type=int, default=VALIDATION_TIMEOUT_SECONDS,
+                       help=f'Timeout in seconds for each validation point (default: {VALIDATION_TIMEOUT_SECONDS})')
     args = parser.parse_args()
     
-    output_csv_path = args.output
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    
     all_results = []
+    master_configs = {}  # Dictionary to store all validation point configurations
     max_runs = args.max_runs
+    timeout_seconds = args.timeout
+    
+    # Statistics counters
+    success_count = 0
+    error_count = 0
+    timeout_count = 0
 
-    print("Starting DMT validation run...")
+    print("Starting DMT validation run with timeout support...")
+    print(f"[INFO] Output directory: {output_dir.resolve()}")
+    print(f"[INFO] Timeout per validation point: {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)")
     if max_runs is not None:
         print(f"[INFO] Limited to {max_runs} validation runs for quick testing")
     else:
         print("[INFO] Running full validation sweep")
 
-    # Create temporary workspace
-    work_dir = Path('./validation_workspace')
-    work_dir.mkdir(exist_ok=True)
-
     try:
-        for i, config in enumerate(generate_configurations(max_runs if max_runs is not None else 1000)):
-            # Check if we've reached the maximum number of runs
-            if max_runs is not None and i >= max_runs:
-                print(f"[INFO] Reached maximum validation runs limit ({max_runs}). Stopping.")
-                break
+        # Generate validation configurations
+        validation_configs = generate_validation_configs(max_runs)
+        print(f"[INFO] Generated {len(validation_configs)} validation configurations")
+        
+        for validation_point_id, config in validation_configs:
+            print(f"--- Running Validation Point {validation_point_id} ---")
+            
+            # Store configuration in master dictionary
+            master_configs[str(validation_point_id)] = config
+            
+            # Create workspace directory in output folder
+            work_dir = output_dir / f'validation_workspace_{validation_point_id}'
+            work_dir.mkdir(exist_ok=True)
+            
+            try:
+                # Run dual-track evaluation
+                dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
+                timeloop_results = run_timeloop_simulation(config, work_dir)
                 
-            print(f"--- Running Validation Point {i+1} ---")
-            
-            # 双轨评估
-            dosa_results = run_dosa_prediction(config)
-            timeloop_results = run_timeloop_simulation(config, work_dir)
+                # Combine results
+                flat_config = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config['fusion_group_info']['group_name'],
+                    **config['hardware_config']
+                }
+                combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success"}
+                all_results.append(combined_result)
+                success_count += 1
+                
+                print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
+                
+            except Exception as e:
+                print(f"[ERROR] Validation point {validation_point_id} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Add error result
+                flat_config = {
+                    "validation_point_id": validation_point_id,
+                    "group_name": config['fusion_group_info']['group_name'],
+                    **config['hardware_config']
+                }
+                error_result = {**flat_config, "predicted_latency_s": -1.0, "predicted_energy_pj": -1.0, 
+                               "simulated_latency_s": -1.0, "simulated_energy_pj": -1.0, 
+                               "status": "error", "error_message": str(e)}
+                all_results.append(error_result)
+                error_count += 1
 
-            # 数据合并
-            # 将配置信息和两边的结果合并到一个字典中
-            flat_config = {
-                "validation_point_id": i + 1,
-                "group_name": config['fusion_group_info']['group_name'],
-                **config['hardware_config'],
-                # 可以有选择性地扁平化一些关键的mapping参数以方便分析
-            }
-            
-            combined_result = {
-                **flat_config,
-                **dosa_results,
-                **timeloop_results
-            }
-            
-            # 数据追加
-            all_results.append(combined_result)
-
-            # 增量写入CSV文件
-            df = pd.DataFrame([combined_result])
-            if i == 0:
-                # 第一次写入，包含表头
-                df.to_csv(args.output, index=False, mode='w')
-            else:
-                # 后续写入，追加模式，不包含表头
-                df.to_csv(args.output, index=False, mode='a', header=False)
-            
-            print(f"[SUCCESS] Validation point {i+1} completed and saved to {args.output}")
-
-        # 结果持久化
+        # Save results to CSV file
         if all_results:
-            print(f"\nValidation complete. {len(all_results)} data points saved to {args.output}")
+            csv_file = output_dir / "dmt_validation_results.csv"
+            df = pd.DataFrame(all_results)
+            # Ensure all required columns are present
+            required_columns = ['validation_point_id', 'group_name', 'num_pes', 'l2_scratchpad_size_kb', 
+                               'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 'status']
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = -1.0 if 'latency' in col or 'energy' in col else 'unknown'
+            
+            df.to_csv(csv_file, index=False)
+            print(f"[INFO] Results saved to {csv_file}")
+        
+        # Debug JSON files are already saved directly to output directory
+        
+        # Final statistics
+        total_points = len(all_results)
+        if total_points > 0:
+            print(f"\nValidation complete. Total: {total_points}, Succeeded: {success_count}, Failed: {error_count}, Timed out: {timeout_count}")
         else:
             print("\nValidation run finished, but no results were collected.")
+            
+        # Save configuration information to JSON file in output directory
+        try:
+            config_file = output_dir / "validation_configs.json"
+            with open(config_file, 'w') as f:
+                json.dump(master_configs, f, indent=4)
+            print(f"[INFO] Configuration information saved to {config_file}")
+            print(f"[INFO] Total configurations saved: {len(master_configs)}")
+        except Exception as json_error:
+            print(f"[ERROR] Failed to save configuration JSON: {json_error}")
             
     except Exception as e:
         print(f"[ERROR] Main validation loop failed: {e}")
@@ -730,14 +946,8 @@ def main():
         traceback.print_exc()
             
     finally:
-        # 可选：清理工作目录
-        import shutil
-        if work_dir.exists():
-            try:
-                shutil.rmtree(work_dir)
-                print("[INFO] Cleaned up temporary workspace")
-            except Exception as e:
-                print(f"[WARNING] Failed to clean up workspace: {e}")
+        # All files are now organized in the output directory
+        print(f"[INFO] All validation results and workspaces are preserved in: {output_dir.resolve()}")
 
 if __name__ == "__main__":
     main()

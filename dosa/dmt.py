@@ -21,8 +21,21 @@ class BaseDMT(nn.Module, ABC):
 
     @abstractmethod
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
+        DMT前向传播方法，支持验证快车道。
+        
+        Args:
+            group: 融合组层名列表
+            graph: 计算图
+            hw_params: 硬件参数
+            mapping: FineGrainedMapping实例（用于训练路径）
+            config: 配置对象
+            direct_mapping_table: （可选）直接映射表，用于验证模式
+        
+        Returns:
+            (latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics)
+        
         Estimates the performance and energy for a given fusion group.
 
         Args:
@@ -43,168 +56,51 @@ class BaseDMT(nn.Module, ABC):
         pass
 
 class InPlaceFusionDMT(BaseDMT):
-    """DMT for in-place fusion patterns like Conv -> ReLU."""
+    """DMT for in-place fusion patterns like Conv -> ReLU.
+    
+    重构后的InPlaceFusionDMT作为任务分派器，将融合组的计算任务
+    分派给HighFidelityPerformanceModel核心引擎进行统一的PPA计算。
+    """
+    
+    def __init__(self, debug_latency: bool = False, debug_output_path: str = None):
+        super().__init__()
+        self.debug_latency = debug_latency
+        self.debug_output_path = debug_output_path
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
-        # Initialize detailed metrics dictionary - 精确复现DOSA源码结构
-        detailed_metrics = {
-            # 1. 能耗分解 (单位: pJ) - 三段式能量模型
-            'energy_breakdown_pj': {
-                'compute': 0.0,  # 计算能耗
-                'intra_level': {  # 层内能耗 (L0, L1, L2)
-                    'L0_Registers': 0.0,
-                    'L1_Accumulator': 0.0,
-                    'L2_Scratchpad': 0.0
-                },
-                'inter_level': {  # 层间能耗 (仅DRAM)
-                    'L3_DRAM': 0.0
-                }
-            },
-            # 2. 访问次数分解
-            'access_counts': {
-                'intra_level': {},  # calculate_intra_level_accesses 结果
-                'inter_level': {}   # calculate_per_level_accesses 结果
-            }
-        }
+        # 步骤1: 解析输入 - 识别生产者层（决定性能的关键层）
+        producer_name = group[0]  # 对于Conv->ReLU，Conv是生产者
+        consumers = group[1:]     # ReLU等消费者层
         
-
-
-        # 1. Identify Producer and Consumers
-        producer_name = group[0]
-        consumers = group[1:]
-        producer_layer = graph.layers[producer_name]
-
-        # 2. Latency Calculation: Dominated by the producer
-        # We can reuse the logic from the main performance model for a single layer
-        producer_macs = reduce(lambda x, y: x * y, producer_layer['dims'].values(), 1)
-        num_pes = hw_params.get_projected_num_pes()
-        compute_latency = producer_macs / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
-
-        # 创建性能模型实例
+        # 步骤2: 准备输入 - 创建只包含生产者层的伪图
+        # 核心洞察：原位融合的性能完全由生产者层决定
+        pseudo_graph = type('PseudoGraph', (), {
+            'layers': {producer_name: graph.layers[producer_name]},
+            'fusion_groups': [[producer_name]]  # 单层融合组
+        })()
+        
+        # 步骤3: 调用核心引擎 - 实例化并调用HighFidelityPerformanceModel
         from dosa.performance_model import HighFidelityPerformanceModel
-        perf_model = HighFidelityPerformanceModel(config)
-        perf_model.hw_params = hw_params  # Temporarily attach hw_params
+        perf_model = HighFidelityPerformanceModel(config, debug_latency=self.debug_latency)
         
-        all_factors = mapping.get_all_factors()
-        producer_accesses = perf_model.calculate_per_level_accesses(producer_layer['dims'], all_factors)
+        # 调用核心引擎的forward方法进行统一PPA计算
+        latency, energy, area, buffer_mismatch_loss, compatibility_penalty = perf_model.forward(
+            graph=pseudo_graph,
+            hw_params=hw_params,
+            mapping=mapping,
+            direct_mapping_table=direct_mapping_table,
+            debug_output_path=self.debug_output_path
+        )
         
-        memory_latencies = []
-        for interface, accesses in producer_accesses.items():
-            upper_level_name = interface.split('_to_')[0]
-            level_info = next((level for level in config.MEMORY_HIERARCHY if level['name'] == upper_level_name), None)
-            if upper_level_name in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
-                bandwidth_gb_s = (2 * torch.sqrt(num_pes) * config.BYTES_PER_ELEMENT * config.CLOCK_FREQUENCY_MHZ * 1e6) / 1e9
-            else:
-                bandwidth_gb_s = level_info['bandwidth_gb_s']
-            memory_latencies.append(accesses / (bandwidth_gb_s * 1e9 + 1e-9))
-
-        if memory_latencies:
-            latency = torch.maximum(compute_latency, torch.max(torch.stack(memory_latencies)))
-        else:
-            latency = compute_latency
-
-        # 3. Energy Calculation
-        total_energy = torch.tensor(0.0, device=config.DEVICE)
-
-        # 3.1. Compute Energy: 融合组内所有操作的计算能耗
-        group_macs = 0
-        for layer_name in group:
-            layer_dims = graph.layers[layer_name]['dims']
-            # 只计算实际的MAC操作，ReLU等激活函数不产生MAC
-            if 'conv' in layer_name.lower():
-                # 对于卷积层：N * K * P * Q * C * R * S
-                layer_macs = (layer_dims.get('N', 1) * layer_dims.get('K', 1) * 
-                             layer_dims.get('P', 1) * layer_dims.get('Q', 1) * 
-                             layer_dims.get('C', 1) * layer_dims.get('R', 1) * 
-                             layer_dims.get('S', 1))
-                group_macs += layer_macs
-            # ReLU等激活函数不计入MAC运算
+        # 步骤4: 返回结果 - 直接返回核心引擎的计算结果
+        # 对于原位融合，不需要额外的组合逻辑
         
-        # 计算能耗：MAC运算 - 精确复现DOSA源码
-        compute_energy = group_macs * config.PE_MAC_EPA_PJ
-        total_energy += compute_energy
-        
-        # 存储计算能耗到详细指标中
-        if isinstance(compute_energy, torch.Tensor):
-            detailed_metrics['energy_breakdown_pj']['compute'] = float(compute_energy.item())
-        else:
-            detailed_metrics['energy_breakdown_pj']['compute'] = float(compute_energy)
-
-        # 3.2. 层内能耗 (Intra-level Energy) - 精确复现dosa源码实现
-        # 调用 calculate_intra_level_accesses 来获取包含L0高估访问在内的次数
-        intra_level_accesses = perf_model.calculate_intra_level_accesses(
-            producer_layer['dims'], all_factors, num_pes)
-        
-        # 将访问次数详情存入metrics
-        detailed_metrics['access_counts']['intra_level'] = convert_tensors_to_native(intra_level_accesses)
-        
-        # 累加L0, L1, L2的层内能耗
-        for level_name, tensors in intra_level_accesses.items():
-            level_energy = torch.tensor(0.0, device=config.DEVICE)
-            for tensor_type, operations in tensors.items():
-                for op_type, access_count in operations.items():
-                    access_bytes = access_count * config.BYTES_PER_ELEMENT
-                    
-                    energy_contribution = torch.tensor(0.0, device=config.DEVICE)
-                    if level_name == 'L0_Registers':
-                        energy_contribution = access_bytes * config.L0_REG_BASE_EPA_PJ
-                    elif level_name == 'L1_Accumulator':
-                        size_kb = hw_params.get_buffer_size_kb(level_name)
-                        epa = config.L1_ACCUM_BASE_EPA_PJ + config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / torch.sqrt(num_pes))
-                        energy_contribution = access_bytes * epa
-                    elif level_name == 'L2_Scratchpad':
-                        size_kb = hw_params.get_buffer_size_kb(level_name)
-                        epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                        energy_contribution = access_bytes * epa
-                    
-                    level_energy += energy_contribution
-                    total_energy += energy_contribution
-            
-            detailed_metrics['energy_breakdown_pj']['intra_level'][level_name] = float(level_energy.item())
-        
-        # 3.3. 层间能耗 (Inter-level Energy) - 只计算DRAM部分
-        inter_level_accesses = producer_accesses
-        detailed_metrics['access_counts']['inter_level'] = {k: v.item() for k, v in inter_level_accesses.items()}
-        
-        dram_energy = torch.tensor(0.0, device=config.DEVICE)
-        for interface, accesses_bytes in inter_level_accesses.items():
-            if 'DRAM' in interface:
-                energy_contribution = (accesses_bytes / config.BYTES_PER_ELEMENT) * config.L3_DRAM_EPA_PJ
-                dram_energy += energy_contribution
-                total_energy += energy_contribution
-        
-        detailed_metrics['energy_breakdown_pj']['inter_level']['L3_DRAM'] = float(dram_energy.item())
-
-        # 4. Buffer Mismatch Loss Calculation (approximated for the producer)
-        group_buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
-        for i, level in enumerate(config.MEMORY_HIERARCHY):
-            if level['type'] == 'buffer':
-                # In a fused group, the buffer must hold the producer's data.
-                # We approximate the requirement based on the producer layer.
-                required_kb = perf_model.calculate_buffer_req_kb(producer_layer['dims'], all_factors, i)
-                available_kb = hw_params.get_buffer_size_kb(level['name'])
-                buffer_deficit = torch.relu(required_kb - available_kb)
-                level_mismatch_loss = torch.pow(buffer_deficit, 2)
-                group_buffer_mismatch_loss += level_mismatch_loss
-
-        # 5. Compatibility Penalty - 对于InPlaceFusionDMT，直接返回0
-        compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
-        
-        return latency, total_energy, group_buffer_mismatch_loss, compatibility_penalty, detailed_metrics
-
-
-class SkipConnectionDMT(BaseDMT):
-    """DMT for ResNet skip connection patterns like Conv -> BN -> ReLU -> Add."""
-
-    def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        
-        # Initialize detailed metrics
+        # 构建详细指标（保持接口兼容性）
         detailed_metrics = {
             'energy_breakdown_pj': {
-                'compute': 0.0,
+                'compute': float(energy.item()) if hasattr(energy, 'item') else float(energy),
                 'intra_level': {
                     'L0_Registers': 0.0,
                     'L1_Accumulator': 0.0,
@@ -217,131 +113,153 @@ class SkipConnectionDMT(BaseDMT):
             'access_counts': {
                 'intra_level': {},
                 'inter_level': {}
-            }
+            },
+            'fusion_type': 'in_place',
+            'producer_layer': producer_name,
+            'consumer_layers': consumers
         }
         
-        # 1. 路径识别：解析Add节点的两个输入源
+        return latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
+
+
+class SkipConnectionDMT(BaseDMT):
+    """DMT for ResNet skip connection patterns like Conv -> BN -> ReLU -> Add.
+    
+    重构后的SkipConnectionDMT作为任务分派器，处理残差连接的并行计算逻辑：
+    - 主路径和旁路并行执行，延迟取较大者
+    - 能耗为两路径的叠加
+    """
+
+    def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        
+        # 步骤1: 解析输入 - 识别主路径和旁路
         add_layer_name = group[-1]  # Add操作通常是最后一个
-        main_path = group[:-1]  # 主计算路径（Conv->BN->ReLU等）
-        
-        # 获取Add层的输入，识别主路径和旁路
-        add_layer_inputs = graph.get_layer_inputs(add_layer_name)
-        
-        # 假设主路径是group中的最后一个非Add层的输出
-        main_path_output = main_path[-1] if main_path else None
-        skip_path_source = None
+        main_path = group[:-1]      # 主计算路径（Conv->BN->ReLU等）
         
         # 识别跳跃连接的源头
+        add_layer_inputs = graph.get_layer_inputs(add_layer_name)
+        skip_path_source = None
         for input_layer in add_layer_inputs:
             if input_layer not in group:
                 skip_path_source = input_layer
                 break
         
-        # 2. 延迟建模
-        num_pes = hw_params.get_projected_num_pes()
-        
-        # 2.1 主路径延迟（复用InPlaceFusionDMT逻辑）
+        # 步骤2: 准备输入 - 为主路径创建伪图
         if main_path:
-            producer_layer = graph.layers[main_path[0]]
-            producer_macs = reduce(lambda x, y: x * y, producer_layer['dims'].values(), 1)
-            latency_main = producer_macs / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+            # 为主路径创建只包含生产者层的伪图
+            producer_name = main_path[0]  # 主路径的生产者层
+            main_pseudo_graph = type('MainPseudoGraph', (), {
+                'layers': {producer_name: graph.layers[producer_name]},
+                'fusion_groups': [[producer_name]]  # 单层融合组
+            })()
+        else:
+            main_pseudo_graph = None
+        
+        # 步骤3: 调用核心引擎 - 计算主路径PPA
+        from dosa.performance_model import HighFidelityPerformanceModel
+        
+        if main_pseudo_graph:
+            perf_model_main = HighFidelityPerformanceModel(config, debug_latency=True)
+            latency_main, energy_main, area_main, buffer_loss_main, compat_penalty_main = perf_model_main.forward(
+                graph=main_pseudo_graph,
+                hw_params=hw_params,
+                mapping=mapping,
+                direct_mapping_table=direct_mapping_table,
+                debug_output_path="debug_performance_model.json"
+            )
         else:
             latency_main = torch.tensor(0.0, device=config.DEVICE)
+            energy_main = torch.tensor(0.0, device=config.DEVICE)
+            buffer_loss_main = torch.tensor(0.0, device=config.DEVICE)
         
-        # 2.2 旁路数据获取延迟
+        # 步骤4: 建模旁路数据搬运成本
         if skip_path_source:
             skip_layer = graph.layers[skip_path_source]
-            # 假设旁路张量需要从L2_Scratchpad读取
-            skip_tensor_size = reduce(lambda x, y: x * y, skip_layer['dims'].values(), 1) * config.BYTES_PER_ELEMENT
-            l2_bandwidth_gb_s = next((level['bandwidth_gb_s'] for level in config.MEMORY_HIERARCHY 
-                                    if level['name'] == 'L2_Scratchpad'), 10.0)  # 默认带宽
-            latency_skip = skip_tensor_size / (l2_bandwidth_gb_s * 1e9 + 1e-9)
+            # 旁路张量大小（字节）
+            skip_tensor_elements = reduce(lambda x, y: x * y, skip_layer['dims'].values(), 1)
+            skip_tensor_bytes = skip_tensor_elements * config.BYTES_PER_ELEMENT
+            
+            # 旁路延迟：从L2读取的时间
+            from dosa.performance_model import calculate_bandwidth_bytes_per_cycle
+            l2_bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(
+                'L2_Scratchpad', hw_params.get_num_pes(), config)
+            latency_skip_cycles = skip_tensor_bytes / l2_bandwidth_bytes_per_cycle
+            latency_skip = latency_skip_cycles / (config.CLOCK_FREQUENCY_MHZ * 1e6)
+            
+            # 旁路能耗：L2读取能耗
+            l2_size_kb = hw_params.get_buffer_size_kb('L2_Scratchpad')
+            l2_epa = config.L2_SPM_BASE_EPA_PJ
+            energy_skip = (skip_tensor_elements * l2_epa)
         else:
             latency_skip = torch.tensor(0.0, device=config.DEVICE)
+            energy_skip = torch.tensor(0.0, device=config.DEVICE)
         
-        # 2.3 Add操作延迟（简化估计）
+        # 步骤5: Add操作成本建模
         add_layer = graph.layers[add_layer_name]
-        add_ops = reduce(lambda x, y: x * y, add_layer['dims'].values(), 1)
-        latency_add_op = add_ops / (num_pes * config.CLOCK_FREQUENCY_MHZ * 1e6 + 1e-9)
+        add_elements = reduce(lambda x, y: x * y, add_layer['dims'].values(), 1)
         
-        # 总延迟
-        latency_total = torch.maximum(latency_main, latency_skip) + latency_add_op
+        # Add操作延迟（简化为单周期操作）
+        add_cycles = add_elements / hw_params.get_num_pes()
+        latency_add_op = add_cycles / (config.CLOCK_FREQUENCY_MHZ * 1e6)
         
-        # 3. 能耗建模
-        total_energy = torch.tensor(0.0, device=config.DEVICE)
+        # Add操作能耗（简化为基础运算能耗）
+        energy_add_op = add_elements * config.PE_MAC_EPA_PJ * 0.1  # Add比MAC能耗低
         
-        # 3.1 主路径能耗（复用InPlaceFusionDMT逻辑）
-        group_macs = 0
-        for layer_name in main_path:
-            layer_dims = graph.layers[layer_name]['dims']
-            if 'conv' in layer_name.lower():
-                layer_macs = (layer_dims.get('N', 1) * layer_dims.get('K', 1) * 
-                             layer_dims.get('P', 1) * layer_dims.get('Q', 1) * 
-                             layer_dims.get('C', 1) * layer_dims.get('R', 1) * 
-                             layer_dims.get('S', 1))
-                group_macs += layer_macs
+        # 步骤6: 组合结果
+        # 延迟：并行执行取最大值，再加Add操作延迟
+        total_latency = torch.maximum(latency_main, latency_skip) + latency_add_op
         
-        energy_main = group_macs * config.PE_MAC_EPA_PJ
-        total_energy += energy_main
+        # 能耗：所有路径能耗叠加
+        total_energy = energy_main + energy_skip + energy_add_op
         
-        # 3.2 旁路数据读取能耗
-        if skip_path_source:
-            skip_layer = graph.layers[skip_path_source]
-            skip_tensor_size = reduce(lambda x, y: x * y, skip_layer['dims'].values(), 1)
-            # 使用L2_Scratchpad的EPA
-            l2_size_kb = hw_params.get_buffer_size_kb('L2_Scratchpad')
-            l2_epa = config.L2_SPM_BASE_EPA_PJ + config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * l2_size_kb
-            energy_skip = skip_tensor_size * config.BYTES_PER_ELEMENT * l2_epa
-            total_energy += energy_skip
+        # 缓冲区不匹配损失：主路径的损失（旁路数据通常已在缓存中）
+        total_buffer_mismatch_loss = buffer_loss_main
         
-        # 3.3 Add操作能耗
-        add_layer = graph.layers[add_layer_name]
-        add_ops = reduce(lambda x, y: x * y, add_layer['dims'].values(), 1)
-        energy_add_op = add_ops * config.PE_MAC_EPA_PJ  # 简化为MAC能耗
-        total_energy += energy_add_op
+        # 兼容性惩罚：暂时设为0
+        total_compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
         
-        detailed_metrics['energy_breakdown_pj']['compute'] = float(total_energy.item())
+        # 构建详细指标（保持接口兼容性）
+        detailed_metrics = {
+            'energy_breakdown_pj': {
+                'compute': float(total_energy.item()) if hasattr(total_energy, 'item') else float(total_energy),
+                'intra_level': {
+                    'L0_Registers': 0.0,
+                    'L1_Accumulator': 0.0,
+                    'L2_Scratchpad': 0.0
+                },
+                'inter_level': {
+                    'L3_DRAM': 0.0
+                }
+            },
+            'access_counts': {
+                'intra_level': {},
+                'inter_level': {}
+            },
+            'fusion_type': 'skip_connection',
+            'main_path': main_path,
+            'skip_path_source': skip_path_source,
+            'add_layer': add_layer_name,
+            'latency_breakdown': {
+                'main_path': float(latency_main.item()) if hasattr(latency_main, 'item') else float(latency_main),
+                'skip_path': float(latency_skip.item()) if hasattr(latency_skip, 'item') else float(latency_skip),
+                'add_operation': float(latency_add_op.item()) if hasattr(latency_add_op, 'item') else float(latency_add_op)
+            },
+            'energy_breakdown': {
+                'main_path': float(energy_main.item()) if hasattr(energy_main, 'item') else float(energy_main),
+                'skip_path': float(energy_skip.item()) if hasattr(energy_skip, 'item') else float(energy_skip),
+                'add_operation': float(energy_add_op.item()) if hasattr(energy_add_op, 'item') else float(energy_add_op)
+            }
+        }
         
-        # 4. Buffer需求建模
-        buffer_mismatch_loss = torch.tensor(0.0, device=config.DEVICE)
-        
-        if main_path and skip_path_source:
-            # 创建性能模型实例
-            from dosa.performance_model import HighFidelityPerformanceModel
-            perf_model = HighFidelityPerformanceModel(config)
-            perf_model.hw_params = hw_params
-            
-            all_factors = mapping.get_all_factors()
-            
-            # 计算主路径输出Tile和旁路输入Tile的总Buffer需求
-            for i, level in enumerate(config.MEMORY_HIERARCHY):
-                if level['type'] == 'buffer':
-                    # 主路径输出Tile需求
-                    main_output_layer = graph.layers[main_path[-1]]
-                    main_required_kb = perf_model.calculate_buffer_req_kb(main_output_layer['dims'], all_factors, i)
-                    
-                    # 旁路输入Tile需求
-                    skip_layer = graph.layers[skip_path_source]
-                    skip_required_kb = perf_model.calculate_buffer_req_kb(skip_layer['dims'], all_factors, i)
-                    
-                    # 总需求是两者之和（因为需要同时存在于片上缓存中）
-                    total_required_kb = main_required_kb + skip_required_kb
-                    available_kb = hw_params.get_buffer_size_kb(level['name'])
-                    buffer_deficit = torch.relu(total_required_kb - available_kb)
-                    level_mismatch_loss = torch.pow(buffer_deficit, 2)
-                    buffer_mismatch_loss += level_mismatch_loss
-        
-        # 5. 兼容性惩罚（对于SkipConnectionDMT暂时返回0）
-        compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
-        
-        return latency_total, total_energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
+        return total_latency, total_energy, total_buffer_mismatch_loss, total_compatibility_penalty, detailed_metrics
 
 
 class SequentialConvDMT(BaseDMT):
     """示例DMT类，展示基于Orojenesis/FFMT思想的兼容性惩罚计算逻辑。"""
 
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
-                mapping: FineGrainedMapping, config: Config) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+                mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
         # 简化的性能建模（可以不完整）
         latency = torch.tensor(1.0, device=config.DEVICE)
