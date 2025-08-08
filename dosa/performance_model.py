@@ -148,8 +148,8 @@ class HighFidelityPerformanceModel(nn.Module):
         """
         计算跨层级数据填充流量（Inter-Level Data Fill Traffic）。
         
-        此函数专门负责计算所有跨层级接口上，因缓存未命中而产生的"数据填充"流量。
-        严格遵循论文公式(11)中的路径A (i > innermost_level)，即流量由 Writes_t(i) 驱动。
+        基于DATA_SUPPLY_MAP的新架构，遍历所有数据需求并追溯其供给来源，
+        计算对应通路上的填充流量，支持跨级数据路径（如L2->L0）。
         
         Args:
             layer_dims: 层的维度信息 {R, S, P, Q, C, K, N}
@@ -160,7 +160,7 @@ class HighFidelityPerformanceModel(nn.Module):
         Returns:
             dict: 详细的跨层级填充流量信息，包含按张量分解的流量和驱动因子
                  {
-                     'L3_DRAM_to_L2_Scratchpad': {
+                     'L2_Scratchpad_to_L0_Registers': {
                          'total_bytes': float,
                          'breakdown': {'Weight': float, 'Input': float, 'Output': float},
                          'drivers': {'Weight': {'C_i,t': float, 'Outer_Temporal_Product': float}, ...}
@@ -179,147 +179,107 @@ class HighFidelityPerformanceModel(nn.Module):
         if debug_data is not None:
             debug_data["inter_level_fill_traffic_trace"] = {}
         
-        # 为每个内存层级计算填充流量（基于 Writes）
+        # 基于数据需求的新逻辑：遍历所有存储层级和张量类型
         for i in range(M + 1):  # i = 0, 1, 2, 3
-            level_name = memory_levels[i]
+            destination_level_name = memory_levels[i]
             
             # 初始化当前层级的调试数据
             if debug_data is not None:
-                debug_data["inter_level_fill_traffic_trace"][f"{level_name} (i={i})"] = {}
+                debug_data["inter_level_fill_traffic_trace"][f"{destination_level_name} (i={i})"] = {}
             
-            # 只为需要"填充"的张量（权重和输入）计算填充流量
-            # 注意：此函数专门处理"下行车道"流量，即从高层级存储填充到低层级存储的数据流
-            for tensor_type in ['W', 'I']:
+            # 遍历所有张量类型
+            for tensor_type in ['W', 'I']:  # 只处理需要填充的张量
                 
-                # 检查该张量是否存储在当前层级
+                # 资格预审：检查STORAGE_MATRIX，确认层级i是否允许存储张量t
                 if not STORAGE_MATRIX[i][tensor_type]:
                     continue
-                    
+                
+                # 映射张量类型到DATA_SUPPLY_MAP中使用的名称
+                tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
+                tensor_name = tensor_name_map[tensor_type]
+                
+                # 查询供给来源：使用DATA_SUPPLY_MAP查询源层级
+                if (destination_level_name not in self.config.DATA_SUPPLY_MAP or 
+                    tensor_name not in self.config.DATA_SUPPLY_MAP[destination_level_name]):
+                    continue
+                
+                source_level_name = self.config.DATA_SUPPLY_MAP[destination_level_name][tensor_name]
+                
+                # 跳过PE产生的数据（不需要填充）
+                if source_level_name == 'PE':
+                    continue
+                
+                # 获取源层级索引
+                try:
+                    j = memory_levels.index(source_level_name)
+                except ValueError:
+                    continue  # 无效的源层级名称
+                
                 # 计算 C_i,t: 在层级 i 存储的张量 t 的数据块大小
                 C_i_t = self._calculate_data_block_size(i, tensor_type, layer_dims, mapping_table)
                 
-                # 计算最内层活跃层级
+                # 计算最内层活跃层级（用于调试）
                 innermost_level = self._find_innermost_level(tensor_type, mapping_table)
                 
                 # 计算外层循环因子乘积 (Outer_Temporal_Product)
+                # 【核心修复】外层循环范围是从目的地层级i+1到最高层级M
                 outer_temporal_product = torch.tensor(1.0, device=self.config.DEVICE)
                 relevant_dims = TENSOR_DIMS[tensor_type]
                 
-                # 连乘所有外层于 i 的层级 (j ∈ {i+1, ..., M})
-                for j in range(i + 1, M + 1):
-                    level_name_j = memory_levels[j]
+                # 【核心修复】连乘所有外层于目的地层级i的层级 (k ∈ {i+1, ..., M})
+                for k in range(i + 1, M + 1):
+                    level_name_k = memory_levels[k]
                     
                     # 对所有与该张量相关的维度 d ∈ D_t
                     for dim_name in relevant_dims:
-                        if dim_name in layer_dims and dim_name in mapping_table and level_name_j in mapping_table[dim_name]:
-                            temporal_factor = mapping_table[dim_name][level_name_j].get('temporal', 1)
+                        if dim_name in layer_dims and dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
+                            temporal_factor = mapping_table[dim_name][level_name_k].get('temporal', 1)
                             outer_temporal_product *= torch.tensor(temporal_factor, device=self.config.DEVICE)
                 
-                # 计算 Writes_t(i) = C_i,t × Outer_Temporal_Product
-                writes = C_i_t * outer_temporal_product
+                # 计算填充流量 = C_i,t × Outer_Temporal_Product
+                tensor_fill_accesses = C_i_t * outer_temporal_product
                 
                 # 收集详细的调试数据
                 if debug_data is not None:
                     tensor_debug_data = {
                         "C_i,t": C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
                         "innermost_level": innermost_level,
-                        "Writes_t(i)": writes.detach().cpu().item() if isinstance(writes, torch.Tensor) else writes
+                        "source_level": source_level_name,
+                        "source_level_index": j,
+                        "outer_temporal_product": outer_temporal_product.detach().cpu().item() if isinstance(outer_temporal_product, torch.Tensor) else outer_temporal_product,
+                        "tensor_fill_accesses": tensor_fill_accesses.detach().cpu().item() if isinstance(tensor_fill_accesses, torch.Tensor) else tensor_fill_accesses
                     }
                     
-                    debug_data["inter_level_fill_traffic_trace"][f"{level_name} (i={i})"][tensor_type] = tensor_debug_data
+                    debug_data["inter_level_fill_traffic_trace"][f"{destination_level_name} (i={i})"][tensor_type] = tensor_debug_data
                 
-                # 累加到对应的层级间接口（仅基于 Writes）
-                if i < M:  # 不是最高层级
-                    interface_name = f"{memory_levels[i+1]}_to_{level_name}"
-                    
-                    # 初始化接口的详细信息结构
-                    if interface_name not in detailed_fill_traffic:
-                        detailed_fill_traffic[interface_name] = {
-                            'total_bytes': torch.tensor(0.0, device=self.config.DEVICE),
-                            'breakdown': {'Weight': torch.tensor(0.0, device=self.config.DEVICE), 
-                                        'Input': torch.tensor(0.0, device=self.config.DEVICE), 
-                                        'Output': torch.tensor(0.0, device=self.config.DEVICE)},
-                            'drivers': {'Weight': {}, 'Input': {}, 'Output': {}}
-                        }
-                    
-                    # 计算该张量的填充流量（字节）
-                    tensor_fill_bytes = writes * self.config.BYTES_PER_ELEMENT
-                    
-                    # 映射张量类型到标准名称
-                    tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
-                    tensor_name = tensor_name_map[tensor_type]
-                    
-                    # 更新分解信息
-                    detailed_fill_traffic[interface_name]['breakdown'][tensor_name] += tensor_fill_bytes
-                    detailed_fill_traffic[interface_name]['total_bytes'] += tensor_fill_bytes
-                    
-                    # 更新驱动因子信息
-                    detailed_fill_traffic[interface_name]['drivers'][tensor_name] = {
-                        'C_i,t': C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
-                        'Outer_Temporal_Product': outer_temporal_product.detach().cpu().item() if isinstance(outer_temporal_product, torch.Tensor) else outer_temporal_product
+                # 构建接口：动态构建接口名称
+                interface_name = f"{source_level_name}_to_{destination_level_name}"
+                
+                # 初始化接口的详细信息结构
+                if interface_name not in detailed_fill_traffic:
+                    detailed_fill_traffic[interface_name] = {
+                        'total_bytes': torch.tensor(0.0, device=self.config.DEVICE),
+                        'breakdown': {'Weight': torch.tensor(0.0, device=self.config.DEVICE), 
+                                    'Input': torch.tensor(0.0, device=self.config.DEVICE), 
+                                    'Output': torch.tensor(0.0, device=self.config.DEVICE)},
+                        'drivers': {'Weight': {}, 'Input': {}, 'Output': {}}
                     }
-        
-        # === 特殊处理：为权重(W)实现真实的L1->L0层间填充流量计算 ===
-        # 当i=1(L1)时，单独计算写往L0的权重填充流量
-        if 'L1_Accumulator_to_L0_Registers' in detailed_fill_traffic:
-            # 计算权重在L0的数据足迹 (Data_Footprint_at_L0)
-            weight_data_footprint_l0 = self._calculate_data_block_size(0, 'W', layer_dims, mapping_table)
-            
-            # 计算驱动L0数据重载的外层循环总次数
-            outer_loop_iterations = torch.tensor(1.0, device=self.config.DEVICE)
-            weight_dims = ['K', 'C', 'R', 'S']  # 权重张量的相关维度
-            
-            # 遍历L1及以上层级
-            for level_idx in range(1, M + 1):
-                level_name = memory_levels[level_idx]
-                for dim_name in weight_dims:
-                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                        outer_loop_iterations *= torch.tensor(temporal_factor, device=self.config.DEVICE)
-            
-            # 计算权重复用因子 (在L0层级的复用)
-            weight_reuse_factor = torch.tensor(1.0, device=self.config.DEVICE)
-            weight_reuse_dims = ['N', 'P', 'Q']  # 权重在这些维度上被复用
-            
-            # 只考虑L0层级的复用
-            level_name = memory_levels[0]  # L0_Registers
-            for dim_name in weight_reuse_dims:
-                if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                    temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                    weight_reuse_factor *= torch.tensor(temporal_factor, device=self.config.DEVICE)
-            
-            # 应用复用修正
-            effective_outer_iterations = outer_loop_iterations / torch.clamp(weight_reuse_factor, min=torch.tensor(1e-9, device=self.config.DEVICE))
-            
-            # 计算L1->L0的权重填充流量
-            l1_to_l0_weight_fills_bytes = (weight_data_footprint_l0 * 
-                                         effective_outer_iterations * 
-                                         self.config.BYTES_PER_ELEMENT)
-            
-            # 重置L1->L0接口的权重流量（使用真实的权重填充流量）
-            detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['breakdown']['Weight'] = l1_to_l0_weight_fills_bytes
-            
-            # 重新计算总流量
-            detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['total_bytes'] = (
-                detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['breakdown']['Weight'] +
-                detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['breakdown']['Input'] +
-                detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['breakdown']['Output']
-            )
-            
-            # 更新权重的驱动因子信息
-            detailed_fill_traffic['L1_Accumulator_to_L0_Registers']['drivers']['Weight'] = {
-                'C_i,t': weight_data_footprint_l0.detach().cpu().item() if isinstance(weight_data_footprint_l0, torch.Tensor) else weight_data_footprint_l0,
-                'Outer_Temporal_Product': effective_outer_iterations.detach().cpu().item() if isinstance(effective_outer_iterations, torch.Tensor) else effective_outer_iterations
-            }
-            
-            # 收集调试数据
-            if debug_data is not None:
-                debug_data["L1_to_L0_weight_fills_calculation"] = {
-                    "weight_data_footprint_l0": weight_data_footprint_l0.detach().cpu().item() if isinstance(weight_data_footprint_l0, torch.Tensor) else weight_data_footprint_l0,
-                    "outer_loop_iterations": outer_loop_iterations.detach().cpu().item() if isinstance(outer_loop_iterations, torch.Tensor) else outer_loop_iterations,
-                    "weight_reuse_factor": weight_reuse_factor.detach().cpu().item() if isinstance(weight_reuse_factor, torch.Tensor) else weight_reuse_factor,
-                    "effective_outer_iterations": effective_outer_iterations.detach().cpu().item() if isinstance(effective_outer_iterations, torch.Tensor) else effective_outer_iterations,
-                    "l1_to_l0_weight_fills_bytes": l1_to_l0_weight_fills_bytes.detach().cpu().item() if isinstance(l1_to_l0_weight_fills_bytes, torch.Tensor) else l1_to_l0_weight_fills_bytes
+                
+                # 计算该张量的填充流量（字节）
+                tensor_fill_bytes = tensor_fill_accesses * self.config.BYTES_PER_ELEMENT
+                
+                # 映射张量类型到标准名称
+                tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
+                tensor_name = tensor_name_map[tensor_type]
+                
+                # 更新分解信息
+                detailed_fill_traffic[interface_name]['breakdown'][tensor_name] += tensor_fill_bytes
+                detailed_fill_traffic[interface_name]['total_bytes'] += tensor_fill_bytes
+                
+                # 更新驱动因子信息
+                detailed_fill_traffic[interface_name]['drivers'][tensor_name] = {
+                    'C_i,t': C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
+                    'Outer_Temporal_Product': outer_temporal_product.detach().cpu().item() if isinstance(outer_temporal_product, torch.Tensor) else outer_temporal_product
                 }
         
         # 转换所有 torch.Tensor 为 float 以便 JSON 序列化
@@ -568,8 +528,8 @@ class HighFidelityPerformanceModel(nn.Module):
             size = torch.tensor(1.0, device=self.config.DEVICE)
             relevant_dims = D_W  # {R, S, C, K}
             
-            # 遍历从 0 到 i-1 的所有内层层级
-            for j in range(i):
+            # 遍历从 0 到 i 的所有内层层级（包括自身）
+            for j in range(i + 1):
                 level_name = memory_levels[j]
                 # 对每个层级，遍历 D_W 中的所有维度，累乘其 temporal 和 spatial 因子
                 for dim_name in relevant_dims:
@@ -606,7 +566,7 @@ class HighFidelityPerformanceModel(nn.Module):
             def calculate_inner(dim_name):
                 """计算 Inner(i, d) - 某个维度 d 在层级 i 及其内层的总 tile size"""
                 inner_size = torch.tensor(1.0, device=self.config.DEVICE)
-                for j in range(i):
+                for j in range(i + 1):
                     level_name = memory_levels[j]
                     if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
                         temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
@@ -626,7 +586,7 @@ class HighFidelityPerformanceModel(nn.Module):
             
             # 计算 C 和 N 维度在所有内层层级的因子连乘积
             cn_factors = torch.tensor(1.0, device=self.config.DEVICE)
-            for j in range(i):
+            for j in range(i + 1):
                 level_name = memory_levels[j]
                 for dim_name in ['C', 'N']:
                     if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
@@ -938,7 +898,9 @@ class HighFidelityPerformanceModel(nn.Module):
             debug_data = {
                 "calculation_summary": {},
                 "memory_interface_analysis": {},
-                "detailed_traffic_formula_trace": {}
+                "detailed_traffic_formula_trace": {},
+                "inter_level_fill_traffic_trace": {},
+                "inter_level_writeback_traffic_trace": {}
             }
         
         # 确定映射表来源
@@ -1043,40 +1005,7 @@ class HighFidelityPerformanceModel(nn.Module):
                             "traffic_drivers": interface_info['drivers']
                         }
                 
-                # === 第四步：建模L2_to_MAC接口 ===
-                # 为从L2到MAC的输入数据流建立独立的成本核算
-                
-                # 计算L2_to_MAC的流量
-                F_S_I_2 = self._calculate_spatial_reuse_factor(2, 'I', layer['dims'], all_factors)
-                L2_to_MAC_traffic_elements = total_macs / torch.clamp(F_S_I_2, min=torch.tensor(1e-9, device=self.config.DEVICE))
-                L2_to_MAC_traffic_bytes = L2_to_MAC_traffic_elements * self.config.BYTES_PER_ELEMENT
-                
-                # 根据论文，L2带宽与L1相同
-                L2_to_MAC_bandwidth = calculate_bandwidth_bytes_per_cycle('L1_Accumulator', num_pes, self.config)
-                l2_to_mac_cycles = L2_to_MAC_traffic_bytes / (L2_to_MAC_bandwidth + torch.tensor(1e-9, device=self.config.DEVICE))
-                
-                # 将L2_to_MAC周期加入到memory_cycles_list中
-                memory_cycles_list.append(l2_to_mac_cycles)
-                
-                # 收集L2_to_MAC接口分析数据
-                if debug_data is not None:
-                    debug_data["memory_interface_analysis"]["L2_to_MAC"] = {
-                        "F_S_I_2": F_S_I_2.detach().cpu().item() if isinstance(F_S_I_2, torch.Tensor) else F_S_I_2,
-                        "L2_to_MAC_traffic_elements": L2_to_MAC_traffic_elements.detach().cpu().item() if isinstance(L2_to_MAC_traffic_elements, torch.Tensor) else L2_to_MAC_traffic_elements,
-                        "fill_bytes_total": L2_to_MAC_traffic_bytes.detach().cpu().item() if isinstance(L2_to_MAC_traffic_bytes, torch.Tensor) else L2_to_MAC_traffic_bytes,
-                        "bandwidth_bytes_per_cycle": L2_to_MAC_bandwidth.detach().cpu().item() if isinstance(L2_to_MAC_bandwidth, torch.Tensor) else L2_to_MAC_bandwidth,
-                        "memory_cycles": l2_to_mac_cycles.detach().cpu().item() if isinstance(l2_to_mac_cycles, torch.Tensor) else l2_to_mac_cycles,
-                        "fill_bytes_breakdown": {
-                            "Weight": 0.0,
-                            "Input": L2_to_MAC_traffic_bytes.detach().cpu().item() if isinstance(L2_to_MAC_traffic_bytes, torch.Tensor) else L2_to_MAC_traffic_bytes,
-                            "Output": 0.0
-                        },
-                        "traffic_drivers": {
-                            "Weight": {"C_i,t": 0.0, "Outer_Temporal_Product": 0.0},
-                            "Input": {"C_i,t": "N/A (MAC-driven)", "Outer_Temporal_Product": "N/A (MAC-driven)"},
-                            "Output": {"C_i,t": 0.0, "Outer_Temporal_Product": 0.0}
-                        }
-                    }
+
                 
                 # 步骤4: 确定瓶颈并计算总延迟
                 if memory_cycles_list:

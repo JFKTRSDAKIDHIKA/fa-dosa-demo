@@ -109,6 +109,29 @@ class Config:
         
         # ========== 带宽模型参数 ==========
         self.DRAM_BANDWIDTH_GB_S = 100  # 对应8 words/cycle @ 1GHz
+        
+        # ========== 数据供给通路图 ==========
+        # 定义每个存储层级中，各类张量数据的合法供给来源
+        # 'PE' 表示由计算单元直接产生
+        self.DATA_SUPPLY_MAP = {
+            'L0_Registers': {
+                'Input': 'L2_Scratchpad',   # L0的Input数据来自L2
+                'Weight': 'L2_Scratchpad',  # L0的Weight数据也来自L2
+                'Output': 'PE'              # Output由PE计算单元产生，无需填充
+            },
+            'L1_Accumulator': {
+                'Output': 'L0_Registers'    # L1的Output数据来自L0的写回
+            },
+            'L2_Scratchpad': {
+                'Input': 'L3_DRAM',
+                'Weight': 'L3_DRAM',
+                'Output': 'L1_Accumulator'  # L2的Output数据来自L1的写回
+            },
+            'L3_DRAM': {
+                # DRAM是最高层级，其数据被认为是"凭空而来"，主要接受来自下层的写回
+                'Output': 'L2_Scratchpad'
+            }
+        }
     
     @classmethod
     def get_instance(cls):
