@@ -144,7 +144,7 @@ class HighFidelityPerformanceModel(nn.Module):
         
         return intra_accesses
     
-    def calculate_inter_level_fill_traffic(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
+    def calculate_inter_level_fill_traffic(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, hw_params: HardwareParameters, debug_data: dict = None) -> dict:
         """
         计算跨层级数据填充流量（Inter-Level Data Fill Traffic）。
         
@@ -221,70 +221,33 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 计算最内层活跃层级（用于调试）
                 innermost_level = self._find_innermost_level(tensor_type, mapping_table)
                 
-                # --- 开始重构区域 ---
+                # --- 开始重构区域：新的流量计算逻辑 ---
                 
-                outer_temporal_product = torch.tensor(1.0, device=self.config.DEVICE)
-                relevant_dims = TENSOR_DIMS[tensor_type]
+                # 计算 C_i_t = _calculate_data_block_size(i, tensor_type, ...)（已修正W/O截断后公式）
+                # C_i_t 已在上面计算
                 
-                # 遍历与当前张量相关的所有维度
-                for dim_name in relevant_dims:
-                    # 检查该维度是否存在于当前层的定义中
-                    if dim_name not in layer_dims:
-                        continue
-                
-                    # 1. 获取该维度的总问题大小
-                    total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
-                
-                    # 2. 计算该维度在所有层级（0到M）的 temporal 映射因子总乘积
-                    total_temporal_factor = torch.tensor(1.0, device=self.config.DEVICE)
-                    for k in range(len(memory_levels)):
-                        level_name_k = memory_levels[k]
-                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
-                            total_temporal_factor *= torch.tensor(mapping_table[dim_name][level_name_k].get('temporal', 1), device=self.config.DEVICE)
-                
-                    # 3. 计算所有内层（0到i）的 temporal 映射因子乘积
-                    inner_temporal_factor = torch.tensor(1.0, device=self.config.DEVICE)
-                    for j in range(i + 1):
-                        level_name_j = memory_levels[j]
-                        if dim_name in mapping_table and level_name_j in mapping_table[dim_name]:
-                            inner_temporal_factor *= torch.tensor(mapping_table[dim_name][level_name_j].get('temporal', 1), device=self.config.DEVICE)
-                
-                    # 4. 计算外层循环因子乘积 (Outer_Temporal_Product)
-                    # 外层循环范围是从目的地层级 i+1 到最高层级 M
+                if tensor_type == 'W':
+                    # 权重张量的新逻辑
+                    persist_W = self._can_persist_W_at_level(i, layer_dims, mapping_table, hw_params)
+                    tiles = self._tiles_above_for_W(i, layer_dims, mapping_table, persist_W)
                     
-                    # 重新初始化，并采用最直接的累乘逻辑
-                    current_dim_outer_product = torch.tensor(1.0, device=self.config.DEVICE)
-                    
-                    # 连乘所有外层于目的地层级 i 的层级 (k ∈ {i+1, ..., M})
-                    for k in range(i + 1, M + 1):
-                        level_name_k = memory_levels[k]
-                        
-                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
-                            # 只累乘 temporal 因子，因为它决定了对上层存储的访问次数
-                            temporal_factor = mapping_table[dim_name][level_name_k].get('temporal', 1)
-                            current_dim_outer_product *= torch.tensor(temporal_factor, device=self.config.DEVICE)
-                
-                    # 一个维度的总大小，必须等于其在所有层级 temporal 和 spatial 因子的总乘积
-                    # total_size = Product(temporal_factors) * Product(spatial_factors)
-                    # 我们需要找到那些没有被 temporal 或 spatial 完全分解的剩余部分，它们也属于外层循环
-                    
-                    all_mapped_factors = torch.tensor(1.0, device=self.config.DEVICE)
-                    for k in range(len(memory_levels)):
-                        level_name_k = memory_levels[k]
-                        if dim_name in mapping_table and level_name_k in mapping_table[dim_name]:
-                             all_mapped_factors *= torch.tensor(mapping_table[dim_name][level_name_k].get('temporal', 1), device=self.config.DEVICE)
-                             all_mapped_factors *= torch.tensor(mapping_table[dim_name][level_name_k].get('spatial', 1), device=self.config.DEVICE)
-                
-                    # 剩余的、未在映射表中分配的迭代次数，也必须在外层（DRAM）执行
-                    remaining_factor = total_dim_size / torch.clamp(all_mapped_factors, min=1e-9)
-                    
-                    # 最终，该维度的外层总迭代次数，是外层显式定义的temporal因子和剩余因子的乘积
-                    outer_temporal_product *= (current_dim_outer_product * remaining_factor)
+                elif tensor_type == 'I':
+                    # 输入张量：tiles = ∏_{d∈D_I} ceil(total(d) / coverage_≤i(d))
+                    tiles = torch.tensor(1.0, device=self.config.DEVICE)
+                    for dim_name in D_I:  # {N, C, P, Q, R, S}
+                        if dim_name in layer_dims:
+                            total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                            coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                            coverage = torch.clamp(coverage, min=1.0)  # 防0
+                            tiles *= torch.ceil(total_dim_size / coverage)
+                else:
+                    # 其他张量类型，保持原逻辑
+                    tiles = torch.tensor(1.0, device=self.config.DEVICE)
                 
                 # --- 结束重构区域 ---
                 
-                # 计算填充流量 = C_i,t × Outer_Temporal_Product
-                tensor_fill_accesses = C_i_t * outer_temporal_product
+                # 计算填充流量 = C_i,t × Tiles_above(i)
+                tensor_fill_accesses = C_i_t * tiles
                 
                 # 收集详细的调试数据
                 if debug_data is not None:
@@ -293,9 +256,21 @@ class HighFidelityPerformanceModel(nn.Module):
                         "innermost_level": innermost_level,
                         "source_level": source_level_name,
                         "source_level_index": j,
-                        "outer_temporal_product": outer_temporal_product.detach().cpu().item() if isinstance(outer_temporal_product, torch.Tensor) else outer_temporal_product,
+                        "tiles": tiles.detach().cpu().item() if isinstance(tiles, torch.Tensor) else tiles,
                         "tensor_fill_accesses": tensor_fill_accesses.detach().cpu().item() if isinstance(tensor_fill_accesses, torch.Tensor) else tensor_fill_accesses
                     }
+                    
+                    # 为权重张量添加额外的调试信息
+                    if tensor_type == 'W':
+                        persist_W = self._can_persist_W_at_level(i, layer_dims, mapping_table, hw_params)
+                        tensor_debug_data["persist_W"] = persist_W
+                        
+                        # 添加coverage快照
+                        coverage_snapshot = {}
+                        for dim_name in D_W:
+                            if dim_name in layer_dims:
+                                coverage_snapshot[dim_name] = self._coverage_upto(i, dim_name, mapping_table, layer_dims).detach().cpu().item()
+                        tensor_debug_data["coverage_snapshot"] = coverage_snapshot
                     
                     debug_data["inter_level_fill_traffic_trace"][f"{destination_level_name} (i={i})"][tensor_type] = tensor_debug_data
                 
@@ -326,7 +301,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 更新驱动因子信息
                 detailed_fill_traffic[interface_name]['drivers'][tensor_name] = {
                     'C_i,t': C_i_t.detach().cpu().item() if isinstance(C_i_t, torch.Tensor) else C_i_t,
-                    'Outer_Temporal_Product': outer_temporal_product.detach().cpu().item() if isinstance(outer_temporal_product, torch.Tensor) else outer_temporal_product
+                    'Tiles_above': tiles.detach().cpu().item() if isinstance(tiles, torch.Tensor) else tiles
                 }
         
         # 转换所有 torch.Tensor 为 float 以便 JSON 序列化
@@ -562,46 +537,151 @@ class HighFidelityPerformanceModel(nn.Module):
         
         return consumption_accesses
     
+    def _coverage_upto(self, level_idx: int, dim: str, mapping_table: dict, layer_dims: dict) -> torch.Tensor:
+        """
+        计算维度 dim 在 ≤level_idx 的 temporal×spatial 乘积（并截断不超过 total(dim)）
+        
+        Args:
+            level_idx: 层级索引 i
+            dim: 维度名称
+            mapping_table: 映射表
+            layer_dims: 层维度信息
+            
+        Returns:
+            coverage_≤i(d): 该维度在≤i层级的覆盖范围
+        """
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        
+        cov = torch.tensor(1.0, device=self.config.DEVICE)
+        for j in range(level_idx + 1):  # 0..i
+            level_name = memory_levels[j]
+            if dim in mapping_table and level_name in mapping_table[dim]:
+                temporal_factor = mapping_table[dim][level_name].get('temporal', 1)
+                spatial_factor = mapping_table[dim][level_name].get('spatial', 1)
+                cov *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+        
+        # 关键：截断不超过 total
+        if dim in layer_dims:
+            total_dim_size = torch.tensor(layer_dims[dim], device=self.config.DEVICE)
+            cov = torch.min(cov, total_dim_size)
+        
+        return torch.max(cov, torch.tensor(1.0, device=self.config.DEVICE))  # 防0
+    
+    def _can_persist_W_at_level(self, i: int, layer_dims: dict, mapping_table: dict, hw_params: HardwareParameters) -> bool:
+        """
+        判断权重W是否可以在层级i持久化
+        
+        条件：
+        (A) 映射覆盖整张W：对d∈D_W满足coverage_≤i(d) ≥ total(d)
+        (B) 容量允许：W_tile_words + buffer_overheads ≤ capacity_words(i)
+        
+        Args:
+            i: 层级索引
+            layer_dims: 层维度信息
+            mapping_table: 映射表
+            hw_params: 硬件参数
+            
+        Returns:
+            bool: 是否可以持久化
+        """
+        memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        
+        # 条件A：映射覆盖整张W
+        for dim_name in D_W:  # {K, C, R, S}
+            if dim_name in layer_dims:
+                total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                if coverage < total_dim_size:
+                    return False
+        
+        # 条件B：容量允许
+        level_name = memory_levels[i]
+        capacity_words = hw_params.get_buffer_size_kb(level_name) * 1024 / self.config.BYTES_PER_ELEMENT
+        
+        # W_tile_words = 整张W的word数
+        W_tile_words = torch.tensor(1.0, device=self.config.DEVICE)
+        for dim_name in D_W:
+            if dim_name in layer_dims:
+                W_tile_words *= torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+        
+        # 计算buffer_overheads
+        input_ws_peak = self._calculate_data_block_size(i, 'I', layer_dims, mapping_table) if STORAGE_MATRIX[i].get('I', False) else torch.tensor(0.0, device=self.config.DEVICE)
+        output_ws_peak = self._calculate_data_block_size(i, 'O', layer_dims, mapping_table) if STORAGE_MATRIX[i].get('O', False) else torch.tensor(0.0, device=self.config.DEVICE)
+        
+        # 双缓冲系数
+        buf_mult = 2  # 默认双缓冲
+        
+        need = W_tile_words + buf_mult * input_ws_peak + output_ws_peak
+        
+        return need.item() <= capacity_words
+    
+    def _tiles_above_for_W(self, i: int, layer_dims: dict, mapping_table: dict, persist_W: bool) -> torch.Tensor:
+        """
+        计算权重W的外层tile数量 Tiles_above(i)
+        
+        公式：
+        Tiles_above(i) = (∏_{d∈D_W} ceil(total/coverage_≤i)) × (persist_W ? 1 : ∏_{d∈{N,P,Q}} ceil(total/coverage_≤i))
+        
+        Args:
+            i: 层级索引
+            layer_dims: 层维度信息
+            mapping_table: 映射表
+            persist_W: 是否可以持久化
+            
+        Returns:
+            torch.Tensor: 外层tile数量
+        """
+        # 计算与W相关维的tiles
+        tiles_dep = torch.tensor(1.0, device=self.config.DEVICE)
+        for dim_name in D_W:  # {K, C, R, S}
+            if dim_name in layer_dims:
+                total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                coverage = torch.clamp(coverage, min=1.0)  # 防0
+                tiles_dep *= torch.ceil(total_dim_size / coverage)
+        
+        # 计算与W无关的维的tiles（N, P, Q）
+        tiles_indep = torch.tensor(1.0, device=self.config.DEVICE)
+        for dim_name in ['N', 'P', 'Q']:
+            if dim_name in layer_dims:
+                total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                coverage = torch.clamp(coverage, min=1.0)  # 防0
+                tiles_indep *= torch.ceil(total_dim_size / coverage)
+        
+        return tiles_dep if persist_W else tiles_dep * tiles_indep
+
     def _calculate_data_block_size(self, i: int, tensor_type: str, layer_dims: dict, mapping_table: dict) -> torch.Tensor:
         """
         计算在层级 i 必须存储的张量 tensor_type 的数据块大小 C_i,t (以word为单位)
         严格按照论文公式实现：Equations 2, 3, 4
+        修改：W/O分支加入截断逻辑，确保不超过总尺寸
         """
         memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
         
         if tensor_type == 'W':
-            # C_i,W (Equation 2 for Weights):
-            # C_i,W = Π(f_k,j,d) 其中 k ∈ {S, T}, j ∈ {0, ..., i-1}, d ∈ D_W = {R, S, C, K}
+            # C_i,W (修改后): ∏_{d∈D_W} min(total(d), coverage_≤i(d))
             size = torch.tensor(1.0, device=self.config.DEVICE)
             relevant_dims = D_W  # {R, S, C, K}
             
-            # 遍历从 0 到 i 的所有内层层级（包括自身）
-            for j in range(i + 1):
-                level_name = memory_levels[j]
-                # 对每个层级，遍历 D_W 中的所有维度，累乘其 temporal 和 spatial 因子
-                for dim_name in relevant_dims:
-                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                        size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+            for dim_name in relevant_dims:
+                if dim_name in layer_dims:
+                    total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                    coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                    size *= torch.min(total_dim_size, coverage)
             
             return size
             
         elif tensor_type == 'O':
-            # C_i,O (Equation 4 for Outputs):
-            # C_i,O = Π(f_k,j,d) 其中 k ∈ {S, T}, j ∈ M (所有内存层级), d ∈ D_O = {P, Q, K, N}
+            # C_i,O (修改后): ∏_{d∈D_O} min(total(d), coverage_≤i(d))
             size = torch.tensor(1.0, device=self.config.DEVICE)
             relevant_dims = D_O  # {P, Q, K, N}
             
-            # 遍历所有内存层级
-            for j in range(len(memory_levels)):
-                level_name = memory_levels[j]
-                # 对每个层级，遍历 D_O 中的所有维度，累乘其 temporal 和 spatial 因子
-                for dim_name in relevant_dims:
-                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                        size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+            for dim_name in relevant_dims:
+                if dim_name in layer_dims:
+                    total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
+                    coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                    size *= torch.min(total_dim_size, coverage)
             
             return size
             
@@ -1001,7 +1081,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 # 步骤3: 计算Memory_Cycles（基于双向跨层级数据流量）
                 # 分别调用填充和写回流量计算引擎
-                detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(layer['dims'], all_factors, num_pes, debug_data)
+                detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(layer['dims'], all_factors, num_pes, hw_params, debug_data)
                 detailed_writeback_traffic_info = self.calculate_inter_level_writeback_traffic(layer['dims'], all_factors, num_pes, debug_data)
                 
                 memory_cycles_list = []
