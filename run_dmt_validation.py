@@ -751,12 +751,62 @@ def generate_timeloop_files(config, work_dir):
                     factors.append(f"{dim}=1")
         return factors
     
+    # Generate spatial permutation based on OS priority and actual spatial factors
+    def generate_spatial_permutation():
+        priority = ['K', 'C', 'N', 'P', 'Q', 'S', 'R']
+        # Find dimensions with spatial factors > 1
+        active = []
+        for dim in priority:
+            if dim in dim_factors and dim_factors[dim].get('spatial', 1) > 1:
+                active.append(dim)
+        
+        # Take first two active dimensions for mesh, or fill with priority order
+        first_two = active[:2] if len(active) >= 2 else active + [d for d in priority if d not in active][:2-len(active)]
+        
+        # Add remaining dimensions in priority order
+        rest = [d for d in priority if d not in first_two]
+        spatial_perm = first_two + rest
+        
+        # Assertion: when C>1 or K>1, N should not be in first two positions
+        c_spatial = dim_factors.get('C', {}).get('spatial', 1)
+        k_spatial = dim_factors.get('K', {}).get('spatial', 1)
+        if (c_spatial > 1 or k_spatial > 1) and 'N' in spatial_perm[:2]:
+            # Swap N with the first valid spatial dimension
+            for i, dim in enumerate(spatial_perm[:2]):
+                if dim == 'N':
+                    # Find first non-N dimension with spatial factor > 1
+                    for j in range(2, len(spatial_perm)):
+                        if spatial_perm[j] in ['K', 'C'] and dim_factors.get(spatial_perm[j], {}).get('spatial', 1) > 1:
+                            spatial_perm[i], spatial_perm[j] = spatial_perm[j], spatial_perm[i]
+                            break
+        
+        return spatial_perm
+    
+    spatial_perm = generate_spatial_permutation()
+    
+    # Print factor details and spatial permutation for debugging
+    print("[DEBUG] Final dimension factors:")
+    for dim in ['N', 'C', 'K', 'P', 'Q', 'R', 'S']:
+        if dim in dim_factors:
+            factors = dim_factors[dim]
+            spatial = factors.get('spatial', 1)
+            l0 = factors.get('L0_Registers', 1)
+            l1 = factors.get('L1_Accumulator', 1)
+            l2 = factors.get('L2_Scratchpad', 1)
+            dram = factors.get('DRAM', 1)
+            product = spatial * l0 * l1 * l2 * dram
+            expected = workload_dims.get(dim, 1)
+            print(f"  {dim}: spatial={spatial}, L0={l0}, L1={l1}, L2={l2}, DRAM={dram}, product={product}, expected={expected}")
+            assert product == expected, f"Dimension {dim}: product {product} != expected {expected}"
+    
+    print(f"[DEBUG] Generated spatial permutation: {spatial_perm}")
+    
     targets = []
-    # Spatial Target
+    # Spatial Target with corrected permutation
     targets.append({
         'target': 'PE_array_container', 'type': 'spatial',
         'factors': format_factors('spatial', 'L0_Registers'),
-        'permutation': layer_mapping['L0_Registers']['permutation']
+        'permutation': ' '.join(spatial_perm)
     })
     # Temporal Targets
     for target_name in ['DRAM', 'L2_Scratchpad', 'L1_Accumulator', 'L0_Registers']:
