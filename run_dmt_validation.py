@@ -713,25 +713,28 @@ def generate_timeloop_files(config, work_dir):
             if dim in dim_factors:
                 dim_factors[dim][target_name] = int(val)
     
-    # Verify and adjust factors for each dimension
+    def fix_factorization_for_dim(dim_name, dim_size, entries):
+        """
+        entries: dict like {'spatial': s, 'L0': l0, 'L1': l1, 'L2': l2, 'DRAM': d?}
+        Ensure product(spatial, L0, L1, L2, DRAM) == dim_size.
+        """
+        s = entries.get('spatial', 1)
+        l0 = entries.get('L0_Registers', 1) or entries.get('L0', 1)
+        l1 = entries.get('L1_Accumulator', 1) or entries.get('L1', 1)
+        l2 = entries.get('L2_Scratchpad', 1) or entries.get('L2', 1)
+        known = s * l0 * l1 * l2
+        if dim_size % known != 0:
+            raise ValueError(f"[{dim_name}] illegal tiling: dim={dim_size}, known={known} (non-divisible). "
+                           f"Fix your per-level factors instead of truncating.")
+        entries['DRAM'] = dim_size // known
+        return entries
+    
+    # Verify and adjust factors for each dimension with strict divisibility
     for dim in all_dims:
         if dim in workload_dims:
             dim_size = workload_dims[dim]
-            # Calculate current product
-            product = 1
-            for level, val in dim_factors[dim].items():
-                product *= val
-            
-            # If product doesn't match, adjust DRAM factor
-            if product != dim_size and dim_size > 0:
-                # Calculate adjustment factor
-                adjustment = dim_size / product
-                # Apply adjustment to DRAM factor
-                if 'DRAM' in dim_factors[dim]:
-                    dim_factors[dim]['DRAM'] = int(dim_factors[dim]['DRAM'] * adjustment)
-                else:
-                    # If no DRAM factor, add it
-                    dim_factors[dim]['DRAM'] = int(adjustment)
+            if dim_size > 0:
+                dim_factors[dim] = fix_factorization_for_dim(dim, dim_size, dim_factors[dim])
     
     # Format factors for constraints.yaml
     def format_factors(level_type, level_name):
@@ -762,8 +765,32 @@ def generate_timeloop_files(config, work_dir):
             'factors': format_factors('temporal', target_name),
             'permutation': layer_mapping[target_name]['permutation']
         })
-    # Dataspace Target for Fusion
-    targets.append({'target': 'L2_Scratchpad', 'type': 'dataspace', 'keep': ['Outputs']})
+    # --- dataspace targets (OS semantics) ---
+    # L1: only psum
+    targets.append({
+        'target': 'L1_Accumulator',
+        'type': 'dataspace',
+        'keep':   ['Outputs'],
+        'bypass': ['Inputs', 'Weights']
+    })
+    
+    # L0: inputs/weights only, no psum if L1 handles it
+    targets.append({
+        'target': 'L0_Registers',
+        'type': 'dataspace',
+        'keep':   ['Inputs', 'Weights'],
+        'bypass': ['Outputs']
+    })
+    
+    # L2: decide your intention
+    # If you want to see W/I traffic at L2, keep them here:
+    targets.append({
+        'target': 'L2_Scratchpad',
+        'type': 'dataspace',
+        'keep': ['Inputs', 'Weights', 'Outputs']
+    })
+    # If you intentionally want W/I to stream-bypass L2, then use:
+    # targets.append({'target':'L2_Scratchpad','type':'dataspace','keep':['Outputs'], 'bypass':['Inputs','Weights']})
 
     with open(work_dir / 'constraints.yaml', 'w') as f:
         yaml.dump({'constraints': {'targets': targets}}, f, sort_keys=False)
