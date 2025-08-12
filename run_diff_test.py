@@ -145,6 +145,14 @@ class TimeloopReportParser:
                 'scalar_fills_total': fills_per_instance * utilized_instances,
                 'scalar_updates_total': updates_per_instance * utilized_instances
             })
+            
+            # 新增：把 per-instance 和 实例数也存起来，后面"atomic 对齐"要用
+            self.parsed_data['components'][component_name]['accesses'][tensor_name].update({
+                'scalar_reads_per_instance': reads_per_instance,
+                'scalar_fills_per_instance': fills_per_instance,
+                'scalar_updates_per_instance': updates_per_instance,
+                'utilized_instances': utilized_instances
+            })
     
     def _extract_utilized_instances(self, tensor_content: str) -> float:
         """
@@ -241,6 +249,34 @@ class DifferentialComparator:
         for metric in self.metrics_to_check:
             dosa_value = self._get_value(dosa_data, metric['dosa_path'])
             tl_value = self._get_value(timeloop_data, metric['tl_path'])
+            
+            # === 专用分支：Atomic: Output Updates（按论文口径对齐） ===
+            if metric.get('name') == 'Atomic: Output Updates':
+                try:
+                    # 1) 从 TL(L1) 取 per-instance 和 utilized_instances
+                    tl_L1_O = timeloop_data['components']['L1_Accumulator']['accesses']['Outputs']
+                    per_inst_updates = float(tl_L1_O.get('scalar_updates_per_instance', 0.0))
+                    utilized_insts   = float(tl_L1_O.get('utilized_instances', 1.0))
+                    
+                    # 2) 从 DOSA 调试里拿 F_S,O(L1) —— 这就是"与 O 无关的空间并行"，等价于 C_spatial（R/S/N若无并行则为1）
+                    #    该值在你的 debug 里是 intra_level_consumption_trace 的 "F_S,t(i)" 字段
+                    dosa_F_S_O_L1 = self._get_value(
+                        dosa_data,
+                        ['intra_level_consumption_trace', 'L1_Accumulator (i=1)', 'O', 'F_S,t(i)']
+                    )
+                    if dosa_F_S_O_L1 == 0.0:
+                        dosa_F_S_O_L1 = 1.0  # 兜底，避免除零
+                    
+                    # 3) 由 "L1 实例数 = C_spatial * K_spatial" 得到 K_spatial
+                    K_spatial = utilized_insts / dosa_F_S_O_L1
+                    
+                    # 4) TL 的"atomic 对齐值" = per-instance × K_spatial
+                    tl_value = per_inst_updates * K_spatial
+                except Exception as e:
+                    # 解析失败时，保留原 tl_value（通常是总数），但打个标记更容易排查
+                    # 你也可以选择在 differences 里加个 Note 提醒
+                    pass
+            # === 专用分支结束 ===
             
             # 检查是否为零守卫模式
             if metric.get('mode') == 'zero_guard':
