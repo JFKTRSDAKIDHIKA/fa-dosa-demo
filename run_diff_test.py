@@ -197,8 +197,8 @@ class DifferentialComparator:
             {
                 'name': 'Atomic: Output Updates',
                 'dosa_path': ['intra_level_consumption_trace', 'L1_Accumulator (i=1)', 'O', 'consumption_updates'],
-                'tl_path': ['components', 'L2_Scratchpad', 'accesses', 'Outputs', 'scalar_updates_total'],
-                'unit': 'accesses',
+                'tl_path':   ['components', 'L1_Accumulator', 'accesses', 'Outputs', 'scalar_updates_total'],
+                'unit': 'accesses', 
                 'tolerance': 0.05
             },
             {
