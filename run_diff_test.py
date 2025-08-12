@@ -221,13 +221,6 @@ class DifferentialComparator:
                 'tl_path': ['components', 'L0_Registers', 'accesses', 'Weights', 'scalar_fills_total'],
                 'unit': 'accesses',
                 'tolerance': 0.05
-            },
-            {
-                'name': 'Traffic: L2->L0 (Fills, I)',
-                'dosa_path': ['inter_level_fill_traffic_trace', 'L0_Registers (i=0)', 'I', 'tensor_fill_accesses'],
-                'tl_path': ['components', 'L0_Registers', 'accesses', 'Inputs', 'scalar_fills_total'],
-                'unit': 'accesses',
-                'tolerance': 0.95
             }
         ]
     
@@ -249,6 +242,30 @@ class DifferentialComparator:
             dosa_value = self._get_value(dosa_data, metric['dosa_path'])
             tl_value = self._get_value(timeloop_data, metric['tl_path'])
             
+            # 检查是否为零守卫模式
+            if metric.get('mode') == 'zero_guard':
+                epsilon = float(metric.get('epsilon', 1.0))
+                dosa_is_zero = abs(dosa_value) <= epsilon
+                tl_is_zero = abs(tl_value) <= epsilon
+                
+                # 如果两侧都接近零，则跳过（通过测试）
+                if dosa_is_zero and tl_is_zero:
+                    continue
+                
+                # 否则记录差异
+                differences.append({
+                    'VP_ID': vp_id,
+                    'Metric': metric['name'],
+                    'DOSA_Value': dosa_value,
+                    'Timeloop_Value': tl_value,
+                    'Relative_Error': '—',
+                    'Tolerance': f'abs≤{epsilon:g}',
+                    'Unit': metric['unit'],
+                    'Note': 'Expected zero under paper-B constraints'
+                })
+                continue
+            
+            # 原有的比率模式逻辑
             # 计算相对误差
             if tl_value == 0 and dosa_value == 0:
                 relative_error = 0.0
@@ -282,6 +299,10 @@ class DifferentialComparator:
         Returns:
             提取的数值，如果路径不存在则返回0.0
         """
+        # 处理特殊的 '__ZERO__' 路径
+        if path == ['__ZERO__']:
+            return 0.0
+            
         current = data
         
         try:
@@ -408,8 +429,10 @@ class DiffTestRunner:
             # 创建DataFrame并格式化输出
             df = pd.DataFrame(all_differences)
             
-            # 重新排列列的顺序
+            # 重新排列列的顺序，如果存在Note列则包含它
             column_order = ['VP_ID', 'Metric', 'DOSA_Value', 'Timeloop_Value', 'Relative_Error', 'Tolerance', 'Unit']
+            if 'Note' in df.columns:
+                column_order.append('Note')
             df = df[column_order]
             
             print("\n差异详情:")

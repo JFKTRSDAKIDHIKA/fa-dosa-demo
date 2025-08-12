@@ -824,12 +824,12 @@ def generate_timeloop_files(config, work_dir):
         'bypass': ['Inputs', 'Weights']
     })
     
-    # L0: inputs/weights only, no psum if L1 handles it
+    # L0: weights only, no psum if L1 handles it
     targets.append({
         'target': 'L0_Registers',
         'type': 'dataspace',
-        'keep':   ['Inputs', 'Weights'],
-        'bypass': ['Outputs']
+        'keep':   ['Weights'],
+        'bypass': ['Inputs','Outputs']
     })
     
     # L2: decide your intention
