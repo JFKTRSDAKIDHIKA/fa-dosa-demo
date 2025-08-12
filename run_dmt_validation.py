@@ -105,8 +105,8 @@ def generate_dynamic_mapping_space(workload_dims, producer_layer):
         if dim_name in ['N', 'K', 'C', 'P', 'Q', 'R', 'S']:
             divisors = get_divisors(dim_size).tolist()
             # Sample a few divisors for efficiency
-            if len(divisors) > 4:
-                divisors = random.sample(divisors, 4)
+            if len(divisors) > 8:
+                divisors = random.sample(divisors, 8)
             mapping_space[dim_name] = divisors
     
     return mapping_space
@@ -869,8 +869,8 @@ def generate_validation_configs(max_runs=None):
                 mapping_space = generate_dynamic_mapping_space(WORKLOAD_DIMS, producer_layer)
                 
                 # Generate a few mapping configurations
-                for k_factor in mapping_space.get("K", [1])[:2]:  # Limit to 2 for efficiency
-                    for c_factor in mapping_space.get("C", [1])[:2]:
+                for k_factor in mapping_space.get("K", [1]):
+                    for c_factor in mapping_space.get("C", [1]):
                         # Generate complete factor decomposition
                         num_pes_sqrt = int(math.sqrt(num_pes))
                         k_factors = generate_factors_by_strategy(WORKLOAD_DIMS[producer_layer]["K"], num_pes_sqrt, "performance")
