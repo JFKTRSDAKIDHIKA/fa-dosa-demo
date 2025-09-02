@@ -118,7 +118,12 @@ class InPlaceFusionDMT(BaseDMT):
             'producer_layer': producer_name,
             'consumer_layers': consumers
         }
-        
+
+        if getattr(mapping, 'partial_sum_dims', {}):
+            penalty_val = sum(mapping.partial_sum_dims.values())
+            compatibility_penalty = compatibility_penalty + torch.tensor(penalty_val, device=config.DEVICE)
+            detailed_metrics['partial_sum_dims'] = mapping.partial_sum_dims
+
         return latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
 
 
@@ -218,7 +223,7 @@ class SkipConnectionDMT(BaseDMT):
         
         # 兼容性惩罚：暂时设为0
         total_compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
-        
+
         # 构建详细指标（保持接口兼容性）
         detailed_metrics = {
             'energy_breakdown_pj': {
@@ -251,7 +256,11 @@ class SkipConnectionDMT(BaseDMT):
                 'add_operation': float(energy_add_op.item()) if hasattr(energy_add_op, 'item') else float(energy_add_op)
             }
         }
-        
+        if getattr(mapping, 'partial_sum_dims', {}):
+            penalty_val = sum(mapping.partial_sum_dims.values())
+            total_compatibility_penalty = total_compatibility_penalty + torch.tensor(penalty_val, device=config.DEVICE)
+            detailed_metrics['partial_sum_dims'] = mapping.partial_sum_dims
+
         return total_latency, total_energy, total_buffer_mismatch_loss, total_compatibility_penalty, detailed_metrics
 
 
@@ -281,22 +290,11 @@ class SequentialConvDMT(BaseDMT):
             
             # 检查是否为卷积层
             if 'conv' in producer_name.lower() or producer_layer.get('type', '').lower() == 'conv':
-                all_factors = mapping.get_all_factors()
-                
-                # 检查所有归约维度(C, R, S)在L3_DRAM上的时间分块因子
-                reduction_dims = ['C', 'R', 'S']
-                
-                for dim in reduction_dims:
-                    # 构造DRAM时间分块因子的键名
-                    dram_temporal_key = f'{dim}_L3_DRAM_temporal'
-                    
-                    if dram_temporal_key in all_factors:
-                        dram_temporal_factor = all_factors[dram_temporal_key]
-                        
-                        # 如果DRAM时间分块因子大于1，说明有部分和溢出到DRAM
-                        # 这违反了融合约束，需要施加惩罚
-                        penalty_contribution = torch.relu(dram_temporal_factor - 1.0)
-                        compatibility_penalty += penalty_contribution
+                mapping.get_all_factors()
+                if getattr(mapping, 'partial_sum_dims', {}):
+                    penalty_val = sum(mapping.partial_sum_dims.values())
+                    compatibility_penalty += torch.tensor(penalty_val, device=config.DEVICE)
+                    detailed_metrics['partial_sum_dims'] = mapping.partial_sum_dims
         
         return latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
 

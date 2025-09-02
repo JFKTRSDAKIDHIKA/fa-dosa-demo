@@ -1083,8 +1083,10 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 分别调用填充和写回流量计算引擎
                 detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(layer['dims'], all_factors, num_pes, hw_params, debug_data)
                 detailed_writeback_traffic_info = self.calculate_inter_level_writeback_traffic(layer['dims'], all_factors, num_pes, debug_data)
-                
+
                 memory_cycles_list = []
+                # Track extra traffic caused by split reduction dimensions
+                extra_partial_bytes = torch.tensor(0.0, device=self.config.DEVICE)
                 for interface, interface_info in detailed_fill_traffic_info.items():
                     upper_level_name = interface.split('_to_')[0]
                     
@@ -1111,17 +1113,17 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 处理写回流量的内存周期计算
                 for interface, interface_info in detailed_writeback_traffic_info.items():
                     lower_level_name = interface.split('_to_')[0]  # 对于写回，源层级是下层
-                    
+
                     # 从详细信息中提取总流量
                     writeback_bytes_total = interface_info['total_bytes']
-                    
+
                     # 计算该接口的带宽（bytes/cycle）- 使用源层级的带宽
                     bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(lower_level_name, num_pes, self.config)
-                    
+
                     # 计算该接口的内存周期数（基于写回流量）
                     memory_cycles = writeback_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
                     memory_cycles_list.append(memory_cycles)
-                    
+
                     # 收集写回流量的内存接口分析数据
                     if debug_data is not None:
                         debug_data["memory_interface_analysis"][interface] = {
@@ -1131,9 +1133,25 @@ class HighFidelityPerformanceModel(nn.Module):
                             "writeback_bytes_breakdown": interface_info['breakdown'],
                             "traffic_drivers": interface_info['drivers']
                         }
-                
 
-                
+                # Detect split reduction dimensions and account for extra partial sum traffic
+                reduction_split_factors = {}
+                for dim in ['C', 'R', 'S']:
+                    if dim in all_factors and 'L3_DRAM' in all_factors[dim]:
+                        dram_temp = all_factors[dim]['L3_DRAM'].get('temporal', 1)
+                        dram_temp_val = float(dram_temp.item()) if isinstance(dram_temp, torch.Tensor) else float(dram_temp)
+                        if dram_temp_val > 1.0:
+                            reduction_split_factors[dim] = dram_temp_val
+
+                if reduction_split_factors:
+                    # expose information for higher-level penalties
+                    mapping.partial_sum_dims = reduction_split_factors
+                    output_elems = reduce(mul, (layer['dims'][d] for d in ['N', 'K', 'P', 'Q']), 1)
+                    extra_partial_bytes = output_elems * sum((f - 1) for f in reduction_split_factors.values()) * self.config.BYTES_PER_ELEMENT * 2
+                    bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle('L2_Scratchpad', num_pes, self.config)
+                    extra_cycles = extra_partial_bytes / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
+                    memory_cycles_list.append(extra_cycles)
+
                 # 步骤4: 确定瓶颈并计算总延迟
                 if memory_cycles_list:
                     bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
@@ -1218,6 +1236,13 @@ class HighFidelityPerformanceModel(nn.Module):
                         epa = torch.tensor(0.0, device=self.config.DEVICE)
                     
                     energy_writeback += writeback_words * epa
+
+                # Additional write/read traffic due to split reductions
+                if extra_partial_bytes > 0:
+                    extra_words = extra_partial_bytes / self.config.BYTES_PER_ELEMENT
+                    epa_spm = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * hw_params.get_buffer_size_kb('L2_Scratchpad')
+                    epa_dram = self.config.L3_DRAM_EPA_PJ
+                    energy_writeback += extra_words * (epa_spm + epa_dram)
                 
                 # 汇总双向层间能耗
                 energy_inter_level = energy_fill + energy_writeback
