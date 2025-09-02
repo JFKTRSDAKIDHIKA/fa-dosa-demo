@@ -1019,6 +1019,8 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # Gather layer information
         layers = [graph.layers[name] for name in group_layers]
+        # Update mapping info for partial-sum detection
+        all_factors = mapping.get_all_factors()
 
         # Compute total MACs across the group
         from dosa.utils import calculate_macs
@@ -1036,8 +1038,8 @@ class HighFidelityPerformanceModel(nn.Module):
         # Determine if weights can stay resident in L2
         l2_bytes = hw_params.get_buffer_size_kb('L2_Scratchpad') * 1024
         if total_weight_bytes > l2_bytes:
-            # If not, approximate by loading weights per layer
-            weight_bytes_to_load = total_weight_bytes
+            reload_factor = torch.ceil(total_weight_bytes / l2_bytes)
+            weight_bytes_to_load = total_weight_bytes * reload_factor
         else:
             weight_bytes_to_load = total_weight_bytes
 
@@ -1054,8 +1056,16 @@ class HighFidelityPerformanceModel(nn.Module):
         input_bytes = input_elems * self.config.BYTES_PER_ELEMENT
         output_bytes = output_elems * self.config.BYTES_PER_ELEMENT
 
-        # Total DRAM traffic (weights + first input + last output)
-        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes
+        # Handle extra traffic if partial sums exist
+        extra_output_bytes = torch.tensor(0.0, device=self.config.DEVICE)
+        partial_penalty = torch.tensor(0.0, device=self.config.DEVICE)
+        if mapping.has_partial_sums():
+            for tiles in mapping.get_partial_sum_tiles().values():
+                extra_output_bytes += output_bytes * (tiles - 1) * 2
+                partial_penalty += tiles - 1
+
+        # Total DRAM traffic (weights + first input + final output + partial-sum overhead)
+        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes + extra_output_bytes
 
         num_pes = hw_params.get_projected_num_pes()
 
@@ -1077,7 +1087,7 @@ class HighFidelityPerformanceModel(nn.Module):
         area_cost = hw_params.get_area_cost()
 
         zero = torch.tensor(0.0, device=self.config.DEVICE)
-        return latency.squeeze(), energy.squeeze(), area_cost, zero, zero
+        return latency.squeeze(), energy.squeeze(), area_cost, zero, partial_penalty
 
     def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None, debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """

@@ -85,6 +85,9 @@ class InPlaceFusionDMT(BaseDMT):
             direct_mapping_table=direct_mapping_table,
         )
 
+        if hasattr(mapping, 'has_partial_sums') and mapping.has_partial_sums():
+            compatibility_penalty += torch.tensor(1.0, device=config.DEVICE)
+
         # 构建详细指标（保持接口兼容性）
         detailed_metrics = {
             'energy_breakdown_pj': {
@@ -206,6 +209,8 @@ class SkipConnectionDMT(BaseDMT):
         
         # 兼容性惩罚：暂时设为0
         total_compatibility_penalty = torch.tensor(0.0, device=config.DEVICE)
+        if hasattr(mapping, 'has_partial_sums') and mapping.has_partial_sums():
+            total_compatibility_penalty += torch.tensor(1.0, device=config.DEVICE)
         
         # 构建详细指标（保持接口兼容性）
         detailed_metrics = {

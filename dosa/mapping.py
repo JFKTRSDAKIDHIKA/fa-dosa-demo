@@ -163,6 +163,9 @@ class FineGrainedMapping(nn.Module):
                     'spatial': nn.Parameter(torch.tensor(0.0))   # log(1) = 0, 标量
                 })
 
+        # Flag storage for partial-sum detection
+        self.partial_sum_violations = {}
+
     def get_factor(self, level_name, dim_name, factor_type):
         """获取指定level, dim, type的tiling因子。"""
         return torch.clamp(torch.exp(self.factors[level_name][dim_name][factor_type]), min=1.0)
@@ -178,6 +181,12 @@ class FineGrainedMapping(nn.Module):
         """
         projected_factors = {}
         on_chip_levels = [level['name'] for level in self.hierarchy if level['type'] == 'buffer']
+
+        # Reset violation tracking
+        self.partial_sum_violations = {}
+        reduction_dims = {'C', 'R', 'S'}
+        dram_level = next((level for level in self.hierarchy if level['type'] == 'dram'), None)
+        dram_level_name = dram_level['name'] if dram_level else None
 
         for dim_name, total_size in self.dims.items():
             projected_factors[dim_name] = {}
@@ -200,16 +209,33 @@ class FineGrainedMapping(nn.Module):
                 product_of_on_chip_factors *= projected_temporal * projected_spatial
 
             # Handle DRAM level factors
-            dram_level = next((level for level in self.hierarchy if level['type'] == 'dram'), None)
-            if dram_level:
-                dram_level_name = dram_level['name']
+            if dram_level_name:
                 # The temporal factor at DRAM is what's left over from the on-chip factors
                 dram_temporal_factor = total_size / product_of_on_chip_factors
-                projected_dram_temporal = ProjectToNearestDivisor.apply(dram_temporal_factor, torch.tensor(float(total_size)))
+                projected_dram_temporal = ProjectToNearestDivisor.apply(
+                    dram_temporal_factor, torch.tensor(float(total_size))
+                )
 
                 projected_factors[dim_name][dram_level_name] = {
                     'temporal': projected_dram_temporal,
-                    'spatial': torch.tensor(1.0) # No spatial tiling in DRAM
+                    'spatial': torch.tensor(1.0)  # No spatial tiling in DRAM
                 }
 
+                if dim_name in reduction_dims:
+                    self.partial_sum_violations[dim_name] = projected_dram_temporal > 1
+        # Convenience flags for external modules
+        self.has_partial_sum = any(self.partial_sum_violations.values())
+        self.partial_sum_tiles = {
+            dim: projected_factors[dim][dram_level_name]['temporal']
+            for dim, violated in self.partial_sum_violations.items() if violated
+        }
+
         return projected_factors
+
+    def has_partial_sums(self) -> bool:
+        """Return True if any reduction dimension is temporally tiled."""
+        return getattr(self, 'has_partial_sum', False)
+
+    def get_partial_sum_tiles(self) -> Dict[str, torch.Tensor]:
+        """Return the number of tiles for each violating reduction dimension."""
+        return getattr(self, 'partial_sum_tiles', {})
