@@ -1048,6 +1048,11 @@ class HighFidelityPerformanceModel(nn.Module):
         # Update mapping info for partial-sum detection
         all_factors = mapping.get_all_factors()
 
+        # === 二道闸：禁止 partial sum ===
+        if hasattr(mapping, 'has_partial_sums') and mapping.has_partial_sums():
+            big = torch.tensor(1e6, device=self.config.DEVICE)
+            return big, big, big, big, big
+
         # Compute total MACs across the group
         from dosa.utils import calculate_macs
         total_macs = torch.tensor(0.0, device=self.config.DEVICE)

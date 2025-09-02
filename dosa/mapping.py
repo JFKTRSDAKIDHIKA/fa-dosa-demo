@@ -165,6 +165,8 @@ class FineGrainedMapping(nn.Module):
 
         # Flag storage for partial-sum detection
         self.partial_sum_violations = {}
+        # Enforce no partial sum across DRAM (default off)
+        self.enforce_no_partial_sum = False
 
     def get_factor(self, level_name, dim_name, factor_type):
         """获取指定level, dim, type的tiling因子。"""
@@ -230,6 +232,20 @@ class FineGrainedMapping(nn.Module):
             for dim, violated in self.partial_sum_violations.items() if violated
         }
 
+        # === Final-Sum-Per-Tile Hard Constraint ===
+        if getattr(self, 'enforce_no_partial_sum', False):
+            reduction_dims = {'C', 'R', 'S'}
+            on_chip_buf_levels = [lv['name'] for lv in self.hierarchy if lv['type'] == 'buffer']
+            dram = next((lv for lv in self.hierarchy if lv['type'] == 'dram'), None)
+            dram_name = dram['name'] if dram else None
+            for dim, total in self.dims.items():
+                if dim in reduction_dims:
+                    self._rebalance_reduction_dim(dim, int(total), projected_factors, on_chip_buf_levels, dram_name)
+            # refresh flags after elimination
+            self.partial_sum_violations = {}
+            self.has_partial_sum = False
+            self.partial_sum_tiles = {}
+
         return projected_factors
 
     def has_partial_sums(self) -> bool:
@@ -239,3 +255,32 @@ class FineGrainedMapping(nn.Module):
     def get_partial_sum_tiles(self) -> Dict[str, torch.Tensor]:
         """Return the number of tiles for each violating reduction dimension."""
         return getattr(self, 'partial_sum_tiles', {})
+
+    def set_enforce_no_partial_sum(self, enabled: bool = True):
+        """Enable or disable hard constraint to disallow partial sums in DRAM."""
+        self.enforce_no_partial_sum = bool(enabled)
+
+    def _param_device(self):
+        """Safely obtain a device from registered parameters."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device('cpu')
+
+    def _rebalance_reduction_dim(self, dim_name, total_size, projected_factors, on_chip_levels, dram_level_name):
+        """Rebalance reduction dimension so that DRAM.temporal == 1."""
+        dev = self._param_device()
+        total = torch.tensor(float(total_size), device=dev)
+        onchip = torch.tensor(1.0, device=dev)
+        for lvl in on_chip_levels:
+            tf = projected_factors[dim_name][lvl]['temporal']
+            sf = projected_factors[dim_name][lvl]['spatial']
+            onchip = onchip * tf * sf
+        need = torch.ceil(torch.clamp(total / torch.clamp(onchip, min=1.0), min=1.0))
+        if need.item() > 1.0:
+            innermost = on_chip_levels[0]
+            extra = ProjectToNearestDivisor.apply(need.to(dev), torch.tensor(float(total_size), device=dev))
+            projected_factors[dim_name][innermost]['temporal'] = projected_factors[dim_name][innermost]['temporal'] * extra
+        if dram_level_name:
+            projected_factors[dim_name][dram_level_name]['temporal'] = torch.tensor(1.0, device=dev)
+            projected_factors[dim_name][dram_level_name]['spatial'] = torch.tensor(1.0, device=dev)
