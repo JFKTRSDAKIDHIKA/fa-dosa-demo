@@ -22,7 +22,7 @@ class BaseSearcher(ABC):
             fusion_params: FusionParameters实例
             perf_model: HighFidelityPerformanceModel实例
             config: 配置对象
-            logger: OptimizationLogger实例
+            logger: StructuredLogger实例
         """
         self.graph = graph
         self.hw_params = hw_params
@@ -30,7 +30,7 @@ class BaseSearcher(ABC):
         self.fusion_params = fusion_params
         self.perf_model = perf_model
         self.config = config
-        self.logger = logger or OptimizationLogger()
+        self.logger = logger
         
         # 创建搜索空间实例
         self.space = SearchSpace(graph)
@@ -261,9 +261,15 @@ class BaseSearcher(ABC):
             self.best_params = params.copy()
             self.best_metrics = metrics.copy()
             
-            print(f"Trial {trial}: New best found! Loss={loss:.4f}, EDP={metrics['edp']:.2e}")
+            
+            
+            # 使用StructuredLogger记录新的最佳结果事件
+            if self.logger:
+                self.logger.event("new_best", step=trial, metrics={"loss": loss, **metrics})
     
-    def log_trial(self, trial: int, loss: float, metrics: Dict[str, float], params: Dict[str, Any]):
+    from typing import Optional
+
+    def log_trial(self, trial: int, loss: float, metrics: Dict[str, float], params: Dict[str, Any], is_best: Optional[bool] = None):
         """
         记录试验结果
         
@@ -272,29 +278,30 @@ class BaseSearcher(ABC):
             loss: 损失值
             metrics: 性能指标
             params: 参数字典
+            is_best: 是否为最佳结果
         """
-        log_data = {
-            'searcher_type': self.__class__.__name__,
-            'trial_number': trial,
-            'loss_total': loss,
-            'current_edp': metrics['edp'],
-            'best_edp_so_far': self.best_metrics['edp'] if self.best_metrics else metrics['edp'],
-            'performance_metrics': {
-                'latency_sec': metrics['latency_sec'],
-                'energy_pj': metrics['energy_pj'],
-                'area_mm2': metrics['area_mm2'],
-                'log_edp': metrics['log_edp']
-            },
-            'hardware_params': {
-                'num_pes': params.get('num_pes', 0),
-                'l0_size_kb': params.get('l0_registers_size_kb', 0),
-                'l1_size_kb': params.get('l1_accumulator_size_kb', 0),
-                'l2_size_kb': params.get('l2_scratchpad_size_kb', 0)
-            },
-            'fusion_decisions': self.fusion_params.get_fusion_decisions_serializable(self.graph)
-        }
-        
-        self.logger.log_step(log_data)
+        if self.logger:
+             trial_data = {
+                 'searcher_type': self.__class__.__name__,
+                 'loss': loss,
+                 'metrics': {
+                    'loss': loss,
+                    'edp': metrics['edp'],
+                    'latency_sec': metrics['latency_sec'],
+                    'energy_pj': metrics['energy_pj'],
+                    'area_mm2': metrics['area_mm2']
+                },
+                 'hardware_params': {
+                     'num_pes': params.get('num_pes', 0),
+                     'l0_size_kb': params.get('l0_registers_size_kb', 0),
+                     'l1_size_kb': params.get('l1_accumulator_size_kb', 0),
+                     'l2_size_kb': params.get('l2_scratchpad_size_kb', 0)
+                 },
+                 'fusion_decisions': self.fusion_params.get_fusion_decisions_serializable(self.graph),
+                 'best_so_far': is_best if is_best is not None else (loss <= self.best_loss)
+             }
+             
+             self.logger.trial(trial, trial_data)
 
 
 def get_random_valid_divisor(dim_size: int) -> int:
@@ -339,7 +346,9 @@ class FADOSASearcher(BaseSearcher):
         import os
         from .utils import save_configuration_to_json
         
-        print(f"Starting FA-DOSA search with {self.num_outer_steps} outer steps...")
+        if self.logger:
+            self.logger.event("search_start", searcher_type="FA-DOSA", outer_steps=self.num_outer_steps)
+            self.logger.console(f"Starting FA-DOSA search with {self.num_outer_steps} outer steps...")
         
         # 确保output目录存在
         os.makedirs('output', exist_ok=True)
@@ -348,10 +357,14 @@ class FADOSASearcher(BaseSearcher):
         
         # 交替优化循环
         for outer_step in range(self.num_outer_steps):
-            print(f"\n--- Outer Step {outer_step + 1}/{self.num_outer_steps} ---")
+            if self.logger:
+                self.logger.event("outer_step_start", index=outer_step + 1, total=self.num_outer_steps)
+                
             
             # Phase A: 优化映射和融合参数（冻结硬件参数）
-            print("--- Phase A: Optimizing Mapping & Fusion ---")
+            if self.logger:
+                self.logger.event("phase_start", phase="mapping_fusion")
+                # Removed duplicate phase console
             
             # 冻结硬件参数
             for p in self.hw_params.parameters():
@@ -408,11 +421,12 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 记录日志
                 if i % 10 == 0:
-                    print(f"[Map] Iter {i}: Loss={loss.item():.4f}, EDP={metrics['edp']:.2e}, Area={metrics['area_mm2']:.2f}mm²")
                     self.log_trial(trial_count, loss.item(), metrics, current_params)
             
             # Phase B: 优化硬件参数（冻结映射和融合参数）
-            print("--- Phase B: Optimizing Hardware ---")
+            if self.logger:
+                self.logger.event("phase_start", phase="hardware")
+                # Removed duplicate phase console
             
             # 冻结映射和融合参数
             for p in list(self.mapping.parameters()) + list(self.fusion_params.parameters()):
@@ -463,7 +477,6 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 记录日志
                 if i % 10 == 0:
-                    print(f"[HW] Iter {i}: Loss={loss.item():.4f}, EDP={metrics['edp']:.2e}, Area={metrics['area_mm2']:.2f}mm²")
                     self.log_trial(trial_count, loss.item(), metrics, current_params)
         
         return {
@@ -501,7 +514,8 @@ class FADOSASearcher(BaseSearcher):
                 file_path=file_path
             )
             
-            print(f"[{trigger_type}] Saved validation config: {file_path}")
+            if self.logger:
+                self.logger.event("validation_config_saved", trigger=trigger_type, file_path=file_path)
             
         except Exception as e:
             print(f"Warning: Failed to save validation config at trial {trial_count}: {e}")

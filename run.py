@@ -21,6 +21,7 @@ from dosa.utils import (
     calculate_macs, save_configuration_to_json, get_divisors,
     OptimizationLogger
 )
+from dosa.structured_logger import StructuredLogger
 
 def parse_onnx_to_graph(model_name: str) -> ComputationGraph:
     """
@@ -38,7 +39,7 @@ def parse_onnx_to_graph(model_name: str) -> ComputationGraph:
     try:
         # Load ONNX model
         if not os.path.exists(onnx_path):
-            print(f"Warning: ONNX file {onnx_path} not found. Using fallback graph.")
+            # 使用fallback graph，警告将通过logger输出
             return _create_fallback_graph()
         
         model = onnx.load(onnx_path)
@@ -312,23 +313,38 @@ def run_experiment(
     Returns:
         搜索结果字典
     """
-    print(f"--- Running DSE Experiment: {searcher_type.upper()} on {model_name} ---")
-    
     # 初始化核心组件
     config = Config()
+    
+    # 创建结构化日志器
+    logger = StructuredLogger(
+        log_dir=config.LOG_DIR,
+        minimal_console=config.MINIMAL_CONSOLE,
+        log_intermediate=config.LOG_INTERMEDIATE
+    )
+    
+    # 记录实验开始
+    logger.event("experiment_start", 
+                model_name=model_name, 
+                searcher_type=searcher_type, 
+                num_trials=num_trials,
+                **kwargs)
+    logger.console(f"--- Running DSE Experiment: {searcher_type.upper()} on {model_name} ---")
+    
     graph = parse_onnx_to_graph(model_name)
     hw_params = HardwareParameters()
     mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY)
     fusion_params = FusionParameters(graph)
     perf_model = HighFidelityPerformanceModel(config)
     
-    # 确保output目录存在
-    import os
-    os.makedirs('output', exist_ok=True)
+    # 记录ONNX解析结果
+    if not os.path.exists(f"onnx_models/{model_name}.onnx"):
+        logger.event("onnx_fallback", model_name=model_name, 
+                    message=f"ONNX file not found, using fallback graph")
     
-    # 创建日志器
-    log_filename = f"output/optimization_log_{searcher_type.replace('-', '_')}.jsonl"
-    logger = OptimizationLogger(log_filename)
+    logger.event("components_initialized", 
+                graph_layers=len(graph.layers),
+                fusion_groups=len(graph.fusion_groups))
     
     # 根据searcher_type实例化对应的搜索器
     searcher = create_searcher(
@@ -341,23 +357,26 @@ def run_experiment(
     results = searcher.search(num_trials)
     end_time = time.time()
     
-    # 输出结果
-    print(f"\n--- Search Completed in {end_time - start_time:.2f}s ---")
-    print(f"Best Loss: {results['best_loss']:.4f}")
+    # 记录搜索完成
+    duration = end_time - start_time
+    logger.event("search_completed", duration=duration)
     
-    # 安全地访问best_metrics
+    # 输出结果摘要
     best_metrics = results.get('best_metrics', {})
-    if best_metrics and 'edp' in best_metrics:
-        print(f"Best EDP: {best_metrics['edp']:.2e}")
-        print(f"Best Area: {best_metrics['area_mm2']:.2f}mm²")
+    if results['best_loss'] != float('inf') and best_metrics:
+        logger.console(f"\n--- Search Completed in {duration:.2f}s ---")
+        logger.console(f"Best Loss: {results['best_loss']:.4f}")
+        logger.console(f"Best EDP: {best_metrics.get('edp', 0):.2e}")
+        logger.console(f"Best Area: {best_metrics.get('area_mm2', 0):.2f}mm²")
     else:
-        print("No valid solutions found.")
+        logger.console(f"\n--- Search Completed in {duration:.2f}s ---")
+        logger.console("No valid solutions found.")
     
-    print(f"Total Trials: {results['total_trials']}")
+    logger.console(f"Total Trials: {results['total_trials']}")
     
     # 保存最终配置（仅当找到有效解时）
     if results['best_params'] is not None:
-        final_config_filename = f"output/final_configuration_{searcher_type.replace('-', '_')}.json"
+        final_config_filename = logger.get_run_dir() / f"final_configuration_{searcher_type.replace('-', '_')}.json"
         
         # 重构映射参数
         best_mapping = {}
@@ -408,14 +427,19 @@ def run_experiment(
                     hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_params'][key])))
         
         save_configuration_to_json(
-            hw_params, best_mapping, best_fusion_decisions, final_config_filename
+            hw_params, best_mapping, best_fusion_decisions, str(final_config_filename)
         )
-        print(f"Configuration saved to {final_config_filename}")
+        logger.artifact(str(final_config_filename), {
+            "type": "final_configuration",
+            "searcher_type": searcher_type,
+            "model_name": model_name
+        })
+        logger.console(f"Configuration saved to {final_config_filename}")
     else:
-        print("No valid configuration to save.")
+        logger.console("No valid configuration to save.")
     
-    # 关闭日志器
-    logger.close()
+    # 完成日志记录
+    logger.finalize(results)
     
     return results
 
@@ -538,7 +562,9 @@ def run_comparison_experiment(
 
 if __name__ == "__main__":
     # 示例1: 运行单个搜索器实验
-    print("=== Single Searcher Experiment ===")
+    print("\n" + "="*60)
+    print("SINGLE SEARCHER EXPERIMENT")
+    print("="*60)
     
     # FA-DOSA实验 - 轻量级测试配置
     fa_dosa_results = run_experiment(
@@ -586,4 +612,6 @@ if __name__ == "__main__":
     # run_experiment(model_name="bert_base", searcher_type="fa-dosa", num_trials=200)
     # run_experiment(model_name="unet", searcher_type="random_search", num_trials=300)
     
-    print("\n=== All Experiments Completed ===")
+    print("\n" + "="*60)
+    print("ALL EXPERIMENTS COMPLETED")
+    print("="*60)

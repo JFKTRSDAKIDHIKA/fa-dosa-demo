@@ -4,6 +4,20 @@ from typing import Tuple
 from functools import reduce
 from operator import mul
 
+# --- Patch safe_tensor to suppress copy-construct warnings ---
+if not hasattr(torch, "_original_tensor"):
+    torch._original_tensor = torch.tensor  # type: ignore[attr-defined]
+    
+    def _safe_tensor(data, *args, **kwargs):
+        """Replacement for torch.tensor that avoids copying when the input is already a Tensor."""
+        if isinstance(data, torch.Tensor):
+            device = kwargs.get("device")
+            return data.to(device) if device is not None and data.device != device else data
+        return torch._original_tensor(data, *args, **kwargs)  # type: ignore[attr-defined]
+
+    torch.tensor = _safe_tensor  # type: ignore[assignment]
+# --- End patch ---
+
 from dosa.config import Config
 from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping

@@ -132,6 +132,13 @@ class Config:
                 'Output': 'L2_Scratchpad'
             }
         }
+        
+        # ========== 日志与可观测性配置 ==========
+        self.MINIMAL_CONSOLE = True          # 控制台仅输出最少必要信息
+        self.LOG_INTERMEDIATE = True         # 记录中间过程到文件
+        self.LOG_DIR = "output"              # 日志输出目录
+        self.LOG_TRIAL_INTERVAL = 50         # 控制台输出试验结果的间隔
+        self.LOG_VALIDATION_INTERVAL = 50    # 保存验证配置的间隔
     
     @classmethod
     def get_instance(cls):
