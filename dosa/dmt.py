@@ -67,6 +67,29 @@ class InPlaceFusionDMT(BaseDMT):
         self.debug_latency = debug_latency
         self.debug_output_path = debug_output_path
 
+    # === 放到 InPlaceFusionDMT 类内（建议在 __init__ 下方） ===
+    def _can_persist_group_W(self, group: list, graph, hw_params, config, level_name: str = 'L2_Scratchpad') -> bool:
+        """
+        组级权重常驻可行性：把融合链中所有卷积层的 W 一起塞进指定片上层（默认 L2）。
+        条件：Σ |W_layer| <= capacity(level_name)
+        """
+        total_W_words = torch.tensor(0.0, device=config.DEVICE)
+
+        for layer_name in group:
+            layer = graph.layers[layer_name]
+            dims = layer.get('dims', {})
+            # 仅以 Conv 为主：K, C, R, S 全在时认为有卷积权重
+            if all(k in dims for k in ('K', 'C', 'R', 'S')):
+                w_size = 1
+                for k in ('K', 'C', 'R', 'S'):
+                    w_size *= int(dims[k])
+                total_W_words += torch.tensor(float(w_size), device=config.DEVICE)
+
+            # 如需兼容其他带权重的层（如 MatMul: M×K, K×N），可在此扩展
+
+        capacity_words = (hw_params.get_buffer_size_kb(level_name) * 1024) / config.BYTES_PER_ELEMENT
+        return total_W_words.item() <= capacity_words
+
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
                 mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
@@ -77,6 +100,19 @@ class InPlaceFusionDMT(BaseDMT):
         # 步骤2: 调用核心性能模型的深度优先评估方法
         from dosa.performance_model import HighFidelityPerformanceModel
         perf_model = HighFidelityPerformanceModel(config, debug_latency=self.debug_latency)
+
+        # === 组级“全权重常驻”容量检查 ===
+        try:
+            can_persist_all_W = self._can_persist_group_W(group, graph, hw_params, config, level_name='L2_Scratchpad')
+        except Exception:
+            # 如果图结构不完整也不要阻塞主流程，默认关闭
+            can_persist_all_W = False
+
+        # === 若可驻留，则通知性能模型启用“只记第一次填充”的模式 ===
+        if can_persist_all_W:
+            perf_model.set_group_weight_residency(True, residency_level='L2_Scratchpad')
+
+
         latency, energy, area, buffer_mismatch_loss, compatibility_penalty = perf_model.evaluate_group_depth_first(
             group_layers=group,
             graph=graph,

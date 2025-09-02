@@ -104,6 +104,20 @@ class HighFidelityPerformanceModel(nn.Module):
             ('ReLU', 'Add'): SkipConnectionDMT(),
             # Add more patterns as needed
         }
+        self._group_w_persist_enabled = False
+        self._group_w_residency_level = 'L2_Scratchpad'
+        self._group_w_first_load_done = False
+
+        # === 2) 在类内新增一个方法（放在类中任意位置即可） ===
+    def set_group_weight_residency(self, enabled: bool, residency_level: str = 'L2_Scratchpad'):
+        """
+        启用/关闭“融合组全权重常驻”模式。
+        若 enabled=True，则本 perf_model 实例生命周期内仅第一次对指定 residency_level 的权重填充计入流量，
+        后续层的权重填充记为 0（视作已驻留）。
+        """
+        self._group_w_persist_enabled = bool(enabled)
+        self._group_w_residency_level = residency_level
+        self._group_w_first_load_done = False
 
     def calculate_intra_level_accesses(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor) -> dict:
         """
@@ -197,6 +211,18 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 映射张量类型到DATA_SUPPLY_MAP中使用的名称
                 tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
                 tensor_name = tensor_name_map[tensor_type]
+
+                # === GROUP RESIDENCY OVERRIDE: 全链权重常驻（只记一次填充） ===
+                if self._group_w_persist_enabled and tensor_type == 'W':
+                    # 仅对“驻留层”的权重填充做“只记一次”的处理
+                    if destination_level_name == self._group_w_residency_level:
+                        if self._group_w_first_load_done:
+                            # 后续层的权重填充记 0——视作已驻留
+                            tensor_fill_bytes = torch.tensor(0.0, device=self.config.DEVICE)
+                            tensor_fill_accesses = torch.tensor(0.0, device=self.config.DEVICE)
+                        else:
+                            # 第一次遇到权重填充：正常计入，并标记完成
+                            self._group_w_first_load_done = True
                 
                 # 查询供给来源：使用DATA_SUPPLY_MAP查询源层级
                 if (destination_level_name not in self.config.DATA_SUPPLY_MAP or 
