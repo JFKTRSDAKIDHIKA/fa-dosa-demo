@@ -142,6 +142,10 @@ class FineGrainedMapping(nn.Module):
         super().__init__()
         self.dims = problem_dims
         self.hierarchy = hierarchy
+        # Reduction dimensions require full coverage to avoid partial sums
+        self.reduction_dims = ['C', 'R', 'S']
+        # Track any reduction dimensions that overflow tiles
+        self.partial_sum_dims = {}
         
         # Initialize the Gumbel-Softmax divisor projector
         self.projector = GumbelSoftmaxDivisor(sharpness_alpha=1.0, initial_tau=1.0, tau_decay_rate=0.999)
@@ -178,6 +182,8 @@ class FineGrainedMapping(nn.Module):
         """
         projected_factors = {}
         on_chip_levels = [level['name'] for level in self.hierarchy if level['type'] == 'buffer']
+        # reset overflow tracking
+        self.partial_sum_dims = {}
 
         for dim_name, total_size in self.dims.items():
             projected_factors[dim_name] = {}
@@ -205,11 +211,16 @@ class FineGrainedMapping(nn.Module):
                 dram_level_name = dram_level['name']
                 # The temporal factor at DRAM is what's left over from the on-chip factors
                 dram_temporal_factor = total_size / product_of_on_chip_factors
-                projected_dram_temporal = ProjectToNearestDivisor.apply(dram_temporal_factor, torch.tensor(float(total_size)))
+                if dim_name in self.reduction_dims and dram_temporal_factor > 1.0:
+                    # Record split reduction dimensions for penalty handling
+                    self.partial_sum_dims[dim_name] = float(dram_temporal_factor)
+                projected_dram_temporal = ProjectToNearestDivisor.apply(
+                    dram_temporal_factor, torch.tensor(float(total_size))
+                )
 
                 projected_factors[dim_name][dram_level_name] = {
                     'temporal': projected_dram_temporal,
-                    'spatial': torch.tensor(1.0) # No spatial tiling in DRAM
+                    'spatial': torch.tensor(1.0)  # No spatial tiling in DRAM
                 }
 
         return projected_factors
