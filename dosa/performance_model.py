@@ -998,6 +998,87 @@ class HighFidelityPerformanceModel(nn.Module):
             return accesses, detailed_info
         return accesses
 
+    def evaluate_group_depth_first(self, group_layers: list, graph, hw_params: HardwareParameters,
+                                   mapping: FineGrainedMapping, direct_mapping_table: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate a fusion group using depth-first scheduling and weight residency.
+
+        This simplified model assumes:
+        * All intermediate activations stay on-chip (depth-first execution).
+        * Weights for all layers are loaded once if they fit in L2.
+
+        Args:
+            group_layers: List of layer names in the fusion group.
+            graph: Computation graph providing layer metadata.
+            hw_params: Hardware parameters instance.
+            mapping: Mapping parameters (unused in simplified model).
+            direct_mapping_table: Optional mapping table (unused).
+
+        Returns:
+            Tuple of (latency, energy, area_cost, buffer_mismatch_loss, compatibility_penalty).
+        """
+
+        # Gather layer information
+        layers = [graph.layers[name] for name in group_layers]
+
+        # Compute total MACs across the group
+        from dosa.utils import calculate_macs
+        total_macs = torch.tensor(0.0, device=self.config.DEVICE)
+        total_weight_bytes = torch.tensor(0.0, device=self.config.DEVICE)
+
+        for layer in layers:
+            total_macs += calculate_macs(layer['dims'])
+            # weight size
+            weight_elems = torch.tensor(1.0, device=self.config.DEVICE)
+            for d in D_W:
+                weight_elems *= torch.tensor(layer['dims'].get(d, 1), device=self.config.DEVICE)
+            total_weight_bytes += weight_elems * self.config.BYTES_PER_ELEMENT
+
+        # Determine if weights can stay resident in L2
+        l2_bytes = hw_params.get_buffer_size_kb('L2_Scratchpad') * 1024
+        if total_weight_bytes > l2_bytes:
+            # If not, approximate by loading weights per layer
+            weight_bytes_to_load = total_weight_bytes
+        else:
+            weight_bytes_to_load = total_weight_bytes
+
+        # First input and final output bytes
+        first_layer = layers[0]
+        last_layer = layers[-1]
+        input_elems = torch.tensor(1.0, device=self.config.DEVICE)
+        for d in D_I:
+            input_elems *= torch.tensor(first_layer['dims'].get(d, 1), device=self.config.DEVICE)
+        output_elems = torch.tensor(1.0, device=self.config.DEVICE)
+        for d in D_O:
+            output_elems *= torch.tensor(last_layer['dims'].get(d, 1), device=self.config.DEVICE)
+
+        input_bytes = input_elems * self.config.BYTES_PER_ELEMENT
+        output_bytes = output_elems * self.config.BYTES_PER_ELEMENT
+
+        # Total DRAM traffic (weights + first input + last output)
+        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes
+
+        num_pes = hw_params.get_projected_num_pes()
+
+        # Compute cycles
+        compute_cycles = total_macs / torch.clamp(num_pes, min=torch.tensor(1.0, device=self.config.DEVICE))
+
+        # Memory cycles based on DRAM bandwidth
+        bandwidth = calculate_bandwidth_bytes_per_cycle('L3_DRAM', num_pes, self.config)
+        memory_cycles = dram_bytes / torch.clamp(bandwidth, min=torch.tensor(1e-9, device=self.config.DEVICE))
+
+        total_cycles = torch.max(compute_cycles, memory_cycles)
+        latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
+
+        # Energy estimation (compute + DRAM)
+        compute_energy = total_macs * self.config.PE_MAC_EPA_PJ
+        dram_energy = (dram_bytes / self.config.BYTES_PER_ELEMENT) * self.config.L2_SPM_BASE_EPA_PJ
+        energy = compute_energy + dram_energy
+
+        area_cost = hw_params.get_area_cost()
+
+        zero = torch.tensor(0.0, device=self.config.DEVICE)
+        return latency.squeeze(), energy.squeeze(), area_cost, zero, zero
+
     def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None, debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         高保真度性能模型的前向传播方法 - 实现完整的PPA计算逻辑。

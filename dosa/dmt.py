@@ -70,33 +70,21 @@ class InPlaceFusionDMT(BaseDMT):
     def forward(self, group: list, graph: ComputationGraph, hw_params: HardwareParameters, 
                 mapping: FineGrainedMapping, config: Config, direct_mapping_table: dict = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         
-        # 步骤1: 解析输入 - 识别生产者层（决定性能的关键层）
-        producer_name = group[0]  # 对于Conv->ReLU，Conv是生产者
-        consumers = group[1:]     # ReLU等消费者层
-        
-        # 步骤2: 准备输入 - 创建只包含生产者层的伪图
-        # 核心洞察：原位融合的性能完全由生产者层决定
-        pseudo_graph = type('PseudoGraph', (), {
-            'layers': {producer_name: graph.layers[producer_name]},
-            'fusion_groups': [[producer_name]]  # 单层融合组
-        })()
-        
-        # 步骤3: 调用核心引擎 - 实例化并调用HighFidelityPerformanceModel
+        # 步骤1: 解析输入 - 识别生产者和消费者层
+        producer_name = group[0]
+        consumers = group[1:]
+
+        # 步骤2: 调用核心性能模型的深度优先评估方法
         from dosa.performance_model import HighFidelityPerformanceModel
         perf_model = HighFidelityPerformanceModel(config, debug_latency=self.debug_latency)
-        
-        # 调用核心引擎的forward方法进行统一PPA计算
-        latency, energy, area, buffer_mismatch_loss, compatibility_penalty = perf_model.forward(
-            graph=pseudo_graph,
+        latency, energy, area, buffer_mismatch_loss, compatibility_penalty = perf_model.evaluate_group_depth_first(
+            group_layers=group,
+            graph=graph,
             hw_params=hw_params,
             mapping=mapping,
             direct_mapping_table=direct_mapping_table,
-            debug_output_path=self.debug_output_path
         )
-        
-        # 步骤4: 返回结果 - 直接返回核心引擎的计算结果
-        # 对于原位融合，不需要额外的组合逻辑
-        
+
         # 构建详细指标（保持接口兼容性）
         detailed_metrics = {
             'energy_breakdown_pj': {
@@ -112,13 +100,13 @@ class InPlaceFusionDMT(BaseDMT):
             },
             'access_counts': {
                 'intra_level': {},
-                'inter_level': {}
+                'inter_level': {},
             },
             'fusion_type': 'in_place',
             'producer_layer': producer_name,
             'consumer_layers': consumers
         }
-        
+
         return latency, energy, buffer_mismatch_loss, compatibility_penalty, detailed_metrics
 
 
