@@ -2,6 +2,8 @@ import os
 import time
 import math
 import numpy as np
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -561,6 +563,21 @@ def run_comparison_experiment(
     return all_results
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="FA-DOSA runner with optional Act I experiment")
+    parser.add_argument("--exp", default="legacy", choices=["legacy", "act1"], help="Experiment to run")
+    parser.add_argument("--config", default=str(Path("configs/act1.yaml").resolve()), help="Config file for act1 experiment")
+    args, unknown = parser.parse_known_args()
+
+    if args.exp == "act1":
+        from experiments.act1 import run_act1  # lazy import
+        run_act1(args.config)
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Legacy demo flow (original behaviour)
+    # ------------------------------------------------------------------
     # 示例1: 运行单个搜索器实验
     print("\n" + "="*60)
     print("SINGLE SEARCHER EXPERIMENT")
@@ -570,10 +587,10 @@ if __name__ == "__main__":
     fa_dosa_results = run_experiment(
         model_name="resnet18",
         searcher_type="fa-dosa",
-        num_trials=50,  # 减少总评估次数以加快测试
-        num_outer_steps=2,  # 减少外层步数
-        num_mapping_steps=5,  # 减少映射优化步数
-        num_hardware_steps=5  # 减少硬件优化步数
+        num_trials=100,  # 减少总评估次数以加快测试
+        num_outer_steps=5,  # 减少外层步数
+        num_mapping_steps=10,  # 减少映射优化步数
+        num_hardware_steps=10  # 减少硬件优化步数
     )
     
     # # Random search experiment - lightweight test configuration
