@@ -18,56 +18,126 @@ class Runner(Protocol):
 
 import random
 from datetime import datetime
+import torch
 
-class _BaseRandomRunner:
-    """Simple random search baseline producing fake EDP values (placeholder)."""
+from dosa.config import Config
+from dosa.hardware_parameters import HardwareParameters
+from dosa.mapping import FineGrainedMapping
+from dosa.performance_model import HighFidelityPerformanceModel
+from dosa.utils import ComputationGraph, FusionParameters
+from dosa.searcher import FADOSASearcher
 
-    def __init__(self, name: str, key_space: list[str]) -> None:
+
+class _BaseSearchRunner:
+    """Common utilities for all real baseline runners."""
+
+    def __init__(self, name: str) -> None:
         self.name = name
-        self.key_space = key_space
 
-    def _random_metrics(self) -> dict[str, Any]:
-        # Produce fake EDP ~ log-uniform, loss correlated
-        edp = 10 ** random.uniform(1, 6)
-        loss = random.uniform(0.5, 5.0)
-        return {"edp": edp, "loss": loss}
+    def _build_components(self, cfg: dict[str, Any]):
+        graph = self._create_fallback_graph()
+        config = Config.get_instance()
+        device = config.DEVICE
+        hw = HardwareParameters().to(device)
+        mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY).to(device)
+        fusion = FusionParameters(graph).to(device)
+        perf_model = HighFidelityPerformanceModel(config).to(device)
+        searcher = FADOSASearcher(graph, hw, mapping, fusion, perf_model, config)
+        return graph, searcher
+
+    def _create_fallback_graph(self) -> ComputationGraph:
+        graph = ComputationGraph()
+        for i in range(2):
+            dims_conv = {
+                "N": 1,
+                "C": 64 * (2 ** (i // 2)),
+                "K": 64 * (2 ** (i // 2)),
+                "P": 56 // (2 ** (i // 2)),
+                "Q": 56 // (2 ** (i // 2)),
+                "R": 3,
+                "S": 3,
+            }
+            dims_relu = dims_conv.copy()
+            graph.add_layer(f"conv_{i}", dims_conv, "Conv")
+            graph.add_layer(f"relu_{i}", dims_relu, "ReLU")
+            graph.add_fusion_group([f"conv_{i}", f"relu_{i}"])
+            graph.add_fusion_group([f"conv_{i}"])
+            graph.add_fusion_group([f"relu_{i}"])
+        return graph
+
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:
+        """Apply baseline-specific constraints to sampled parameters."""
 
     def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
         random.seed(seed)
+        torch.manual_seed(seed)
+        graph, searcher = self._build_components(cfg["shared"])
+        space = searcher.space
         num_trials = cfg["shared"].get("num_trials", 30)
         start_ts = datetime.now().isoformat(timespec="seconds")
+
         for t in range(1, num_trials + 1):
-            metrics = self._random_metrics()
-            row = {
-                "trial": t,
-                "seed": seed,
-                **metrics,
-            }
+            params = space.sample()
+            self._override_params(params, graph, self.name)
+            flat = space.to_flat(params)
+            loss, metrics = searcher.evaluate(flat)
+            row = {"trial": t, "seed": seed, **metrics}
             recorder.record_trial(row)
             recorder.update_best(metrics, key="edp")
+
         recorder.finalize_best()
         end_ts = datetime.now().isoformat(timespec="seconds")
         print(f"[{self.name}] seed={seed} completed {num_trials} trials in {start_ts}→{end_ts}.")
 
 
-class MappingOnlyA1Runner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineA_A1", ["mapping"])
+class MappingOnlyA1Runner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineA_A1")
+
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
+        params["num_pes"] = 128
+        params["l0_registers_size_kb"] = 2.0
+        params["l1_accumulator_size_kb"] = 8.0
+        params["l2_scratchpad_size_kb"] = 256.0
+        if graph.fusion_groups:
+            params["fusion_logits"] = [-2.0] * len(graph.fusion_groups)
 
 
-class MappingOnlyA2Runner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineA_A2", ["mapping"])
+class MappingOnlyA2Runner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineA_A2")
+
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
+        params["num_pes"] = 128
+        params["l0_registers_size_kb"] = 2.0
+        params["l1_accumulator_size_kb"] = 8.0
+        params["l2_scratchpad_size_kb"] = 256.0
 
 
-class HardwareOnlyRunner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineB", ["hardware"])
+class HardwareOnlyRunner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineB")
+
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
+        for dim in graph.problem_dims.keys():
+            for level in ["L0_Registers", "L1_Accumulator", "L2_Scratchpad"]:
+                params[f"{dim}_{level}_temporal"] = 1
+                params[f"{dim}_{level}_spatial"] = 1
+        if "P" in graph.problem_dims:
+            params["P_L0_Registers_spatial"] = 2
+        if "Q" in graph.problem_dims:
+            params["Q_L0_Registers_spatial"] = 2
+        if graph.fusion_groups:
+            params["fusion_logits"] = [-2.0] * len(graph.fusion_groups)
 
 
-class CooptRunner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("coopt", ["mapping", "hardware"])
+class CooptRunner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("coopt")
+
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
+        # Co-optimization searches the full space; no overrides required
+        pass
 
 
 def get_baseline_runner(name: str) -> Runner:  # noqa: D401
