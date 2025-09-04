@@ -4,7 +4,7 @@ import torch.optim as optim
 import numpy as np
 from typing import Dict, Any, List, Tuple
 import random
-from .utils import OptimizationLogger, get_divisors
+from .utils import OptimizationLogger, get_divisors, derive_minimal_hardware
 from .space import SearchSpace
 
 
@@ -484,12 +484,22 @@ class FADOSASearcher(BaseSearcher):
                     # 记录日志
                     if i % 10 == 0:
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
-            
+
+            # 根据当前映射推导最小硬件规模，作为硬件优化的起点
+            with torch.no_grad():
+                min_hw = derive_minimal_hardware(self.mapping, self.config)
+                device = self.hw_params.log_num_pes.device
+                self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(min_hw['num_pes']), device=device))
+                for level in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
+                    if level in min_hw:
+                        size_kb = torch.tensor(float(min_hw[level]), device=device)
+                        self.hw_params.log_buffer_sizes_kb[level].data = torch.log(size_kb)
+
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
                 self.logger.event("phase_start", phase="hardware")
                 # Removed duplicate phase console
-            
+
             # 冻结映射和融合参数
             for p in mapping_params_list + fusion_params_list:
                 p.requires_grad = False
