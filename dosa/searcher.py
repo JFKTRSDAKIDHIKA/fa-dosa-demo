@@ -375,8 +375,16 @@ class FADOSASearcher(BaseSearcher):
 
         # 确保output目录存在
         os.makedirs('output', exist_ok=True)
-        
+
         trial_count = 0
+
+        # 记录基线约束下的 requires_grad 状态，以防被后续阶段覆盖
+        hw_params_list = list(self.hw_params.parameters())
+        mapping_params_list = list(self.mapping.parameters())
+        fusion_params_list = list(self.fusion_params.parameters())
+        init_hw_requires_grad = [p.requires_grad for p in hw_params_list]
+        init_mapping_requires_grad = [p.requires_grad for p in mapping_params_list]
+        init_fusion_requires_grad = [p.requires_grad for p in fusion_params_list]
         
         # 交替优化循环
         for outer_step in range(self.num_outer_steps):
@@ -388,93 +396,94 @@ class FADOSASearcher(BaseSearcher):
             if self.logger:
                 self.logger.event("phase_start", phase="mapping_fusion")
                 # Removed duplicate phase console
-            
+
             # 冻结硬件参数
-            for p in self.hw_params.parameters():
+            for p in hw_params_list:
                 p.requires_grad = False
-            # 解冻映射和融合参数
-            for p in list(self.mapping.parameters()) + list(self.fusion_params.parameters()):
-                p.requires_grad = True
-            
-            # 创建映射和融合参数的优化器
-            optimizer_map = optim.Adam(
-                list(self.mapping.parameters()) + list(self.fusion_params.parameters()), 
-                lr=self.lr_mapping
-            )
-            
-            for i in range(self.num_mapping_steps):
-                optimizer_map.zero_grad()
-                
-                # 直接计算损失（保持梯度图）
-                latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
-                    self.graph, self.hw_params, self.mapping
-                )
-                
-                # 计算PE惩罚
-                pe_square_penalty = self.hw_params.get_pe_square_penalty()
-                
-                # 使用统一的损失计算方法
-                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
-                
-                # 反向传播
-                loss.backward()
+            # 恢复映射和融合参数在基线约束下的 requires_grad 状态
+            for p, flag in zip(mapping_params_list, init_mapping_requires_grad):
+                p.requires_grad = flag
+            for p, flag in zip(fusion_params_list, init_fusion_requires_grad):
+                p.requires_grad = flag
 
-                # ---- 调试日志记录（Phase A） ----
-                if self.recorder is not None:
-                    try:
-                        first_map_grad = next((p.grad for p in self.mapping.parameters() if p.grad is not None), None)
-                        mapping_grad_mean = float(first_map_grad.abs().mean().item()) if first_map_grad is not None else 0.0
-                    except StopIteration:
-                        mapping_grad_mean = 0.0
-                    fusion_grad = self.fusion_params.fusion_logits.grad
-                    fusion_grad_mean = float(fusion_grad.abs().mean().item()) if fusion_grad is not None else 0.0
-                    debug_snapshot = {
-                        "trial": trial_count + 1,
-                        "phase": "A_Mapping_Fusion",
-                        "outer_step": outer_step,
-                        "inner_step": i,
-                        "loss": loss.item(),
-                        "loss_breakdown": {
-                            "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
-                            "area_penalty": (self.loss_weights['area_weight'] * area).item(),
-                            "mismatch_penalty": mismatch_loss.item(),
-                            "compatibility_penalty": compatibility_penalty.item()
-                        },
-                        "learning_rate": self.lr_mapping,
-                        "gradients": {
-                            "mapping_sample_grad_mean_abs": mapping_grad_mean,
-                            "fusion_logits_grad_mean_abs": fusion_grad_mean
+            # 收集可训练的映射和融合参数
+            map_opt_params = [p for p in mapping_params_list + fusion_params_list if p.requires_grad]
+            if map_opt_params:
+                optimizer_map = optim.Adam(map_opt_params, lr=self.lr_mapping)
+
+                for i in range(self.num_mapping_steps):
+                    optimizer_map.zero_grad()
+
+                    # 直接计算损失（保持梯度图）
+                    latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
+                        self.graph, self.hw_params, self.mapping
+                    )
+
+                    # 计算PE惩罚
+                    pe_square_penalty = self.hw_params.get_pe_square_penalty()
+
+                    # 使用统一的损失计算方法
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
+
+                    # 反向传播
+                    loss.backward()
+
+                    # ---- 调试日志记录（Phase A） ----
+                    if self.recorder is not None:
+                        try:
+                            first_map_grad = next((p.grad for p in self.mapping.parameters() if p.grad is not None), None)
+                            mapping_grad_mean = float(first_map_grad.abs().mean().item()) if first_map_grad is not None else 0.0
+                        except StopIteration:
+                            mapping_grad_mean = 0.0
+                        fusion_grad = self.fusion_params.fusion_logits.grad
+                        fusion_grad_mean = float(fusion_grad.abs().mean().item()) if fusion_grad is not None else 0.0
+                        debug_snapshot = {
+                            "trial": trial_count + 1,
+                            "phase": "A_Mapping_Fusion",
+                            "outer_step": outer_step,
+                            "inner_step": i,
+                            "loss": loss.item(),
+                            "loss_breakdown": {
+                                "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
+                                "area_penalty": (self.loss_weights['area_weight'] * area).item(),
+                                "mismatch_penalty": mismatch_loss.item(),
+                                "compatibility_penalty": compatibility_penalty.item()
+                            },
+                            "learning_rate": self.lr_mapping,
+                            "gradients": {
+                                "mapping_sample_grad_mean_abs": mapping_grad_mean,
+                                "fusion_logits_grad_mean_abs": fusion_grad_mean
+                            }
                         }
-                    }
-                    self.recorder.log_coopt_debug_step(debug_snapshot)
+                        self.recorder.log_coopt_debug_step(debug_snapshot)
 
-                optimizer_map.step()
-                
-                # 计算指标用于记录
-                with torch.no_grad():
-                    current_params = self._get_params_as_dict()
-                    flat_params = self.space.to_flat(current_params)
-                    _, metrics = self.evaluate(flat_params)
-                
-                # 退火温度
-                self.mapping.anneal_tau()
-                
-                # 更新最佳结果
-                trial_count += 1
-                old_best_loss = self.best_loss
-                self.update_best_result(loss.item(), current_params, metrics, trial_count)
-                
-                # 质量驱动的触发：当找到新的全局最优解时保存配置
-                if loss.item() < old_best_loss:
-                    self._save_validation_config(trial_count, "quality_driven")
-                
-                # 多样性驱动的触发：周期性保存配置
-                if i % 50 == 0:
-                    self._save_validation_config(trial_count, "diversity_driven")
-                
-                # 记录日志
-                if i % 10 == 0:
-                    self.log_trial(trial_count, loss.item(), metrics, current_params)
+                    optimizer_map.step()
+
+                    # 计算指标用于记录
+                    with torch.no_grad():
+                        current_params = self._get_params_as_dict()
+                        flat_params = self.space.to_flat(current_params)
+                        _, metrics = self.evaluate(flat_params)
+
+                    # 退火温度
+                    self.mapping.anneal_tau()
+
+                    # 更新最佳结果
+                    trial_count += 1
+                    old_best_loss = self.best_loss
+                    self.update_best_result(loss.item(), current_params, metrics, trial_count)
+
+                    # 质量驱动的触发：当找到新的全局最优解时保存配置
+                    if loss.item() < old_best_loss:
+                        self._save_validation_config(trial_count, "quality_driven")
+
+                    # 多样性驱动的触发：周期性保存配置
+                    if i % 50 == 0:
+                        self._save_validation_config(trial_count, "diversity_driven")
+
+                    # 记录日志
+                    if i % 10 == 0:
+                        self.log_trial(trial_count, loss.item(), metrics, current_params)
             
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
@@ -482,73 +491,75 @@ class FADOSASearcher(BaseSearcher):
                 # Removed duplicate phase console
             
             # 冻结映射和融合参数
-            for p in list(self.mapping.parameters()) + list(self.fusion_params.parameters()):
+            for p in mapping_params_list + fusion_params_list:
                 p.requires_grad = False
-            # 解冻硬件参数
-            for p in self.hw_params.parameters():
-                p.requires_grad = True
-            
-            # 创建硬件参数的优化器
-            optimizer_hw = optim.Adam(self.hw_params.parameters(), lr=self.lr_hardware)
-            
-            for i in range(self.num_hardware_steps):
-                optimizer_hw.zero_grad()
-                
-                # 直接计算损失（保持梯度图）
-                latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
-                    self.graph, self.hw_params, self.mapping
-                )
-                
-                # 计算PE惩罚
-                pe_square_penalty = self.hw_params.get_pe_square_penalty()
-                
-                # 使用统一的损失计算方法
-                loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
-                
-                # 反向传播
-                loss.backward()
+            # 恢复硬件参数在基线约束下的 requires_grad 状态
+            for p, flag in zip(hw_params_list, init_hw_requires_grad):
+                p.requires_grad = flag
 
-                # ---- 调试日志记录（Phase B） ----
-                if self.recorder is not None:
-                    log_num_pes_grad = self.hw_params.log_num_pes.grad
-                    l0_grad = self.hw_params.log_buffer_sizes_kb['L0_Registers'].grad
-                    l1_grad = self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].grad
-                    l2_grad = self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].grad
-                    debug_snapshot = {
-                        "trial": trial_count + 1,
-                        "phase": "B_Hardware",
-                        "outer_step": outer_step,
-                        "inner_step": i,
-                        "loss": loss.item(),
-                        "loss_breakdown": {
-                            "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
-                            "area_penalty": (self.loss_weights['area_weight'] * area).item(),
-                            "mismatch_penalty": mismatch_loss.item(),
-                            "compatibility_penalty": compatibility_penalty.item()
-                        },
-                        "learning_rate": self.lr_hardware,
-                        "hardware_params_log_space": {
-                            "log_num_pes": self.hw_params.log_num_pes.item(),
-                            "log_l0_kb": self.hw_params.log_buffer_sizes_kb['L0_Registers'].item(),
-                            "log_l1_kb": self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].item(),
-                            "log_l2_kb": self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].item()
-                        },
-                        "gradients": {
-                            "log_num_pes_grad": float(log_num_pes_grad.item()) if log_num_pes_grad is not None else 0.0,
-                            "log_l0_kb_grad": float(l0_grad.item()) if l0_grad is not None else 0.0,
-                            "log_l1_kb_grad": float(l1_grad.item()) if l1_grad is not None else 0.0,
-                            "log_l2_kb_grad": float(l2_grad.item()) if l2_grad is not None else 0.0
+            # 收集可训练的硬件参数
+            hw_opt_params = [p for p in hw_params_list if p.requires_grad]
+            if hw_opt_params:
+                optimizer_hw = optim.Adam(hw_opt_params, lr=self.lr_hardware)
+
+                for i in range(self.num_hardware_steps):
+                    optimizer_hw.zero_grad()
+
+                    # 直接计算损失（保持梯度图）
+                    latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
+                        self.graph, self.hw_params, self.mapping
+                    )
+
+                    # 计算PE惩罚
+                    pe_square_penalty = self.hw_params.get_pe_square_penalty()
+
+                    # 使用统一的损失计算方法
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
+
+                    # 反向传播
+                    loss.backward()
+
+                    # ---- 调试日志记录（Phase B） ----
+                    if self.recorder is not None:
+                        log_num_pes_grad = self.hw_params.log_num_pes.grad
+                        l0_grad = self.hw_params.log_buffer_sizes_kb['L0_Registers'].grad
+                        l1_grad = self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].grad
+                        l2_grad = self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].grad
+                        debug_snapshot = {
+                            "trial": trial_count + 1,
+                            "phase": "B_Hardware",
+                            "outer_step": outer_step,
+                            "inner_step": i,
+                            "loss": loss.item(),
+                            "loss_breakdown": {
+                                "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
+                                "area_penalty": (self.loss_weights['area_weight'] * area).item(),
+                                "mismatch_penalty": mismatch_loss.item(),
+                                "compatibility_penalty": compatibility_penalty.item()
+                            },
+                            "learning_rate": self.lr_hardware,
+                            "hardware_params_log_space": {
+                                "log_num_pes": self.hw_params.log_num_pes.item(),
+                                "log_l0_kb": self.hw_params.log_buffer_sizes_kb['L0_Registers'].item(),
+                                "log_l1_kb": self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].item(),
+                                "log_l2_kb": self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].item()
+                            },
+                            "gradients": {
+                                "log_num_pes_grad": float(log_num_pes_grad.item()) if log_num_pes_grad is not None else 0.0,
+                                "log_l0_kb_grad": float(l0_grad.item()) if l0_grad is not None else 0.0,
+                                "log_l1_kb_grad": float(l1_grad.item()) if l1_grad is not None else 0.0,
+                                "log_l2_kb_grad": float(l2_grad.item()) if l2_grad is not None else 0.0
+                            }
                         }
-                    }
-                    self.recorder.log_coopt_debug_step(debug_snapshot)
+                        self.recorder.log_coopt_debug_step(debug_snapshot)
 
-                optimizer_hw.step()
-                
-                # 计算指标用于记录
-                with torch.no_grad():
-                    current_params = self._get_params_as_dict()
-                    flat_params = self.space.to_flat(current_params)
-                    _, metrics = self.evaluate(flat_params)
+                    optimizer_hw.step()
+
+                    # 计算指标用于记录
+                    with torch.no_grad():
+                        current_params = self._get_params_as_dict()
+                        flat_params = self.space.to_flat(current_params)
+                        _, metrics = self.evaluate(flat_params)
                 
                 # 更新最佳结果
                 trial_count += 1
