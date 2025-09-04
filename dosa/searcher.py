@@ -11,7 +11,7 @@ from .space import SearchSpace
 class BaseSearcher(ABC):
     """抽象基类，定义所有搜索器的通用接口"""
     
-    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
+    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None, recorder=None):
         """
         初始化搜索器
         
@@ -31,6 +31,8 @@ class BaseSearcher(ABC):
         self.perf_model = perf_model
         self.config = config
         self.logger = logger
+        # 主调用方可选地传入 Recorder，用于记录每一步试验信息和最佳结果
+        self.recorder = recorder
         
         # 创建搜索空间实例
         self.space = SearchSpace(graph)
@@ -187,12 +189,14 @@ class BaseSearcher(ABC):
             # 确保num_pes是平方数
             sqrt_pes = int(np.sqrt(params['num_pes']))
             actual_pes = sqrt_pes * sqrt_pes
-            self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(actual_pes)))
+            device = self.hw_params.log_num_pes.device
+            self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(actual_pes), device=device))
         
         for level in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
             key = f'{level.lower()}_size_kb'
             if key in params:
-                self.hw_params.log_buffer_sizes_kb[level].data = torch.log(torch.tensor(params[key]))
+                device = self.hw_params.log_buffer_sizes_kb[level].device
+                self.hw_params.log_buffer_sizes_kb[level].data = torch.log(torch.tensor(params[key], device=device))
         
         # 设置映射参数 - 只为实际存在的on-chip buffer层级设置参数
         on_chip_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']
@@ -204,15 +208,19 @@ class BaseSearcher(ABC):
                     spatial_key = f'{dim_name}_{level_name}_spatial'
                     
                     if temporal_key in params:
-                        self.mapping.factors[level_name][dim_name]['temporal'].data = torch.log(torch.tensor(params[temporal_key]))
+                        device = self.mapping.factors[level_name][dim_name]['temporal'].device
+                        self.mapping.factors[level_name][dim_name]['temporal'].data = torch.log(torch.tensor(params[temporal_key], device=device))
                     if spatial_key in params:
-                        self.mapping.factors[level_name][dim_name]['spatial'].data = torch.log(torch.tensor(params[spatial_key]))
+                        device = self.mapping.factors[level_name][dim_name]['spatial'].device
+                        self.mapping.factors[level_name][dim_name]['spatial'].data = torch.log(torch.tensor(params[spatial_key], device=device))
         
         # 设置融合参数
         if 'fusion_logits' in params:
             fusion_logits = params['fusion_logits']
             if isinstance(fusion_logits, list):
-                fusion_logits = torch.tensor(fusion_logits).unsqueeze(1)
+                fusion_logits = torch.tensor(fusion_logits, device=self.fusion_params.fusion_logits.device).unsqueeze(1)
+            else:
+                fusion_logits = fusion_logits.to(self.fusion_params.fusion_logits.device)
             self.fusion_params.fusion_logits.data = fusion_logits
     
     def _get_params_as_dict(self) -> Dict[str, Any]:
@@ -260,9 +268,9 @@ class BaseSearcher(ABC):
             self.best_loss = loss
             self.best_params = params.copy()
             self.best_metrics = metrics.copy()
-            
-            
-            
+            # 若集成 Recorder，则同步更新
+            if self.recorder is not None:
+                self.recorder.update_best(metrics, key="edp")
             # 使用StructuredLogger记录新的最佳结果事件
             if self.logger:
                 self.logger.event("new_best", step=trial, metrics={"loss": loss, **metrics})
@@ -302,6 +310,15 @@ class BaseSearcher(ABC):
              }
              
              self.logger.trial(trial, trial_data)
+        
+        # ------ Recorder 集成 ------
+        if self.recorder is not None:
+            trial_row = {
+                "trial": trial,
+                "loss": loss,
+                **metrics
+            }
+            self.recorder.record_trial(trial_row)
 
 
 def get_random_valid_divisor(dim_size: int) -> int:
@@ -323,8 +340,8 @@ class FADOSASearcher(BaseSearcher):
     FA-DOSA搜索器：基于梯度的交替优化
     """
     
-    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
-        super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger)
+    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None, recorder=None):
+        super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger, recorder)
         
         # FA-DOSA特定参数
         self.num_outer_steps = getattr(config, 'NUM_OUTER_STEPS', 5)
@@ -346,10 +363,16 @@ class FADOSASearcher(BaseSearcher):
         import os
         from .utils import save_configuration_to_json
         
+        # -------- 设备同步 --------
+        device = self.config.DEVICE
+        self.hw_params.to(device)
+        self.mapping.to(device)
+        self.fusion_params.to(device)
+
         if self.logger:
             self.logger.event("search_start", searcher_type="FA-DOSA", outer_steps=self.num_outer_steps)
             self.logger.console(f"Starting FA-DOSA search with {self.num_outer_steps} outer steps...")
-        
+
         # 确保output目录存在
         os.makedirs('output', exist_ok=True)
         
@@ -395,6 +418,36 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 反向传播
                 loss.backward()
+
+                # ---- 调试日志记录（Phase A） ----
+                if self.recorder is not None:
+                    try:
+                        first_map_grad = next((p.grad for p in self.mapping.parameters() if p.grad is not None), None)
+                        mapping_grad_mean = float(first_map_grad.abs().mean().item()) if first_map_grad is not None else 0.0
+                    except StopIteration:
+                        mapping_grad_mean = 0.0
+                    fusion_grad = self.fusion_params.fusion_logits.grad
+                    fusion_grad_mean = float(fusion_grad.abs().mean().item()) if fusion_grad is not None else 0.0
+                    debug_snapshot = {
+                        "trial": trial_count + 1,
+                        "phase": "A_Mapping_Fusion",
+                        "outer_step": outer_step,
+                        "inner_step": i,
+                        "loss": loss.item(),
+                        "loss_breakdown": {
+                            "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
+                            "area_penalty": (self.loss_weights['area_weight'] * area).item(),
+                            "mismatch_penalty": mismatch_loss.item(),
+                            "compatibility_penalty": compatibility_penalty.item()
+                        },
+                        "learning_rate": self.lr_mapping,
+                        "gradients": {
+                            "mapping_sample_grad_mean_abs": mapping_grad_mean,
+                            "fusion_logits_grad_mean_abs": fusion_grad_mean
+                        }
+                    }
+                    self.recorder.log_coopt_debug_step(debug_snapshot)
+
                 optimizer_map.step()
                 
                 # 计算指标用于记录
@@ -454,6 +507,41 @@ class FADOSASearcher(BaseSearcher):
                 
                 # 反向传播
                 loss.backward()
+
+                # ---- 调试日志记录（Phase B） ----
+                if self.recorder is not None:
+                    log_num_pes_grad = self.hw_params.log_num_pes.grad
+                    l0_grad = self.hw_params.log_buffer_sizes_kb['L0_Registers'].grad
+                    l1_grad = self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].grad
+                    l2_grad = self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].grad
+                    debug_snapshot = {
+                        "trial": trial_count + 1,
+                        "phase": "B_Hardware",
+                        "outer_step": outer_step,
+                        "inner_step": i,
+                        "loss": loss.item(),
+                        "loss_breakdown": {
+                            "log_edp": (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
+                            "area_penalty": (self.loss_weights['area_weight'] * area).item(),
+                            "mismatch_penalty": mismatch_loss.item(),
+                            "compatibility_penalty": compatibility_penalty.item()
+                        },
+                        "learning_rate": self.lr_hardware,
+                        "hardware_params_log_space": {
+                            "log_num_pes": self.hw_params.log_num_pes.item(),
+                            "log_l0_kb": self.hw_params.log_buffer_sizes_kb['L0_Registers'].item(),
+                            "log_l1_kb": self.hw_params.log_buffer_sizes_kb['L1_Accumulator'].item(),
+                            "log_l2_kb": self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'].item()
+                        },
+                        "gradients": {
+                            "log_num_pes_grad": float(log_num_pes_grad.item()) if log_num_pes_grad is not None else 0.0,
+                            "log_l0_kb_grad": float(l0_grad.item()) if l0_grad is not None else 0.0,
+                            "log_l1_kb_grad": float(l1_grad.item()) if l1_grad is not None else 0.0,
+                            "log_l2_kb_grad": float(l2_grad.item()) if l2_grad is not None else 0.0
+                        }
+                    }
+                    self.recorder.log_coopt_debug_step(debug_snapshot)
+
                 optimizer_hw.step()
                 
                 # 计算指标用于记录

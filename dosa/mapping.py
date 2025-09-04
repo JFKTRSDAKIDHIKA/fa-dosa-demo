@@ -50,11 +50,13 @@ class GumbelSoftmaxDivisor(nn.Module):
         
         if self.training:
             # Training mode: Use Gumbel-Softmax with hard=True for discrete selection
-            one_hot_selection = F.gumbel_softmax(logits, tau=self.tau, hard=True, dim=-1)
+            # Ensure tau is on the same device as logits
+            tau_device = self.tau.to(logits.device)
+            one_hot_selection = F.gumbel_softmax(logits, tau=tau_device, hard=True, dim=-1)
         else:
             # Evaluation mode: Deterministic argmax selection
             best_idx = torch.argmax(logits, dim=-1)
-            one_hot_selection = F.one_hot(best_idx, num_classes=logits.shape[-1]).float()
+            one_hot_selection = F.one_hot(best_idx, num_classes=logits.shape[-1]).float().to(logits.device)
         
         # Calculate selected divisor using one-hot selection
         selected_divisor = torch.sum(one_hot_selection * valid_divisors, dim=-1)
@@ -200,7 +202,7 @@ class FineGrainedMapping(nn.Module):
                 continuous_spatial = self.get_factor(level_name, dim_name, 'spatial')
                 
                 # Apply differentiable projection using SoftmaxWeightedDivisor
-                problem_dim_tensor = torch.tensor(float(total_size))
+                problem_dim_tensor = torch.tensor(float(total_size), device=self._param_device())
                 projected_temporal = self.projector(continuous_temporal, problem_dim_tensor)
                 projected_spatial = self.projector(continuous_spatial, problem_dim_tensor)
                 

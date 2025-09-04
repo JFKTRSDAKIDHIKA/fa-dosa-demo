@@ -18,56 +18,158 @@ class Runner(Protocol):
 
 import random
 from datetime import datetime
+import torch
 
-class _BaseRandomRunner:
-    """Simple random search baseline producing fake EDP values (placeholder)."""
+from dosa.config import Config
+from dosa.hardware_parameters import HardwareParameters
+from dosa.mapping import FineGrainedMapping
+from dosa.performance_model import HighFidelityPerformanceModel
+from dosa.utils import ComputationGraph, FusionParameters
+from dosa.searcher import FADOSASearcher
 
-    def __init__(self, name: str, key_space: list[str]) -> None:
+
+class _BaseSearchRunner:
+    """Common utilities for all real baseline runners."""
+
+    def __init__(self, name: str) -> None:
         self.name = name
-        self.key_space = key_space
 
-    def _random_metrics(self) -> dict[str, Any]:
-        # Produce fake EDP ~ log-uniform, loss correlated
-        edp = 10 ** random.uniform(1, 6)
-        loss = random.uniform(0.5, 5.0)
-        return {"edp": edp, "loss": loss}
+    def _build_components(self, cfg: dict[str, Any], recorder):
+        graph = self._create_fallback_graph()
+        config = Config.get_instance()
+        device = config.DEVICE
+        hw = HardwareParameters().to(device)
+        mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY).to(device)
+        fusion = FusionParameters(graph).to(device)
+        perf_model = HighFidelityPerformanceModel(config).to(device)
+        searcher = FADOSASearcher(graph, hw, mapping, fusion, perf_model, config, recorder=recorder)
+        return graph, searcher
+
+    def _create_fallback_graph(self) -> ComputationGraph:
+        graph = ComputationGraph()
+        for i in range(2):
+            dims_conv = {
+                "N": 1,
+                "C": 64 * (2 ** (i // 2)),
+                "K": 64 * (2 ** (i // 2)),
+                "P": 56 // (2 ** (i // 2)),
+                "Q": 56 // (2 ** (i // 2)),
+                "R": 3,
+                "S": 3,
+            }
+            dims_relu = dims_conv.copy()
+            graph.add_layer(f"conv_{i}", dims_conv, "Conv")
+            graph.add_layer(f"relu_{i}", dims_relu, "ReLU")
+            graph.add_fusion_group([f"conv_{i}", f"relu_{i}"])
+            graph.add_fusion_group([f"conv_{i}"])
+            graph.add_fusion_group([f"relu_{i}"])
+        return graph
+
+    # ---------------- Constraint helpers ----------------
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        """Freeze parameters/initialize values according to baseline kind."""
+        pass  # To be overridden by subclasses
+
+    # Deprecated method retained for compatibility (no-op)
+    def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
+        return
 
     def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
         random.seed(seed)
+        torch.manual_seed(seed)
+        graph, searcher = self._build_components(cfg["shared"], recorder)
+        # 在搜索前按基准类型应用参数冻结/初始化约束
+        self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
+
         num_trials = cfg["shared"].get("num_trials", 30)
         start_ts = datetime.now().isoformat(timespec="seconds")
-        for t in range(1, num_trials + 1):
-            metrics = self._random_metrics()
-            row = {
-                "trial": t,
-                "seed": seed,
-                **metrics,
-            }
-            recorder.record_trial(row)
-            recorder.update_best(metrics, key="edp")
+
+        # 主动优化：调用 searcher.search()
+        searcher.search(num_trials)
+
+        # 完成后刷新 Recorder 最佳记录
         recorder.finalize_best()
         end_ts = datetime.now().isoformat(timespec="seconds")
         print(f"[{self.name}] seed={seed} completed {num_trials} trials in {start_ts}→{end_ts}.")
 
 
-class MappingOnlyA1Runner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineA_A1", ["mapping"])
+class MappingOnlyA1Runner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineA_A1")
+
+    # 仅优化映射/融合，硬件固定
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        # 冻结所有硬件参数
+        for p in hw_params.parameters():
+            p.requires_grad = False
+        # 解冻映射与融合参数（默认即可，无需显式设置）
+
+        # 将硬件参数设为固定基准值
+        hw_params.log_num_pes.data = torch.log(torch.tensor(128.0, device=hw_params.log_num_pes.device))
+        hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(2.0, device=hw_params.log_buffer_sizes_kb["L0_Registers"].device))
+        hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(8.0, device=hw_params.log_buffer_sizes_kb["L1_Accumulator"].device))
+        hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(256.0, device=hw_params.log_buffer_sizes_kb["L2_Scratchpad"].device))
+
+        # 固定融合策略 (较少融合)
+        if graph.fusion_groups:
+            with torch.no_grad():
+                fusion_params.fusion_logits.data = torch.full_like(fusion_params.fusion_logits, -2.0)
 
 
-class MappingOnlyA2Runner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineA_A2", ["mapping"])
+class MappingOnlyA2Runner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineA_A2")
+
+    # 同 A1 但允许融合搜索
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        # 冻结硬件参数
+        for p in hw_params.parameters():
+            p.requires_grad = False
+
+        # 设置固定硬件规模
+        hw_params.log_num_pes.data = torch.log(torch.tensor(128.0, device=hw_params.log_num_pes.device))
+        hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(2.0, device=hw_params.log_buffer_sizes_kb["L0_Registers"].device))
+        hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(8.0, device=hw_params.log_buffer_sizes_kb["L1_Accumulator"].device))
+        hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(256.0, device=hw_params.log_buffer_sizes_kb["L2_Scratchpad"].device))
 
 
-class HardwareOnlyRunner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("baselineB", ["hardware"])
+class HardwareOnlyRunner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("baselineB")
+
+    # 仅优化硬件，映射/融合固定
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        # 冻结映射与融合参数
+        for p in mapping.parameters():
+            p.requires_grad = False
+        for p in fusion_params.parameters():
+            p.requires_grad = False
+
+        # 设置映射参数为统一的无优化基准（所有分解因子=1，log(1)=0）
+        with torch.no_grad():
+            for level_factors in mapping.factors.values():
+                for dim_dict in level_factors.values():
+                    dim_dict["temporal"].data.fill_(0.0)
+                    dim_dict["spatial"].data.fill_(0.0)
+            # 可选: 提升 P/Q 的 spatial 至 2 用于提高并行度
+            if "P" in graph.problem_dims and "L0_Registers" in mapping.factors:
+                mapping.factors["L0_Registers"]["P"]["spatial"].data.fill_(torch.log(torch.tensor(2.0)))
+            if "Q" in graph.problem_dims and "L0_Registers" in mapping.factors:
+                mapping.factors["L0_Registers"]["Q"]["spatial"].data.fill_(torch.log(torch.tensor(2.0)))
+
+        # 融合设置为极少融合
+        if graph.fusion_groups:
+            with torch.no_grad():
+                fusion_params.fusion_logits.data = torch.full_like(fusion_params.fusion_logits, -2.0)
 
 
-class CooptRunner(_BaseRandomRunner):
-    def __init__(self):
-        super().__init__("coopt", ["mapping", "hardware"])
+class CooptRunner(_BaseSearchRunner):
+    def __init__(self) -> None:
+        super().__init__("coopt")
+
+    # 协同优化：不做任何冻结或初始化限制
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        pass
 
 
 def get_baseline_runner(name: str) -> Runner:  # noqa: D401
