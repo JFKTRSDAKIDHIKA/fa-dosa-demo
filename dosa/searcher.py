@@ -11,7 +11,7 @@ from .space import SearchSpace
 class BaseSearcher(ABC):
     """抽象基类，定义所有搜索器的通用接口"""
     
-    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
+    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None, recorder=None):
         """
         初始化搜索器
         
@@ -31,6 +31,8 @@ class BaseSearcher(ABC):
         self.perf_model = perf_model
         self.config = config
         self.logger = logger
+        # 主调用方可选地传入 Recorder，用于记录每一步试验信息和最佳结果
+        self.recorder = recorder
         
         # 创建搜索空间实例
         self.space = SearchSpace(graph)
@@ -187,12 +189,14 @@ class BaseSearcher(ABC):
             # 确保num_pes是平方数
             sqrt_pes = int(np.sqrt(params['num_pes']))
             actual_pes = sqrt_pes * sqrt_pes
-            self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(actual_pes)))
+            device = self.hw_params.log_num_pes.device
+            self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(actual_pes), device=device))
         
         for level in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
             key = f'{level.lower()}_size_kb'
             if key in params:
-                self.hw_params.log_buffer_sizes_kb[level].data = torch.log(torch.tensor(params[key]))
+                device = self.hw_params.log_buffer_sizes_kb[level].device
+                self.hw_params.log_buffer_sizes_kb[level].data = torch.log(torch.tensor(params[key], device=device))
         
         # 设置映射参数 - 只为实际存在的on-chip buffer层级设置参数
         on_chip_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']
@@ -204,15 +208,19 @@ class BaseSearcher(ABC):
                     spatial_key = f'{dim_name}_{level_name}_spatial'
                     
                     if temporal_key in params:
-                        self.mapping.factors[level_name][dim_name]['temporal'].data = torch.log(torch.tensor(params[temporal_key]))
+                        device = self.mapping.factors[level_name][dim_name]['temporal'].device
+                        self.mapping.factors[level_name][dim_name]['temporal'].data = torch.log(torch.tensor(params[temporal_key], device=device))
                     if spatial_key in params:
-                        self.mapping.factors[level_name][dim_name]['spatial'].data = torch.log(torch.tensor(params[spatial_key]))
+                        device = self.mapping.factors[level_name][dim_name]['spatial'].device
+                        self.mapping.factors[level_name][dim_name]['spatial'].data = torch.log(torch.tensor(params[spatial_key], device=device))
         
         # 设置融合参数
         if 'fusion_logits' in params:
             fusion_logits = params['fusion_logits']
             if isinstance(fusion_logits, list):
-                fusion_logits = torch.tensor(fusion_logits).unsqueeze(1)
+                fusion_logits = torch.tensor(fusion_logits, device=self.fusion_params.fusion_logits.device).unsqueeze(1)
+            else:
+                fusion_logits = fusion_logits.to(self.fusion_params.fusion_logits.device)
             self.fusion_params.fusion_logits.data = fusion_logits
     
     def _get_params_as_dict(self) -> Dict[str, Any]:
@@ -260,9 +268,9 @@ class BaseSearcher(ABC):
             self.best_loss = loss
             self.best_params = params.copy()
             self.best_metrics = metrics.copy()
-            
-            
-            
+            # 若集成 Recorder，则同步更新
+            if self.recorder is not None:
+                self.recorder.update_best(metrics, key="edp")
             # 使用StructuredLogger记录新的最佳结果事件
             if self.logger:
                 self.logger.event("new_best", step=trial, metrics={"loss": loss, **metrics})
@@ -302,6 +310,15 @@ class BaseSearcher(ABC):
              }
              
              self.logger.trial(trial, trial_data)
+        
+        # ------ Recorder 集成 ------
+        if self.recorder is not None:
+            trial_row = {
+                "trial": trial,
+                "loss": loss,
+                **metrics
+            }
+            self.recorder.record_trial(trial_row)
 
 
 def get_random_valid_divisor(dim_size: int) -> int:
@@ -323,8 +340,8 @@ class FADOSASearcher(BaseSearcher):
     FA-DOSA搜索器：基于梯度的交替优化
     """
     
-    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None):
-        super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger)
+    def __init__(self, graph, hw_params, mapping, fusion_params, perf_model, config, logger=None, recorder=None):
+        super().__init__(graph, hw_params, mapping, fusion_params, perf_model, config, logger, recorder)
         
         # FA-DOSA特定参数
         self.num_outer_steps = getattr(config, 'NUM_OUTER_STEPS', 5)
@@ -346,10 +363,16 @@ class FADOSASearcher(BaseSearcher):
         import os
         from .utils import save_configuration_to_json
         
+        # -------- 设备同步 --------
+        device = self.config.DEVICE
+        self.hw_params.to(device)
+        self.mapping.to(device)
+        self.fusion_params.to(device)
+
         if self.logger:
             self.logger.event("search_start", searcher_type="FA-DOSA", outer_steps=self.num_outer_steps)
             self.logger.console(f"Starting FA-DOSA search with {self.num_outer_steps} outer steps...")
-        
+
         # 确保output目录存在
         os.makedirs('output', exist_ok=True)
         

@@ -1115,11 +1115,11 @@ class HighFidelityPerformanceModel(nn.Module):
         num_pes = hw_params.get_projected_num_pes()
 
         # Compute cycles
-        compute_cycles = total_macs / torch.clamp(num_pes, min=torch.tensor(1.0, device=self.config.DEVICE))
+        compute_cycles = total_macs / torch.clamp(num_pes, min=torch.tensor(1.0, device=num_pes.device))
 
         # Memory cycles based on DRAM bandwidth
         bandwidth = calculate_bandwidth_bytes_per_cycle('L3_DRAM', num_pes, self.config)
-        memory_cycles = dram_bytes / torch.clamp(bandwidth, min=torch.tensor(1e-9, device=self.config.DEVICE))
+        memory_cycles = dram_bytes / torch.clamp(bandwidth, min=torch.tensor(1e-9, device=bandwidth.device))
 
         total_cycles = torch.max(compute_cycles, memory_cycles)
         latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
