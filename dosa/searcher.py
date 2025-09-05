@@ -46,7 +46,7 @@ class BaseSearcher(ABC):
         self.loss_strategy = getattr(config, 'LOSS_STRATEGY', 'log_edp_plus_area')
         self.loss_weights = getattr(config, 'LOSS_WEIGHTS', {
             'area_weight': getattr(config, 'AREA_WEIGHT', 0.1),
-            'mismatch_penalty_weight': 10.0,
+            'mismatch_penalty_weight': getattr(config, 'MISMATCH_PENALTY_WEIGHT', 0.1),
             'pe_penalty_weight_phase_a': 0.1,
             'pe_penalty_weight_phase_b': 0.01,
             'edp_weight': 1.0
@@ -154,7 +154,7 @@ class BaseSearcher(ABC):
             # 标准策略：log(EDP) + 面积惩罚
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
-            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
             loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
             
@@ -162,7 +162,7 @@ class BaseSearcher(ABC):
             # EDP + 面积惩罚
             edp = latency * energy
             area_penalty = self.loss_weights['area_weight'] * area
-            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
             loss = edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
             
@@ -170,7 +170,7 @@ class BaseSearcher(ABC):
             # 默认策略：与log_edp_plus_area相同
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
-            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 10.0)
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
             pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
             loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
         
