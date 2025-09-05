@@ -167,9 +167,31 @@ class CooptRunner(_BaseSearchRunner):
     def __init__(self) -> None:
         super().__init__("coopt")
 
-    # 协同优化：不做任何冻结或初始化限制
+    # 协同优化：仍允许搜索，但从专家挑选的较优初始点出发
     def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
-        pass
+        device = hw_params.log_num_pes.device
+        with torch.no_grad():
+            # 1) 设定一个经验上效果较好的硬件规模
+            hw_params.log_num_pes.data = torch.log(torch.tensor(256.0, device=device))
+            hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(4.0, device=device))
+            hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(16.0, device=device))
+            hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(512.0, device=device))
+
+            # 2) 初始化映射因子为可行的基础方案
+            for level_factors in mapping.factors.values():
+                for dim_dict in level_factors.values():
+                    dim_dict["temporal"].data.fill_(0.0)  # log(1)
+                    dim_dict["spatial"].data.fill_(0.0)   # log(1)
+
+            # 在寄存器层为输出空间引入适度并行度
+            if "P" in graph.problem_dims and "L0_Registers" in mapping.factors:
+                mapping.factors["L0_Registers"]["P"]["spatial"].data.fill_(torch.log(torch.tensor(2.0, device=device)))
+            if "Q" in graph.problem_dims and "L0_Registers" in mapping.factors:
+                mapping.factors["L0_Registers"]["Q"]["spatial"].data.fill_(torch.log(torch.tensor(2.0, device=device)))
+
+            # 3) 融合概率初始化为中性值，鼓励搜索但不偏向任一方案
+            if graph.fusion_groups:
+                fusion_params.fusion_logits.data = torch.zeros_like(fusion_params.fusion_logits)
 
 
 def get_baseline_runner(name: str) -> Runner:  # noqa: D401

@@ -100,6 +100,16 @@ class Config:
         self.LOSS_STRATEGY = 'log_edp_plus_area'
         self.AREA_WEIGHT = 1e-3
         self.COMPATIBILITY_PENALTY_WEIGHT = 100.0
+        # Weight for buffer mismatch penalty
+        self.MISMATCH_PENALTY_WEIGHT = 0.1
+        # Consolidated loss weights for easy tuning
+        self.LOSS_WEIGHTS = {
+            'area_weight': self.AREA_WEIGHT,
+            'mismatch_penalty_weight': self.MISMATCH_PENALTY_WEIGHT,
+            'pe_penalty_weight_phase_a': 0.1,
+            'pe_penalty_weight_phase_b': 0.01,
+            'edp_weight': 1.0
+        }
         
         # ========== 面积模型参数 (单位: mm²) ==========
         self.AREA_BASE_MM2 = 1.0                # 芯片基础面积

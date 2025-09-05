@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import json
 from typing import Dict, List, Tuple
+from .config import Config
 
 # Memoization cache for divisors
 _divisors_cache = {}
@@ -176,6 +177,68 @@ def calculate_macs(dims):
     output_elements = dims.get('N', 1) * dims.get('K', 1) * dims.get('P', 1) * dims.get('Q', 1)
     ops_per_element = dims.get('C', 1) * dims.get('R', 1) * dims.get('S', 1)
     return output_elements * ops_per_element
+
+
+def derive_minimal_hardware(mapping, config: Config = None) -> Dict[str, float]:
+    """Derive minimal hardware resources required to fit the current mapping.
+
+    Computes the minimum buffer capacity (in KB) for each on-chip level and the
+    minimum number of processing elements (PEs) needed to hold the spatial
+    parallelism of the innermost level.
+
+    Args:
+        mapping: ``FineGrainedMapping`` instance describing the current tiling.
+        config: Optional ``Config`` instance. If ``None``, the global singleton
+            is used.
+
+    Returns:
+        Dict[str, float]: A dictionary with keys ``num_pes`` and buffer level
+        names (e.g., ``'L0_Registers'``) mapping to minimal values.
+    """
+
+    if config is None:
+        config = Config.get_instance()
+
+    projected = mapping.get_all_factors()
+
+    # Determine minimal PE count from spatial factors at the innermost level
+    on_chip_levels = [lvl['name'] for lvl in config.MEMORY_HIERARCHY if lvl['type'] == 'buffer']
+    l0_name = on_chip_levels[0] if on_chip_levels else None
+    num_pes = 1
+    if l0_name is not None:
+        for dim in mapping.dims.keys():
+            spatial = projected.get(dim, {}).get(l0_name, {}).get('spatial', torch.tensor(1.0))
+            num_pes *= int(spatial.item())
+
+    results: Dict[str, float] = {'num_pes': max(1, num_pes)}
+
+    # Compute minimal buffer capacities for each on-chip level
+    for level_index, level_name in enumerate(on_chip_levels):
+        total_words = 0
+        for tensor_type in ['W', 'I', 'O']:
+            if config.STORAGE_MATRIX.get(level_index, {}).get(tensor_type, 0) == 0:
+                continue
+
+            tensor_dims = config.TENSOR_DIMENSIONS[tensor_type]
+            tensor_words = 1
+            for dim in tensor_dims:
+                tile_factor = 1
+                # Multiply factors of all inner levels up to current level
+                for j in range(level_index + 1):
+                    lvl_name = on_chip_levels[j]
+                    factors = projected.get(dim, {}).get(lvl_name, {})
+                    temporal = factors.get('temporal', torch.tensor(1.0))
+                    spatial = factors.get('spatial', torch.tensor(1.0))
+                    tile_factor *= int(temporal.item() * spatial.item())
+                tensor_words *= tile_factor
+
+            total_words += tensor_words
+
+        # Convert words to KB (assuming BYTES_PER_ELEMENT per word)
+        total_kb = (total_words * config.BYTES_PER_ELEMENT) / 1024.0
+        results[level_name] = float(total_kb)
+
+    return results
 
 def save_configuration_to_json(hw_params, projected_mapping, fusion_decisions, file_path="final_configuration.json"):
     # Helper function to convert tensors to native Python types

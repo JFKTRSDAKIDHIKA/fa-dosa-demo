@@ -1396,7 +1396,9 @@ class HighFidelityPerformanceModel(nn.Module):
                         required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
                         available_kb = hw_params.get_buffer_size_kb(level['name'])
                         buffer_deficit = torch.relu(required_kb - available_kb)
-                        level_mismatch_loss = torch.pow(buffer_deficit, 2)
+                        # Compute relative deficit to avoid overly penalizing small mismatches
+                        relative_deficit = buffer_deficit / (required_kb + 1e-9)
+                        level_mismatch_loss = torch.pow(relative_deficit, 2)
                         total_buffer_mismatch_loss += level_mismatch_loss
 
             total_latency += latency
