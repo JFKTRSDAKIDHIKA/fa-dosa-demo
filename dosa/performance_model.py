@@ -104,10 +104,11 @@ class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
     """
-    def __init__(self, config: Config, debug_latency: bool = False):
+    def __init__(self, config: Config, debug_latency: bool = False, fusion_aware: bool = True):
         super().__init__()
         self.config = config
         self.debug_latency = debug_latency
+        self.fusion_aware = fusion_aware
         self.dmt_registry = {
             ('Conv', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
             ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
@@ -1172,10 +1173,16 @@ class HighFidelityPerformanceModel(nn.Module):
         else:
             all_factors = mapping.get_all_factors()
 
+        # 根据是否启用融合感知决定计算组
+        if self.fusion_aware:
+            fusion_groups = graph.fusion_groups
+        else:
+            fusion_groups = [[layer_name] for group in graph.fusion_groups for layer_name in group]
+
         # 以计算组为单位进行PPA计算
-        for group in graph.fusion_groups:
+        for group in fusion_groups:
             current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
-            dmt_model = self.dmt_registry.get(current_pattern)
+            dmt_model = self.dmt_registry.get(current_pattern) if self.fusion_aware else None
 
             if dmt_model:
                 # 使用DMT处理融合模式

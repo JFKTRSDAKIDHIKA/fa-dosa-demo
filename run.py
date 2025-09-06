@@ -7,10 +7,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
 import json
 import onnx
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Optional
 from functools import reduce
 from operator import mul
 
@@ -298,9 +297,11 @@ def _create_fallback_graph() -> ComputationGraph:
 # --- 主实验流程 ---
 
 def run_experiment(
-    model_name: str = "resnet18", 
+    model_name: str = "resnet18",
     searcher_type: str = "fa-dosa",
     num_trials: int = 500,
+    fusion_aware: bool = True,
+    log_dir: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -310,6 +311,8 @@ def run_experiment(
         model_name: 模型名称 (e.g., 'resnet18', 'bert_base')
         searcher_type: 搜索器类型 ('fa-dosa', 'random_search', 'bayesian_opt', 'genetic_algo')
         num_trials: 试验次数或评估次数
+        fusion_aware: 是否启用融合感知性能建模
+        log_dir: 日志输出目录，可自定义；默认为 Config.LOG_DIR
         **kwargs: 其他搜索器特定参数
         
     Returns:
@@ -320,7 +323,7 @@ def run_experiment(
     
     # 创建结构化日志器
     logger = StructuredLogger(
-        log_dir=config.LOG_DIR,
+        log_dir=log_dir or config.LOG_DIR,
         minimal_console=config.MINIMAL_CONSOLE,
         log_intermediate=config.LOG_INTERMEDIATE
     )
@@ -337,7 +340,7 @@ def run_experiment(
     hw_params = HardwareParameters()
     mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY)
     fusion_params = FusionParameters(graph)
-    perf_model = HighFidelityPerformanceModel(config)
+    perf_model = HighFidelityPerformanceModel(config, fusion_aware=fusion_aware)
     
     # 记录ONNX解析结果
     if not os.path.exists(f"onnx_models/{model_name}.onnx"):
@@ -506,7 +509,8 @@ def create_searcher(
 def run_comparison_experiment(
     model_name: str = "resnet18",
     searcher_types: List[str] = ["fa-dosa", "random_search"],
-    num_trials: int = 500
+    num_trials: int = 500,
+    fusion_aware: bool = True
 ) -> Dict[str, Dict[str, Any]]:
     """
     运行多个搜索器的对比实验
@@ -529,12 +533,13 @@ def run_comparison_experiment(
         print(f"\n{'='*60}")
         print(f"Running {searcher_type.upper()}")
         print(f"{'='*60}")
-        
+
         try:
             results = run_experiment(
                 model_name=model_name,
                 searcher_type=searcher_type,
-                num_trials=num_trials
+                num_trials=num_trials,
+                fusion_aware=fusion_aware
             )
             all_results[searcher_type] = results
             
@@ -568,6 +573,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FA-DOSA runner with optional Act I experiment")
     parser.add_argument("--exp", default="legacy", choices=["legacy", "act1"], help="Experiment to run")
     parser.add_argument("--config", default=str(Path("configs/act1.yaml").resolve()), help="Config file for act1 experiment")
+    parser.add_argument("--fusion-unaware", action="store_true", help="Disable fusion-aware performance modeling")
     args, unknown = parser.parse_known_args()
 
     if args.exp == "act1":
@@ -590,7 +596,8 @@ if __name__ == "__main__":
         num_trials=100,  # 减少总评估次数以加快测试
         num_outer_steps=5,  # 减少外层步数
         num_mapping_steps=10,  # 减少映射优化步数
-        num_hardware_steps=10  # 减少硬件优化步数
+        num_hardware_steps=10,  # 减少硬件优化步数
+        fusion_aware=not args.fusion_unaware
     )
     
     # # Random search experiment - lightweight test configuration
