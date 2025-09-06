@@ -176,6 +176,30 @@ class BaseSearcher(ABC):
         
         # 确保返回标量张量
         return loss.squeeze() if loss.dim() > 0 else loss
+
+    def _apply_min_hw_bounds(self, min_hw: Dict[str, float], reset: bool = False):
+        """Apply minimal hardware constraints.
+
+        Args:
+            min_hw: Dictionary returned by ``derive_minimal_hardware``.
+            reset: If True, hardware parameters are reset exactly to the
+                minimal values. If False, existing parameters are only clamped
+                to be no smaller than the minima.
+        """
+        device = self.hw_params.log_num_pes.device
+
+        min_num_pes = torch.tensor(float(min_hw.get('num_pes', 1)), device=device)
+        current_pes = torch.exp(self.hw_params.log_num_pes.data)
+        new_pes = min_num_pes if reset else torch.maximum(current_pes, min_num_pes)
+        self.hw_params.log_num_pes.data = torch.log(new_pes)
+
+        for level, param in self.hw_params.log_buffer_sizes_kb.items():
+            if level not in min_hw:
+                continue
+            min_size = torch.tensor(float(min_hw[level]), device=param.device)
+            current_size = torch.exp(param.data)
+            new_size = min_size if reset else torch.maximum(current_size, min_size)
+            param.data = torch.log(new_size)
     
     def _set_params_from_dict(self, params: Dict[str, Any]):
         """
@@ -485,15 +509,11 @@ class FADOSASearcher(BaseSearcher):
                     if i % 10 == 0:
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
 
-            # 根据当前映射推导最小硬件规模，作为硬件优化的起点
+            # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
-                device = self.hw_params.log_num_pes.device
-                self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(min_hw['num_pes']), device=device))
-                for level in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
-                    if level in min_hw:
-                        size_kb = torch.tensor(float(min_hw[level]), device=device)
-                        self.hw_params.log_buffer_sizes_kb[level].data = torch.log(size_kb)
+                # Optionally reset to minimal hardware or simply enforce as lower bound
+                self._apply_min_hw_bounds(min_hw, reset=getattr(self.config, 'RESET_TO_MIN_HW', True))
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
@@ -564,6 +584,10 @@ class FADOSASearcher(BaseSearcher):
                         self.recorder.log_coopt_debug_step(debug_snapshot)
 
                     optimizer_hw.step()
+
+                    # Enforce minimal hardware as lower bounds after the update
+                    with torch.no_grad():
+                        self._apply_min_hw_bounds(min_hw, reset=False)
 
                     # 计算指标用于记录
                     with torch.no_grad():

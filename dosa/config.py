@@ -98,7 +98,10 @@ class Config:
         
         # ========== 优化目标与损失函数权重 ==========
         self.LOSS_STRATEGY = 'log_edp_plus_area'
-        self.AREA_WEIGHT = 1e-3
+        # Area penalty is disabled by default so that the benefit of larger
+        # hardware configurations can be observed. Set ``AREA_WEIGHT`` to a
+        # non-zero value to re-enable the penalty.
+        self.AREA_WEIGHT = 0.0
         self.COMPATIBILITY_PENALTY_WEIGHT = 100.0
         # Weight for buffer mismatch penalty
         self.MISMATCH_PENALTY_WEIGHT = 0.1
@@ -149,6 +152,12 @@ class Config:
         self.LOG_DIR = "output"              # 日志输出目录
         self.LOG_TRIAL_INTERVAL = 50         # 控制台输出试验结果的间隔
         self.LOG_VALIDATION_INTERVAL = 50    # 保存验证配置的间隔
+
+        # ========== 硬件搜索行为配置 ==========
+        # If True, hardware parameters are reset to the minimal configuration
+        # derived from the current mapping before Phase B. If False, the
+        # minimal hardware only serves as a lower bound constraint.
+        self.RESET_TO_MIN_HW = True
     
     @classmethod
     def get_instance(cls):
