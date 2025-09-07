@@ -101,7 +101,9 @@ class Config:
         # Area penalty is disabled by default so that the benefit of larger
         # hardware configurations can be observed. Set ``AREA_WEIGHT`` to a
         # non-zero value to re-enable the penalty.
-        self.AREA_WEIGHT = 0.0
+        # Use a small positive value by default to encourage exploring larger
+        # hardware when needed.
+        self.AREA_WEIGHT = 0.1
         self.COMPATIBILITY_PENALTY_WEIGHT = 100.0
         # Weight for buffer mismatch penalty
         self.MISMATCH_PENALTY_WEIGHT = 0.1
@@ -158,6 +160,10 @@ class Config:
         # derived from the current mapping before Phase B. If False, the
         # minimal hardware only serves as a lower bound constraint.
         self.RESET_TO_MIN_HW = False
+        # Whether to enforce minimal hardware as a hard lower bound during
+        # the search. Set to ``False`` to temporarily remove this constraint
+        # and allow more aggressive exploration of the hardware space.
+        self.APPLY_MIN_HW_BOUNDS = False
     
     @classmethod
     def get_instance(cls):

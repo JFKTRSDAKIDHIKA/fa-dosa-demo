@@ -473,9 +473,9 @@ def create_searcher(
     if searcher_type == 'fa-dosa':
         config.NUM_OUTER_STEPS = kwargs.get('num_outer_steps', 5)
         config.NUM_MAPPING_STEPS = kwargs.get('num_mapping_steps', 50)
-        config.NUM_HARDWARE_STEPS = kwargs.get('num_hardware_steps', 50)
+        config.NUM_HARDWARE_STEPS = kwargs.get('num_hardware_steps', 100)
         config.LR_MAPPING = kwargs.get('lr_mapping', 0.01)
-        config.LR_HARDWARE = kwargs.get('lr_hardware', 0.01)
+        config.LR_HARDWARE = kwargs.get('lr_hardware', 0.05)
         
         return FADOSASearcher(
             graph, hw_params, mapping, fusion_params, perf_model, config, logger
@@ -596,7 +596,8 @@ if __name__ == "__main__":
         num_trials=100,  # 减少总评估次数以加快测试
         num_outer_steps=5,  # 减少外层步数
         num_mapping_steps=10,  # 减少映射优化步数
-        num_hardware_steps=10,  # 减少硬件优化步数
+        num_hardware_steps=20,  # 提高硬件优化步数以增强探索
+        lr_hardware=0.05,  # 提高硬件优化学习率
         fusion_aware=not args.fusion_unaware
     )
     

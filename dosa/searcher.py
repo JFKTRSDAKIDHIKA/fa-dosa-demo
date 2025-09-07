@@ -529,8 +529,11 @@ class FADOSASearcher(BaseSearcher):
             # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
-                # Optionally reset to minimal hardware or simply enforce as lower bound
-                self._apply_min_hw_bounds(min_hw, reset=getattr(self.config, 'RESET_TO_MIN_HW', True))
+                if getattr(self.config, 'APPLY_MIN_HW_BOUNDS', True):
+                    # Optionally reset to minimal hardware or simply enforce as lower bound
+                    self._apply_min_hw_bounds(
+                        min_hw, reset=getattr(self.config, 'RESET_TO_MIN_HW', True)
+                    )
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
@@ -609,8 +612,9 @@ class FADOSASearcher(BaseSearcher):
                     optimizer_hw.step()
 
                     # Enforce minimal hardware as lower bounds after the update
-                    with torch.no_grad():
-                        self._apply_min_hw_bounds(min_hw, reset=False)
+                    if getattr(self.config, 'APPLY_MIN_HW_BOUNDS', True):
+                        with torch.no_grad():
+                            self._apply_min_hw_bounds(min_hw, reset=False)
 
                     # 计算指标用于记录（避免再次调用 evaluate(flat_params) 造成的二次完整前向）
                     with torch.no_grad():

@@ -67,9 +67,9 @@ if __name__ == "__main__":
     # 添加轻量级测试参数
     parser.add_argument("--num-outer-steps", type=int, default=5, help="Number of outer optimization steps")
     parser.add_argument("--num-mapping-steps", type=int, default=50, help="Number of mapping optimization steps")
-    parser.add_argument("--num-hardware-steps", type=int, default=50, help="Number of hardware optimization steps")
+    parser.add_argument("--num-hardware-steps", type=int, default=100, help="Number of hardware optimization steps")
     parser.add_argument("--lr-mapping", type=float, default=0.01, help="Learning rate for mapping optimization")
-    parser.add_argument("--lr-hardware", type=float, default=0.01, help="Learning rate for hardware optimization")
+    parser.add_argument("--lr-hardware", type=float, default=0.05, help="Learning rate for hardware optimization")
     
     args = parser.parse_args()
     
