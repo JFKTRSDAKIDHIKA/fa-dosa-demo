@@ -64,5 +64,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run fusion-aware vs fusion-unaware ablation experiment")
     parser.add_argument("--model", default="resnet18", help="Model name to evaluate")
     parser.add_argument("--num-trials", type=int, default=100, help="Number of trials per run")
+    # 添加轻量级测试参数
+    parser.add_argument("--num-outer-steps", type=int, default=5, help="Number of outer optimization steps")
+    parser.add_argument("--num-mapping-steps", type=int, default=50, help="Number of mapping optimization steps")
+    parser.add_argument("--num-hardware-steps", type=int, default=50, help="Number of hardware optimization steps")
+    parser.add_argument("--lr-mapping", type=float, default=0.01, help="Learning rate for mapping optimization")
+    parser.add_argument("--lr-hardware", type=float, default=0.01, help="Learning rate for hardware optimization")
+    
     args = parser.parse_args()
-    run_fusion_ablation(model_name=args.model, num_trials=args.num_trials)
+    
+    # 将额外参数传递给run_fusion_ablation
+    run_fusion_ablation(
+        model_name=args.model, 
+        num_trials=args.num_trials,
+        num_outer_steps=args.num_outer_steps,
+        num_mapping_steps=args.num_mapping_steps,
+        num_hardware_steps=args.num_hardware_steps,
+        lr_mapping=args.lr_mapping,
+        lr_hardware=args.lr_hardware
+    )

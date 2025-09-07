@@ -500,6 +500,11 @@ class FADOSASearcher(BaseSearcher):
                         current_params = self._get_params_as_dict()
                         flat_params = self.space.to_flat(current_params)
                         _, metrics = self.evaluate(flat_params)
+                
+                    # 添加缺失的日志记录
+                    if i % 10 == 0:
+                        trial_count += 1
+                        self.log_trial(trial_count, loss.item(), metrics, current_params)
 
                     # 退火温度
                     self.mapping.anneal_tau()
@@ -607,11 +612,28 @@ class FADOSASearcher(BaseSearcher):
                     with torch.no_grad():
                         self._apply_min_hw_bounds(min_hw, reset=False)
 
-                    # 计算指标用于记录
+                    # 计算指标用于记录（避免再次调用 evaluate(flat_params) 造成的二次完整前向）
                     with torch.no_grad():
                         current_params = self._get_params_as_dict()
-                        flat_params = self.space.to_flat(current_params)
-                        _, metrics = self.evaluate(flat_params)
+                        latency2, energy2, area2, mismatch2, compat2 = self.perf_model(
+                            self.graph, self.hw_params, self.mapping, self.fusion_params
+                        )
+                        metrics = {
+                            'latency_sec': latency2.item(),
+                            'energy_pj': energy2.item(),
+                            'area_mm2': area2.item(),
+                            'edp': (latency2 * energy2).item(),
+                            'log_edp': (torch.log(latency2 + 1e-9) + torch.log(energy2 + 1e-9)).item(),
+                            'mismatch_loss': mismatch2.item(),
+                            'pe_penalty': self.hw_params.get_pe_square_penalty().item()
+                        }
+                    
+                    # 添加进度输出
+                    if i % 2 == 0 or i == self.num_hardware_steps - 1:
+                        if self.logger:
+                            self.logger.console(
+                                f"  Hardware Step {i+1}/{self.num_hardware_steps}: Loss={loss.item():.4f}, EDP={metrics['edp']:.2e}, Area={metrics['area_mm2']:.2f}mm²"
+                            )
                 
                 # 更新最佳结果
                 trial_count += 1

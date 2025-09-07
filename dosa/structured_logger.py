@@ -115,7 +115,9 @@ class StructuredLogger:
             elif name == "new_best":
                 metrics = kwargs.get('metrics', {})
                 loss = metrics.get('loss', 0)
-                self.console(f"🎯 New Best Found! Loss: {loss:.4f}")
+                edp = metrics.get('edp', 0)
+                area = metrics.get('area_mm2', 0)
+                self.console(f"🎯 New Best Found! Loss: {loss:.4f}, EDP: {edp:.2e}, Area: {area:.2f}mm²")
     
     def trial(self, step: int, payload: Dict[str, Any]):
         """

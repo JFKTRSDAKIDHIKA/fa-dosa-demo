@@ -4,7 +4,7 @@ from dosa.config import Config
 
 class HardwareParameters(nn.Module):
     """硬件参数，现在支持多级Buffer。"""
-    def __init__(self, initial_num_pes=128.0, initial_l0_kb=2.0, initial_l1_kb=4.0, initial_l2_kb=256.0):
+    def __init__(self, initial_num_pes=4.0, initial_l0_kb=0.1, initial_l1_kb=0.2, initial_l2_kb=1.0):
         super().__init__()
         self.log_num_pes = nn.Parameter(torch.log(torch.tensor(float(initial_num_pes))))
         
