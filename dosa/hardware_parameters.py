@@ -25,18 +25,6 @@ class HardwareParameters(nn.Module):
         
     def get_buffer_size_kb(self, level_name: str):
         return torch.exp(self.log_buffer_sizes_kb[level_name])
-    
-    def get_pe_square_penalty(self) -> torch.Tensor:
-        """计算PE数量的平方惩罚，用于鼓励PE数量为完全平方数
-        
-        Returns:
-            torch.Tensor: PE平方惩罚值
-        """
-        continuous_pes = self.get_num_pes()
-        sqrt_pes = torch.sqrt(continuous_pes)
-        penalty = torch.pow(sqrt_pes - torch.round(sqrt_pes), 2)
-        # 确保返回标量张量
-        return penalty.squeeze() if penalty.dim() > 0 else penalty
         
     def get_area_cost(self) -> torch.Tensor:
         """Calculate total hardware area based on provisioned parameters.
@@ -50,5 +38,5 @@ class HardwareParameters(nn.Module):
         l0_buffer_area = self.get_buffer_size_kb('L0_Registers') * config.AREA_PER_KB_L1_MM2 # Use L1 cost for registers
         l1_buffer_area = self.get_buffer_size_kb('L1_Accumulator') * config.AREA_PER_KB_L1_MM2 # Use L1 cost for accumulators
         l2_buffer_area = self.get_buffer_size_kb('L2_Scratchpad') * config.AREA_PER_KB_L2_MM2
-        
+
         return config.AREA_BASE_MM2 + pe_area + l0_buffer_area + l1_buffer_area + l2_buffer_area

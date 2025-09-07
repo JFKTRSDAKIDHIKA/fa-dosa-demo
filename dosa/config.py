@@ -97,7 +97,7 @@ class Config:
         self.L3_DRAM_EPA_PJ = 128.0
         
         # ========== 优化目标与损失函数权重 ==========
-        self.LOSS_STRATEGY = 'log_edp_plus_area'
+        self.LOSS_STRATEGY = 'pure_edp'
         # Area penalty is disabled by default so that the benefit of larger
         # hardware configurations can be observed. Set ``AREA_WEIGHT`` to a
         # non-zero value to re-enable the penalty.
@@ -111,8 +111,7 @@ class Config:
         self.LOSS_WEIGHTS = {
             'area_weight': self.AREA_WEIGHT,
             'mismatch_penalty_weight': self.MISMATCH_PENALTY_WEIGHT,
-            'pe_penalty_weight_phase_a': 0.1,
-            'pe_penalty_weight_phase_b': 0.01,
+            'compatibility_penalty_weight': self.COMPATIBILITY_PENALTY_WEIGHT,
             'edp_weight': 1.0
         }
         

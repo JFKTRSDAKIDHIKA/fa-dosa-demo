@@ -26,6 +26,10 @@ class BaseSearcher(ABC):
         """
         self.graph = graph
         self.hw_params = hw_params
+        # Number of PEs is now derived from ``min_hw`` and kept fixed during
+        # optimization. Disable gradient updates for this parameter to avoid
+        # treating it as a learnable variable.
+        self.hw_params.log_num_pes.requires_grad = False
         self.mapping = mapping
         self.fusion_params = fusion_params
         self.perf_model = perf_model
@@ -47,8 +51,7 @@ class BaseSearcher(ABC):
         self.loss_weights = getattr(config, 'LOSS_WEIGHTS', {
             'area_weight': getattr(config, 'AREA_WEIGHT', 0.1),
             'mismatch_penalty_weight': getattr(config, 'MISMATCH_PENALTY_WEIGHT', 0.1),
-            'pe_penalty_weight_phase_a': 0.1,
-            'pe_penalty_weight_phase_b': 0.01,
+            'compatibility_penalty_weight': getattr(config, 'COMPATIBILITY_PENALTY_WEIGHT', 100.0),
             'edp_weight': 1.0
         })
     
@@ -80,7 +83,13 @@ class BaseSearcher(ABC):
         
         # 将参数设置到模型中
         self._set_params_from_dict(params_dict)
-        
+
+        # Derive minimal hardware and fix the number of PEs accordingly.
+        # The PE count is treated as a deterministic value from ``min_hw``
+        # instead of a differentiable parameter.
+        min_hw = derive_minimal_hardware(self.mapping, self.config)
+        self._apply_min_hw_bounds(min_hw, reset=True)
+
         # 调用性能模型
         latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
             self.graph, self.hw_params, self.mapping, self.fusion_params
@@ -92,11 +101,8 @@ class BaseSearcher(ABC):
                 decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
             )
         
-        # 计算PE惩罚
-        pe_square_penalty = self.hw_params.get_pe_square_penalty()
-        
         # 使用统一的损失计算方法
-        loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
+        loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty)
         
         # 构建性能指标字典
         metrics = {
@@ -105,13 +111,12 @@ class BaseSearcher(ABC):
             'area_mm2': area.item(),
             'edp': (latency * energy).item(),
             'log_edp': (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
-            'mismatch_loss': mismatch_loss.item(),
-            'pe_penalty': pe_square_penalty.item()
+            'mismatch_loss': mismatch_loss.item()
         }
         
         return loss.item(), metrics
     
-    def _compute_loss(self, latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty):
+    def _compute_loss(self, latency, energy, area, mismatch_loss, compatibility_penalty):
         """
         计算总损失 - 完整复现原始run.py中的损失计算逻辑
         
@@ -120,7 +125,6 @@ class BaseSearcher(ABC):
             energy: 能耗张量
             area: 面积张量
             mismatch_loss: 不匹配损失张量
-            pe_square_penalty: PE平方惩罚张量
             compatibility_penalty: 兼容性惩罚张量
             
         Returns:
@@ -131,7 +135,6 @@ class BaseSearcher(ABC):
         energy = energy.squeeze() if energy.dim() > 0 else energy
         area = area.squeeze() if area.dim() > 0 else area
         mismatch_loss = mismatch_loss.squeeze() if mismatch_loss.dim() > 0 else mismatch_loss
-        pe_square_penalty = pe_square_penalty.squeeze() if pe_square_penalty.dim() > 0 else pe_square_penalty
         compatibility_penalty = compatibility_penalty.squeeze() if compatibility_penalty.dim() > 0 else compatibility_penalty
         
         # 获取兼容性惩罚权重
@@ -144,41 +147,42 @@ class BaseSearcher(ABC):
             edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_loss = self.loss_weights['area_weight'] * area
             mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
-            pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
-            loss = edp_loss + area_loss + mismatch_penalty + pe_penalty + comp_penalty
+            loss = edp_loss + area_loss + mismatch_penalty + comp_penalty
             
         elif self.loss_strategy == 'strategy_B':
             # Strategy B: 加权EDP损失计算
             edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_loss = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
-            pe_penalty = pe_square_penalty * self.loss_weights['pe_penalty_weight_phase_a']
-            loss = (self.loss_weights['edp_weight'] * edp_loss + 
-                   area_loss + mismatch_penalty + pe_penalty + comp_penalty)
+            loss = (self.loss_weights['edp_weight'] * edp_loss +
+                   area_loss + mismatch_penalty + comp_penalty)
             
         elif self.loss_strategy == 'log_edp_plus_area':
             # 标准策略：log(EDP) + 面积惩罚
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty
             
         elif self.loss_strategy == 'edp_plus_area':
             # EDP + 面积惩罚
             edp = latency * energy
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
-            
+            loss = edp + area_penalty + mismatch_penalty + comp_penalty
+
+        elif self.loss_strategy == 'pure_edp':
+            # Pure EDP optimisation without area or PE penalties
+            edp = latency * energy
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+            loss = edp + mismatch_penalty + comp_penalty
+
         else:
             # 默认策略：与log_edp_plus_area相同
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            pe_penalty = pe_square_penalty * self.loss_weights.get('pe_penalty_weight_phase_a', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + pe_penalty + comp_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty
         
         # 确保返回标量张量
         return loss.squeeze() if loss.dim() > 0 else loss
@@ -214,14 +218,7 @@ class BaseSearcher(ABC):
         Args:
             params: 包含所有参数的扁平化字典
         """
-        # 设置硬件参数
-        if 'num_pes' in params:
-            # 确保num_pes是平方数
-            sqrt_pes = int(np.sqrt(params['num_pes']))
-            actual_pes = sqrt_pes * sqrt_pes
-            device = self.hw_params.log_num_pes.device
-            self.hw_params.log_num_pes.data = torch.log(torch.tensor(float(actual_pes), device=device))
-        
+        # 设置硬件参数（PE数量固定为min_hw推导值，不再从参数设置）
         for level in ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad']:
             key = f'{level.lower()}_size_kb'
             if key in params:
@@ -319,27 +316,28 @@ class BaseSearcher(ABC):
             is_best: 是否为最佳结果
         """
         if self.logger:
-             trial_data = {
-                 'searcher_type': self.__class__.__name__,
-                 'loss': loss,
-                 'metrics': {
+            num_pes_val = params.get('num_pes', self.hw_params.get_projected_num_pes().item())
+            trial_data = {
+                'searcher_type': self.__class__.__name__,
+                'loss': loss,
+                'metrics': {
                     'loss': loss,
                     'edp': metrics['edp'],
                     'latency_sec': metrics['latency_sec'],
                     'energy_pj': metrics['energy_pj'],
                     'area_mm2': metrics['area_mm2']
                 },
-                 'hardware_params': {
-                     'num_pes': params.get('num_pes', 0),
-                     'l0_size_kb': params.get('l0_registers_size_kb', 0),
-                     'l1_size_kb': params.get('l1_accumulator_size_kb', 0),
-                     'l2_size_kb': params.get('l2_scratchpad_size_kb', 0)
-                 },
-                 'fusion_decisions': self.fusion_params.get_fusion_decisions_serializable(self.graph),
-                 'best_so_far': is_best if is_best is not None else (loss <= self.best_loss)
-             }
-             
-             self.logger.trial(trial, trial_data)
+                'hardware_params': {
+                    'num_pes': num_pes_val,
+                    'l0_size_kb': params.get('l0_registers_size_kb', 0),
+                    'l1_size_kb': params.get('l1_accumulator_size_kb', 0),
+                    'l2_size_kb': params.get('l2_scratchpad_size_kb', 0)
+                },
+                'fusion_decisions': self.fusion_params.get_fusion_decisions_serializable(self.graph),
+                'best_so_far': is_best if is_best is not None else (loss <= self.best_loss)
+            }
+
+            self.logger.trial(trial, trial_data)
         
         # ------ Recorder 集成 ------
         if self.recorder is not None:
@@ -455,11 +453,8 @@ class FADOSASearcher(BaseSearcher):
                             decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
                         )
 
-                    # 计算PE惩罚
-                    pe_square_penalty = self.hw_params.get_pe_square_penalty()
-
                     # 使用统一的损失计算方法
-                    loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty)
 
                     # 反向传播
                     loss.backward()
@@ -529,11 +524,10 @@ class FADOSASearcher(BaseSearcher):
             # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
-                if getattr(self.config, 'APPLY_MIN_HW_BOUNDS', True):
-                    # Optionally reset to minimal hardware or simply enforce as lower bound
-                    self._apply_min_hw_bounds(
-                        min_hw, reset=getattr(self.config, 'RESET_TO_MIN_HW', True)
-                    )
+                # Always reset hardware to the minimal configuration derived
+                # from the current mapping. The number of PEs is therefore
+                # deterministically determined by ``min_hw``.
+                self._apply_min_hw_bounds(min_hw, reset=True)
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
@@ -566,11 +560,8 @@ class FADOSASearcher(BaseSearcher):
                             decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
                         )
 
-                    # 计算PE惩罚
-                    pe_square_penalty = self.hw_params.get_pe_square_penalty()
-
                     # 使用统一的损失计算方法
-                    loss = self._compute_loss(latency, energy, area, mismatch_loss, pe_square_penalty, compatibility_penalty)
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty)
 
                     # 反向传播
                     loss.backward()
@@ -612,9 +603,8 @@ class FADOSASearcher(BaseSearcher):
                     optimizer_hw.step()
 
                     # Enforce minimal hardware as lower bounds after the update
-                    if getattr(self.config, 'APPLY_MIN_HW_BOUNDS', True):
-                        with torch.no_grad():
-                            self._apply_min_hw_bounds(min_hw, reset=False)
+                    with torch.no_grad():
+                        self._apply_min_hw_bounds(min_hw, reset=False)
 
                     # 计算指标用于记录（避免再次调用 evaluate(flat_params) 造成的二次完整前向）
                     with torch.no_grad():
@@ -628,8 +618,7 @@ class FADOSASearcher(BaseSearcher):
                             'area_mm2': area2.item(),
                             'edp': (latency2 * energy2).item(),
                             'log_edp': (torch.log(latency2 + 1e-9) + torch.log(energy2 + 1e-9)).item(),
-                            'mismatch_loss': mismatch2.item(),
-                            'pe_penalty': self.hw_params.get_pe_square_penalty().item()
+                            'mismatch_loss': mismatch2.item()
                         }
                     
                     # 添加进度输出

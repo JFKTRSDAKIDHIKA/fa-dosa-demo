@@ -41,14 +41,6 @@ class SearchSpace:
         """
         添加硬件参数维度 - 扩大搜索范围
         """
-        # 大幅扩大PE数量范围
-        self.dimensions.append({
-            'name': 'num_pes',
-            'type': 'integer_square',
-            'range': (2, 64),  # sqrt范围，实际PE数量为4-4096
-            'description': 'Number of PEs (will be squared)'
-        })
-        
         # 大幅扩大Buffer大小范围
         buffer_configs = [
             ('l0_registers_size_kb', (0.05, 50.0)),     # 0.05KB-50KB
