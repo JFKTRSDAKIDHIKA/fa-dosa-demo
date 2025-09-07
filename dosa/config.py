@@ -157,7 +157,7 @@ class Config:
         # If True, hardware parameters are reset to the minimal configuration
         # derived from the current mapping before Phase B. If False, the
         # minimal hardware only serves as a lower bound constraint.
-        self.RESET_TO_MIN_HW = True
+        self.RESET_TO_MIN_HW = False
     
     @classmethod
     def get_instance(cls):
