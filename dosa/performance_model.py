@@ -1135,7 +1135,143 @@ class HighFidelityPerformanceModel(nn.Module):
         zero = torch.tensor(0.0, device=self.config.DEVICE)
         return latency.squeeze(), energy.squeeze(), area_cost, zero, partial_penalty
 
-    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping, direct_mapping_table: dict = None, debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _evaluate_single_layer(self, layer_name: str, graph, hw_params: HardwareParameters,
+                               mapping: FineGrainedMapping, all_factors: dict,
+                               debug_data: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate a single layer using the high fidelity model."""
+        from dosa.utils import calculate_macs
+
+        layer = graph.layers[layer_name]
+        total_macs = calculate_macs(layer['dims'])
+        num_pes = hw_params.get_projected_num_pes()
+
+        # 计算实际利用的PE数量
+        utilized_pes = torch.tensor(1.0, device=self.config.DEVICE)
+        for dim_name, dim_mapping in all_factors.items():
+            for level_name, level_factors in dim_mapping.items():
+                if 'spatial' in level_factors:
+                    spatial_factor = level_factors['spatial']
+                    if not isinstance(spatial_factor, torch.Tensor):
+                        spatial_factor = torch.tensor(float(spatial_factor), device=self.config.DEVICE)
+                    utilized_pes *= spatial_factor
+
+        effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
+        compute_cycles = total_macs / effective_pes
+
+        detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(
+            layer['dims'], all_factors, num_pes, hw_params, debug_data)
+        detailed_writeback_traffic_info = self.calculate_inter_level_writeback_traffic(
+            layer['dims'], all_factors, num_pes, debug_data)
+
+        memory_cycles_list = []
+        for interface, interface_info in detailed_fill_traffic_info.items():
+            upper_level_name = interface.split('_to_')[0]
+            fill_bytes_total = interface_info['total_bytes']
+            bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(upper_level_name, num_pes, self.config)
+            memory_cycles = fill_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
+            memory_cycles_list.append(memory_cycles)
+
+        for interface, interface_info in detailed_writeback_traffic_info.items():
+            lower_level_name = interface.split('_to_')[0]
+            writeback_bytes_total = interface_info['total_bytes']
+            bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(lower_level_name, num_pes, self.config)
+            memory_cycles = writeback_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
+            memory_cycles_list.append(memory_cycles)
+
+        if memory_cycles_list:
+            bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
+        else:
+            bottleneck_memory_cycles = torch.tensor(0.0, device=self.config.DEVICE)
+
+        stall_cycles = torch.relu(bottleneck_memory_cycles - compute_cycles)
+        total_cycles = compute_cycles + stall_cycles
+        latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
+
+        # 能耗计算
+        energy = torch.tensor(0.0, device=self.config.DEVICE)
+        energy_compute = total_macs * self.config.PE_MAC_EPA_PJ
+        energy += energy_compute
+
+        energy_fill = torch.tensor(0.0, device=self.config.DEVICE)
+        for interface, interface_info in detailed_fill_traffic_info.items():
+            lower_level_name = interface.split('_to_')[1]
+            fill_bytes = interface_info['total_bytes']
+            fill_words = fill_bytes / self.config.BYTES_PER_ELEMENT
+            if lower_level_name == 'L0_Registers':
+                epa = self.config.L0_REG_BASE_EPA_PJ
+            elif lower_level_name == 'L1_Accumulator':
+                size_kb = hw_params.get_buffer_size_kb(lower_level_name)
+                num_pes_sqrt = torch.sqrt(num_pes)
+                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+            elif lower_level_name == 'L2_Scratchpad':
+                size_kb = hw_params.get_buffer_size_kb(lower_level_name)
+                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+            elif lower_level_name == 'L3_DRAM':
+                epa = self.config.L3_DRAM_EPA_PJ
+            else:
+                epa = torch.tensor(0.0, device=self.config.DEVICE)
+            energy_fill += fill_words * epa
+
+        energy_writeback = torch.tensor(0.0, device=self.config.DEVICE)
+        for interface, interface_info in detailed_writeback_traffic_info.items():
+            upper_level_name = interface.split('_to_')[1]
+            writeback_bytes = interface_info['total_bytes']
+            writeback_words = writeback_bytes / self.config.BYTES_PER_ELEMENT
+            if upper_level_name == 'L0_Registers':
+                epa = self.config.L0_REG_BASE_EPA_PJ
+            elif upper_level_name == 'L1_Accumulator':
+                size_kb = hw_params.get_buffer_size_kb(upper_level_name)
+                num_pes_sqrt = torch.sqrt(num_pes)
+                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+            elif upper_level_name == 'L2_Scratchpad':
+                size_kb = hw_params.get_buffer_size_kb(upper_level_name)
+                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+            elif upper_level_name == 'L3_DRAM':
+                epa = self.config.L3_DRAM_EPA_PJ
+            else:
+                epa = torch.tensor(0.0, device=self.config.DEVICE)
+            energy_writeback += writeback_words * epa
+
+        energy_inter_level = energy_fill + energy_writeback
+        energy += energy_inter_level
+
+        energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
+        intra_level_consumption_accesses = self.calculate_intra_level_consumption_accesses(
+            layer['dims'], all_factors, num_pes, debug_data)
+        for level_name, tensors in intra_level_consumption_accesses.items():
+            if level_name == 'L0_Registers':
+                epa = self.config.L0_REG_BASE_EPA_PJ
+            elif level_name == 'L1_Accumulator':
+                size_kb = hw_params.get_buffer_size_kb(level_name)
+                num_pes_sqrt = torch.sqrt(num_pes)
+                epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
+            elif level_name == 'L2_Scratchpad':
+                size_kb = hw_params.get_buffer_size_kb(level_name)
+                epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
+            elif level_name == 'L3_DRAM':
+                epa = self.config.L3_DRAM_EPA_PJ
+            else:
+                epa = torch.tensor(0.0, device=self.config.DEVICE)
+            for tensor_type, operations in tensors.items():
+                for op_type, count in operations.items():
+                    energy_intra_level += count * epa
+
+        energy += energy_intra_level
+
+        buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
+        for i, level in enumerate(self.config.MEMORY_HIERARCHY):
+            if level['type'] == 'buffer':
+                required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
+                available_kb = hw_params.get_buffer_size_kb(level['name'])
+                buffer_deficit = torch.relu(required_kb - available_kb)
+                relative_deficit = buffer_deficit / (required_kb + 1e-9)
+                buffer_mismatch_loss += torch.pow(relative_deficit, 2)
+
+        return latency, energy, buffer_mismatch_loss
+
+    def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping,
+                fusion_params: nn.Module = None, direct_mapping_table: dict = None,
+                debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         高保真度性能模型的前向传播方法 - 实现完整的PPA计算逻辑。
         
@@ -1173,261 +1309,71 @@ class HighFidelityPerformanceModel(nn.Module):
         else:
             all_factors = mapping.get_all_factors()
 
-        # 根据是否启用融合感知决定计算组
-        if self.fusion_aware:
+        num_pes = hw_params.get_projected_num_pes()
+
+        if self.fusion_aware and fusion_params is not None:
+            fusion_probs = torch.sigmoid(fusion_params.fusion_logits.squeeze())
             fusion_groups = graph.fusion_groups
+            if debug_data is not None:
+                decisions = (fusion_probs > 0.5).detach().cpu().tolist()
+                debug_data["fusion_decisions"] = decisions
         else:
-            fusion_groups = [[layer_name] for group in graph.fusion_groups for layer_name in group]
+            fusion_probs = torch.ones(len(graph.fusion_groups), device=self.config.DEVICE)
+            fusion_groups = [[layer_name] for group in graph.fusion_groups for layer_name in group] if not self.fusion_aware else graph.fusion_groups
 
-        # 以计算组为单位进行PPA计算
-        for group in fusion_groups:
+        for idx, group in enumerate(fusion_groups):
+            weight = fusion_probs[idx] if self.fusion_aware and fusion_params is not None else torch.tensor(1.0, device=self.config.DEVICE)
+            fused_latency = torch.tensor(0.0, device=self.config.DEVICE)
+            fused_energy = torch.tensor(0.0, device=self.config.DEVICE)
+            fused_mismatch = torch.tensor(0.0, device=self.config.DEVICE)
+            fused_comp = torch.tensor(0.0, device=self.config.DEVICE)
+
+            split_latency = torch.tensor(0.0, device=self.config.DEVICE)
+            split_energy = torch.tensor(0.0, device=self.config.DEVICE)
+            split_mismatch = torch.tensor(0.0, device=self.config.DEVICE)
+            split_comp = torch.tensor(0.0, device=self.config.DEVICE)
+
             current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
-            dmt_model = self.dmt_registry.get(current_pattern) if self.fusion_aware else None
-
-            if dmt_model:
-                # 使用DMT处理融合模式
-                latency, energy, group_buffer_mismatch_loss, compatibility_penalty, detailed_metrics = dmt_model(group, graph, hw_params, mapping, self.config)
-                total_buffer_mismatch_loss += group_buffer_mismatch_loss
-                total_compatibility_penalty += compatibility_penalty
+            dmt_model = self.dmt_registry.get(current_pattern) if (self.fusion_aware and fusion_params is not None) else None
+            if dmt_model is not None:
+                fused_latency, fused_energy, fused_mismatch, fused_comp, _ = dmt_model(group, graph, hw_params, mapping, self.config)
             else:
-                # 单层计算：实现完整的PPA计算逻辑
-                layer_name = group[0]
-                layer = graph.layers[layer_name]
-                
-                # 导入必要的工具函数
-                from dosa.utils import calculate_macs
-                
-                # 基础参数计算
-                total_macs = calculate_macs(layer['dims'])
-                num_pes = hw_params.get_projected_num_pes()
-                
-                # ===== 2.1 时延模型实现 (屋顶线模型 - 公式12) =====
-                
-                # 步骤1: 计算实际利用的PE数量 (utilized_pes)
-                utilized_pes = torch.tensor(1.0, device=self.config.DEVICE)
-                
-                # 从 all_factors 中提取所有 spatial 因子并累乘
-                for dim_name, dim_mapping in all_factors.items():
-                    for level_name, level_factors in dim_mapping.items():
-                        if 'spatial' in level_factors:
-                            spatial_factor = level_factors['spatial']
-                            # 确保 spatial_factor 是张量类型
-                            if not isinstance(spatial_factor, torch.Tensor):
-                                spatial_factor = torch.tensor(float(spatial_factor), device=self.config.DEVICE)
-                            utilized_pes *= spatial_factor
-                
-                # 边界条件检查：确保 utilized_pes 至少为 1，防止除以零错误
-                effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
-                
-                # 步骤2: 计算Compute_Cycles (使用实际利用的PE数量)
-                compute_cycles = total_macs / effective_pes
-                
-                # 步骤3: 计算Memory_Cycles（基于双向跨层级数据流量）
-                # 分别调用填充和写回流量计算引擎
-                detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(layer['dims'], all_factors, num_pes, hw_params, debug_data)
-                detailed_writeback_traffic_info = self.calculate_inter_level_writeback_traffic(layer['dims'], all_factors, num_pes, debug_data)
-                
-                memory_cycles_list = []
-                for interface, interface_info in detailed_fill_traffic_info.items():
-                    upper_level_name = interface.split('_to_')[0]
-                    
-                    # 从详细信息中提取总流量
-                    fill_bytes_total = interface_info['total_bytes']
-                    
-                    # 计算该接口的带宽（bytes/cycle）
-                    bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(upper_level_name, num_pes, self.config)
-                    
-                    # 计算该接口的内存周期数（仅基于填充流量）
-                    memory_cycles = fill_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
-                    memory_cycles_list.append(memory_cycles)
-                    
-                    # 收集增强的内存接口分析数据
-                    if debug_data is not None:
-                        debug_data["memory_interface_analysis"][interface] = {
-                            "fill_bytes_total": fill_bytes_total,
-                            "bandwidth_bytes_per_cycle": bandwidth_bytes_per_cycle.detach().cpu().item() if isinstance(bandwidth_bytes_per_cycle, torch.Tensor) else bandwidth_bytes_per_cycle,
-                            "memory_cycles": memory_cycles.detach().cpu().item() if isinstance(memory_cycles, torch.Tensor) else memory_cycles,
-                            "fill_bytes_breakdown": interface_info['breakdown'],
-                            "traffic_drivers": interface_info['drivers']
-                        }
-                
-                # 处理写回流量的内存周期计算
-                for interface, interface_info in detailed_writeback_traffic_info.items():
-                    lower_level_name = interface.split('_to_')[0]  # 对于写回，源层级是下层
-                    
-                    # 从详细信息中提取总流量
-                    writeback_bytes_total = interface_info['total_bytes']
-                    
-                    # 计算该接口的带宽（bytes/cycle）- 使用源层级的带宽
-                    bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(lower_level_name, num_pes, self.config)
-                    
-                    # 计算该接口的内存周期数（基于写回流量）
-                    memory_cycles = writeback_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
-                    memory_cycles_list.append(memory_cycles)
-                    
-                    # 收集写回流量的内存接口分析数据
-                    if debug_data is not None:
-                        debug_data["memory_interface_analysis"][interface] = {
-                            "writeback_bytes_total": writeback_bytes_total,
-                            "bandwidth_bytes_per_cycle": bandwidth_bytes_per_cycle.detach().cpu().item() if isinstance(bandwidth_bytes_per_cycle, torch.Tensor) else bandwidth_bytes_per_cycle,
-                            "memory_cycles": memory_cycles.detach().cpu().item() if isinstance(memory_cycles, torch.Tensor) else memory_cycles,
-                            "writeback_bytes_breakdown": interface_info['breakdown'],
-                            "traffic_drivers": interface_info['drivers']
-                        }
-                
+                for layer_name in group:
+                    lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
+                    fused_latency += lat
+                    fused_energy += en
+                    fused_mismatch += mismatch
 
-                
-                # 步骤4: 确定瓶颈并计算总延迟
-                if memory_cycles_list:
-                    bottleneck_memory_cycles = torch.max(torch.stack(memory_cycles_list))
-                else:
-                    bottleneck_memory_cycles = torch.tensor(0.0, device=self.config.DEVICE)
-                
-                # 计算停滞周期
-                stall_cycles = torch.relu(bottleneck_memory_cycles - compute_cycles)
-                
-                # 计算总周期数和延迟
-                total_cycles = compute_cycles + stall_cycles
-                latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
-                
-                # 收集计算总结数据
-                if debug_data is not None:
-                    debug_data["calculation_summary"] = {
-                        "total_macs": total_macs.detach().cpu().item() if isinstance(total_macs, torch.Tensor) else total_macs,
-                        "utilized_pes": utilized_pes.detach().cpu().item() if isinstance(utilized_pes, torch.Tensor) else utilized_pes,
-                        "effective_pes": effective_pes.detach().cpu().item() if isinstance(effective_pes, torch.Tensor) else effective_pes,
-                        "compute_cycles": compute_cycles.detach().cpu().item() if isinstance(compute_cycles, torch.Tensor) else compute_cycles,
-                        "bottleneck_memory_cycles": bottleneck_memory_cycles.detach().cpu().item() if isinstance(bottleneck_memory_cycles, torch.Tensor) else bottleneck_memory_cycles,
-                        "stall_cycles": stall_cycles.detach().cpu().item() if isinstance(stall_cycles, torch.Tensor) else stall_cycles,
-                        "total_cycles": total_cycles.detach().cpu().item() if isinstance(total_cycles, torch.Tensor) else total_cycles,
-                        "final_latency_s": latency.detach().cpu().item() if isinstance(latency, torch.Tensor) else latency
-                    }
-                
-                # ===== 2.2 能耗模型实现 (三段式成本核算 - 公式13) =====
-                
-                energy = torch.tensor(0.0, device=self.config.DEVICE)
-                
-                # 步骤1: 计算Compute_Energy
-                energy_compute = total_macs * self.config.PE_MAC_EPA_PJ
-                energy += energy_compute
-                
-                # 步骤2: 计算Inter-level_Energy (双向层间数据流能耗)
-                energy_inter_level = torch.tensor(0.0, device=self.config.DEVICE)
-                
-                # 步骤2.1: 计算填充能耗 (下行车道: W和I张量)
-                energy_fill = torch.tensor(0.0, device=self.config.DEVICE)
-                for interface, interface_info in detailed_fill_traffic_info.items():
-                    lower_level_name = interface.split('_to_')[1]  # 目的地层级
-                    fill_bytes = interface_info['total_bytes']
-                    fill_words = fill_bytes / self.config.BYTES_PER_ELEMENT
-                    
-                    # 根据目的地层级查找对应的EPA模型
-                    if lower_level_name == 'L0_Registers':
-                        epa = self.config.L0_REG_BASE_EPA_PJ
-                    elif lower_level_name == 'L1_Accumulator':
-                        size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        num_pes_sqrt = torch.sqrt(num_pes)
-                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                    elif lower_level_name == 'L2_Scratchpad':
-                        size_kb = hw_params.get_buffer_size_kb(lower_level_name)
-                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                    elif lower_level_name == 'L3_DRAM':
-                        epa = self.config.L3_DRAM_EPA_PJ
-                    else:
-                        epa = torch.tensor(0.0, device=self.config.DEVICE)
-                    
-                    energy_fill += fill_words * epa
-                
-                # 步骤2.2: 计算写回能耗 (上行车道: O张量)
-                energy_writeback = torch.tensor(0.0, device=self.config.DEVICE)
-                for interface, interface_info in detailed_writeback_traffic_info.items():
-                    upper_level_name = interface.split('_to_')[1]  # 目的地层级（上层存储）
-                    writeback_bytes = interface_info['total_bytes']
-                    writeback_words = writeback_bytes / self.config.BYTES_PER_ELEMENT
-                    
-                    # 根据目的地层级（上层存储）查找对应的EPA模型
-                    if upper_level_name == 'L0_Registers':
-                        epa = self.config.L0_REG_BASE_EPA_PJ
-                    elif upper_level_name == 'L1_Accumulator':
-                        size_kb = hw_params.get_buffer_size_kb(upper_level_name)
-                        num_pes_sqrt = torch.sqrt(num_pes)
-                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                    elif upper_level_name == 'L2_Scratchpad':
-                        size_kb = hw_params.get_buffer_size_kb(upper_level_name)
-                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                    elif upper_level_name == 'L3_DRAM':
-                        epa = self.config.L3_DRAM_EPA_PJ
-                    else:
-                        epa = torch.tensor(0.0, device=self.config.DEVICE)
-                    
-                    energy_writeback += writeback_words * epa
-                
-                # 汇总双向层间能耗
-                energy_inter_level = energy_fill + energy_writeback
-                energy += energy_inter_level
-                
-                # 步骤3: 计算Intra-level_Energy (层级内部消耗能耗)
-                energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
-                
-                # 调用层级内部消耗访问计算引擎
-                intra_level_consumption_accesses = self.calculate_intra_level_consumption_accesses(layer['dims'], all_factors, num_pes, debug_data)
-                
-                for level_name, tensors in intra_level_consumption_accesses.items():
-                    # 根据层级名称获取对应的EPA
-                    if level_name == 'L0_Registers':
-                        epa = self.config.L0_REG_BASE_EPA_PJ
-                    elif level_name == 'L1_Accumulator':
-                        size_kb = hw_params.get_buffer_size_kb(level_name)
-                        num_pes_sqrt = torch.sqrt(num_pes)
-                        epa = self.config.L1_ACCUM_BASE_EPA_PJ + self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt)
-                    elif level_name == 'L2_Scratchpad':
-                        size_kb = hw_params.get_buffer_size_kb(level_name)
-                        epa = self.config.L2_SPM_BASE_EPA_PJ + self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb
-                    elif level_name == 'L3_DRAM':
-                        epa = self.config.L3_DRAM_EPA_PJ
-                    else:
-                        epa = torch.tensor(0.0, device=self.config.DEVICE)
-                    
-                    # 累加该层级所有张量的所有操作的能耗
-                    for tensor_type, operations in tensors.items():
-                        for op_type, count in operations.items():
-                            energy_intra_level += count * epa
-                
-                energy += energy_intra_level
-                
-                # ===== 2.3 面积模型与其他损失项 =====
-                
-                # 计算缓冲区不匹配损失
-                for i, level in enumerate(self.config.MEMORY_HIERARCHY):
-                    if level['type'] == 'buffer':
-                        required_kb = self.calculate_buffer_req_kb(layer['dims'], all_factors, i)
-                        available_kb = hw_params.get_buffer_size_kb(level['name'])
-                        buffer_deficit = torch.relu(required_kb - available_kb)
-                        # Compute relative deficit to avoid overly penalizing small mismatches
-                        relative_deficit = buffer_deficit / (required_kb + 1e-9)
-                        level_mismatch_loss = torch.pow(relative_deficit, 2)
-                        total_buffer_mismatch_loss += level_mismatch_loss
+            for layer_name in group:
+                lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
+                split_latency += lat
+                split_energy += en
+                split_mismatch += mismatch
+
+            latency = weight * fused_latency + (1 - weight) * split_latency
+            energy = weight * fused_energy + (1 - weight) * split_energy
+            group_buffer_mismatch_loss = weight * fused_mismatch + (1 - weight) * split_mismatch
+            compatibility_penalty = weight * fused_comp + (1 - weight) * split_comp
 
             total_latency += latency
             total_energy += energy
+            total_buffer_mismatch_loss += group_buffer_mismatch_loss
+            total_compatibility_penalty += compatibility_penalty
 
-        # 面积成本
         area_cost = hw_params.get_area_cost()
-        
-        # 写入调试数据到JSON文件
+
         if debug_data is not None and debug_output_path is not None:
             import json
             with torch.no_grad():
                 with open(debug_output_path, 'w', encoding='utf-8') as f:
                     json.dump(debug_data, f, indent=4, ensure_ascii=False)
-        
-        # 确保所有返回值都是标量张量
+
         total_latency = total_latency.squeeze() if total_latency.dim() > 0 else total_latency
         total_energy = total_energy.squeeze() if total_energy.dim() > 0 else total_energy
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
         total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
-        
+
         return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):

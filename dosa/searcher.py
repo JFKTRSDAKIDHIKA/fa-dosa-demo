@@ -83,8 +83,14 @@ class BaseSearcher(ABC):
         
         # 调用性能模型
         latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
-            self.graph, self.hw_params, self.mapping
+            self.graph, self.hw_params, self.mapping, self.fusion_params
         )
+
+        if self.logger is not None:
+            self.logger.event(
+                "fusion_decisions",
+                decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
+            )
         
         # 计算PE惩罚
         pe_square_penalty = self.hw_params.get_pe_square_penalty()
@@ -440,8 +446,14 @@ class FADOSASearcher(BaseSearcher):
 
                     # 直接计算损失（保持梯度图）
                     latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
-                        self.graph, self.hw_params, self.mapping
+                        self.graph, self.hw_params, self.mapping, self.fusion_params
                     )
+
+                    if self.logger is not None:
+                        self.logger.event(
+                            "fusion_decisions",
+                            decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
+                        )
 
                     # 计算PE惩罚
                     pe_square_penalty = self.hw_params.get_pe_square_penalty()
@@ -537,8 +549,14 @@ class FADOSASearcher(BaseSearcher):
 
                     # 直接计算损失（保持梯度图）
                     latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
-                        self.graph, self.hw_params, self.mapping
+                        self.graph, self.hw_params, self.mapping, self.fusion_params
                     )
+
+                    if self.logger is not None:
+                        self.logger.event(
+                            "fusion_decisions",
+                            decisions=self.fusion_params.get_fusion_decisions_serializable(self.graph),
+                        )
 
                     # 计算PE惩罚
                     pe_square_penalty = self.hw_params.get_pe_square_penalty()
