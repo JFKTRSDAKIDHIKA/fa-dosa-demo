@@ -15,7 +15,7 @@ from pathlib import Path
 # 添加项目根目录到Python路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from experiments.act1 import run_baseline_experiment
+from experiments.act1 import run_act1 as run_baseline_experiment
 from experiments.pareto_analysis import ParetoAnalyzer
 
 
@@ -41,10 +41,10 @@ def create_pareto_config(base_config: dict = None, num_trials: int = 30) -> dict
             "workload": base_config.get("workload", "resnet18"),
             "device": base_config.get("device", "cuda:0"),
             "num_trials": num_trials,
-            "output_dir": base_config.get("output_dir", "output")
+            "output_dir": base_config.get("output_dir", "output"),
+            "seeds": [42]  # 移动seeds到shared中
         },
-        "baselines": ["pareto_frontier"],
-        "seeds": [42]  # 使用单个种子以保持一致性
+        "baselines": ["pareto_frontier"]
     }
     
     return config
@@ -93,7 +93,10 @@ def run_pareto_experiment(workload: str = "resnet18",
     # 运行实验
     print("\n开始运行帕累托前沿扫描...")
     try:
-        run_baseline_experiment(config)
+        # 将config字典转换为YAML字符串，然后再传递
+        import yaml
+        config_str = yaml.dump(config)
+        run_baseline_experiment(config_str)
         print("\n实验完成！")
         return output_dir
     except Exception as e:

@@ -200,11 +200,23 @@ class ParetoFrontierRunner(_BaseSearchRunner):
     def __init__(self, name: str = "ParetoFrontier") -> None:
         super().__init__(name)
         # Define area weight sweep range for Pareto frontier
-        self.area_weights = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+        # Use class attribute if set, otherwise use default
+        if hasattr(self.__class__, '_test_area_weights'):
+            self.area_weights = self.__class__._test_area_weights
+        else:
+            self.area_weights = [0.0, 0.1, 0.5, 2.0, 10.0]
         self.pareto_results = []
+        self.last_best_params = None  # Store best params from previous run
     
     def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
-        """Apply constraints similar to CooptRunner."""
+        """Apply constraints, starting from last best parameters if available."""
+        if self.last_best_params:
+            print("Loading parameters from previous best run.")
+            hw_params.load_state_dict(self.last_best_params["hw"])
+            mapping.load_state_dict(self.last_best_params["mapping"])
+            fusion_params.load_state_dict(self.last_best_params["fusion"])
+            return
+
         device = hw_params.log_num_pes.device
         with torch.no_grad():
             # Set initial hardware scale
@@ -248,6 +260,13 @@ class ParetoFrontierRunner(_BaseSearchRunner):
             # Run search for this weight point
             num_trials = cfg["shared"].get("num_trials", 30)
             searcher.search(num_trials)
+
+            # Store the best parameters for the next run
+            self.last_best_params = {
+                "hw": copy.deepcopy(searcher.hw_params.state_dict()),
+                "mapping": copy.deepcopy(searcher.mapping.state_dict()),
+                "fusion": copy.deepcopy(searcher.fusion_params.state_dict()),
+            }
             
             # Store result with area weight info
             pareto_point = {

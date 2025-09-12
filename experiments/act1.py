@@ -27,12 +27,15 @@ def run_act1(cfg_path: str | Path | None = None) -> None:  # noqa: D401
     Args:
         cfg_path: Path to YAML configuration. If *None*, fallbacks to default sample.
     """
-    cfg_path = Path(cfg_path or DEFAULT_CFG_PATH)
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    if isinstance(cfg_path, str):
+        cfg: dict[str, Any] = yaml.safe_load(cfg_path)
+    else:
+        cfg_path = Path(cfg_path or DEFAULT_CFG_PATH)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Config file not found: {cfg_path}")
 
-    with cfg_path.open("r", encoding="utf-8") as fp:
-        cfg: dict[str, Any] = yaml.safe_load(fp)
+        with cfg_path.open("r", encoding="utf-8") as fp:
+            cfg: dict[str, Any] = yaml.safe_load(fp)
 
     # Lazy import to avoid circular dependency before skeletons are complete
     baselines_mod = importlib.import_module("experiments.baselines")

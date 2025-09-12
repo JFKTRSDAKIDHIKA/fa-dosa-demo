@@ -88,7 +88,7 @@ class BaseSearcher(ABC):
         # The PE count is treated as a deterministic value from ``min_hw``
         # instead of a differentiable parameter.
         min_hw = derive_minimal_hardware(self.mapping, self.config)
-        self._apply_min_hw_bounds(min_hw, reset=True)
+        self._apply_min_hw_bounds(min_hw, reset=False)
 
         # 调用性能模型
         latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
@@ -534,10 +534,11 @@ class FADOSASearcher(BaseSearcher):
             # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
-                # Always reset hardware to the minimal configuration derived
-                # from the current mapping. The number of PEs is therefore
-                # deterministically determined by ``min_hw``.
-                self._apply_min_hw_bounds(min_hw, reset=True)
+                # Apply minimal hardware bounds only if configured to do so
+                if self.config.APPLY_MIN_HW_BOUNDS:
+                    # Reset hardware to the minimal configuration if configured to do so.
+                    # The number of PEs is deterministically determined by ``min_hw`` when reset=True.
+                    self._apply_min_hw_bounds(min_hw, reset=self.config.RESET_TO_MIN_HW)
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
