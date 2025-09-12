@@ -378,6 +378,16 @@ class FADOSASearcher(BaseSearcher):
         self.lr_mapping = getattr(config, 'LR_MAPPING', 0.01)
         self.lr_hardware = getattr(config, 'LR_HARDWARE', 0.01)
     
+    def update_loss_weights(self, new_weights: dict):
+        """Update loss weights dynamically for Pareto frontier scanning.
+        
+        Args:
+            new_weights: Dictionary containing new weight values
+        """
+        self.loss_weights.update(new_weights)
+        if self.logger:
+            self.logger.console(f"Updated loss weights: {self.loss_weights}")
+    
     def search(self, num_trials: int) -> Dict[str, Any]:
         """
         执行FA-DOSA的交替优化搜索

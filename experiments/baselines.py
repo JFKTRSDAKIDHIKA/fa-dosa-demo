@@ -194,6 +194,76 @@ class CooptRunner(_BaseSearchRunner):
                 fusion_params.fusion_logits.data = torch.zeros_like(fusion_params.fusion_logits)
 
 
+class ParetoFrontierRunner(_BaseSearchRunner):
+    """Pareto Frontier Runner: Scans the area-performance trade-off space by varying loss weights."""
+    
+    def __init__(self, name: str = "ParetoFrontier") -> None:
+        super().__init__(name)
+        # Define area weight sweep range for Pareto frontier
+        self.area_weights = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+        self.pareto_results = []
+    
+    def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        """Apply constraints similar to CooptRunner."""
+        device = hw_params.log_num_pes.device
+        with torch.no_grad():
+            # Set initial hardware scale
+            hw_params.log_num_pes.data = torch.log(torch.tensor(256.0, device=device))
+            hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(4.0, device=device))
+            hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(16.0, device=device))
+            hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(512.0, device=device))
+            
+            # Initialize mapping factors to a reasonable baseline
+            for level_factors in mapping.factors.values():
+                for dim_dict in level_factors.values():
+                    dim_dict["temporal"].data.fill_(0.0)  # log(1)
+                    dim_dict["spatial"].data.fill_(0.0)   # log(1)
+            
+            # Initialize fusion probabilities to neutral values
+            if graph.fusion_groups:
+                fusion_params.fusion_logits.data = torch.zeros_like(fusion_params.fusion_logits)
+    
+    def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
+        """Run Pareto frontier sweep by varying area weights."""
+        import copy
+        from dosa.config import Config
+        
+        random.seed(seed)
+        torch.manual_seed(seed)
+        
+        print(f"Starting Pareto Frontier sweep with {len(self.area_weights)} area weight points...")
+        
+        for i, area_weight in enumerate(self.area_weights):
+            print(f"\n=== Pareto Point {i+1}/{len(self.area_weights)}: Area Weight = {area_weight} ===")
+            
+            # Create fresh components for each weight point
+            graph, searcher = self._build_components(cfg["shared"], recorder)
+            
+            # Update area weight using the searcher's dynamic method
+            searcher.update_loss_weights({'area_weight': area_weight})
+            
+            # Apply constraints
+            self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
+            
+            # Run search for this weight point
+            num_trials = cfg["shared"].get("num_trials", 30)
+            searcher.search(num_trials)
+            
+            # Store result with area weight info
+            pareto_point = {
+                'area_weight': area_weight,
+                'seed': seed,
+                'trials': num_trials
+            }
+            self.pareto_results.append(pareto_point)
+        
+        # Finalize recorder
+        recorder.finalize_best()
+        
+        print(f"\n=== Pareto Frontier Sweep Complete ===")
+        print(f"Generated {len(self.pareto_results)} Pareto points")
+
+
 def get_baseline_runner(name: str) -> Runner:  # noqa: D401
     """Factory returning baseline runner by name."""
     mapping = {
@@ -201,6 +271,7 @@ def get_baseline_runner(name: str) -> Runner:  # noqa: D401
         "baselineA_A2": MappingOnlyA2Runner,
         "baselineB": HardwareOnlyRunner,
         "coopt": CooptRunner,
+        "pareto_frontier": ParetoFrontierRunner,
     }
     if name not in mapping:
         raise ValueError(f"Unknown baseline runner: {name}")
