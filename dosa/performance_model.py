@@ -1364,9 +1364,21 @@ class HighFidelityPerformanceModel(nn.Module):
 
         if debug_data is not None and debug_output_path is not None:
             import json
+            
+            def tensor_to_serializable(obj):
+                if isinstance(obj, torch.Tensor):
+                    return obj.detach().cpu().numpy().tolist()
+                elif isinstance(obj, dict):
+                    return {k: tensor_to_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [tensor_to_serializable(item) for item in obj]
+                else:
+                    return obj
+            
             with torch.no_grad():
+                serializable_debug_data = tensor_to_serializable(debug_data)
                 with open(debug_output_path, 'w', encoding='utf-8') as f:
-                    json.dump(debug_data, f, indent=4, ensure_ascii=False)
+                    json.dump(serializable_debug_data, f, indent=4, ensure_ascii=False)
 
         total_latency = total_latency.squeeze() if total_latency.dim() > 0 else total_latency
         total_energy = total_energy.squeeze() if total_energy.dim() > 0 else total_energy
