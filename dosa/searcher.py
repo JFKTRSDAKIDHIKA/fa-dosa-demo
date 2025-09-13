@@ -862,6 +862,13 @@ class FADOSASearcher(BaseSearcher):
 
             # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
+                # 恢复Phase A中的最佳映射/融合配置，确保后续硬件搜索基于最优映射
+                if self.best_params is not None:
+                    print("[DEBUG] Phase A结束 - 恢复最佳映射/融合配置")
+                    self._set_params_from_dict(self.best_params)
+                else:
+                    print("[DEBUG] Phase A结束 - 无可恢复的最佳配置，使用当前参数")
+
                 # 记录当前硬件参数（Phase A结束时）
                 current_hw_before = {
                     'num_pes': self.hw_params.get_projected_num_pes().item(),
@@ -869,7 +876,7 @@ class FADOSASearcher(BaseSearcher):
                     'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
                     'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
                 }
-                
+
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
                 print(f"\n[DEBUG] Phase A结束 - 推导的最小硬件需求: {min_hw}")
                 print(f"[DEBUG] Phase A结束 - 当前硬件配置: {current_hw_before}")
