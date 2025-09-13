@@ -114,11 +114,14 @@ class BaseSearcher(ABC):
             'mismatch_loss': mismatch_loss.item()
         }
         
+        # 存储loss breakdown用于后续的update_best_result调用
+        self._last_loss_breakdown = self._compute_loss_breakdown(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=0)
+        
         return loss.item(), metrics
     
-    def _compute_loss(self, latency, energy, area, mismatch_loss, compatibility_penalty):
+    def _compute_loss(self, latency, energy, area, mismatch_loss, compatibility_penalty, step_count=0):
         """
-        计算总损失 - 完整复现原始run.py中的损失计算逻辑
+        计算总损失 - 完整复现原始run.py中的损失计算逻辑，并集成面积预算惩罚项
         
         Args:
             latency: 延迟张量
@@ -126,6 +129,7 @@ class BaseSearcher(ABC):
             area: 面积张量
             mismatch_loss: 不匹配损失张量
             compatibility_penalty: 兼容性惩罚张量
+            step_count: 当前训练步数，用于权重调度
             
         Returns:
             总损失张量
@@ -141,13 +145,16 @@ class BaseSearcher(ABC):
         comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
         comp_penalty = comp_penalty_weight * compatibility_penalty
         
+        # 计算面积预算惩罚项
+        area_budget_penalty = self._compute_area_budget_penalty(area, step_count)
+        
         # 根据损失策略计算损失
         if self.loss_strategy == 'strategy_A':
             # Strategy A: 复杂的对数损失计算
             edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_loss = self.loss_weights['area_weight'] * area
             mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
-            loss = edp_loss + area_loss + mismatch_penalty + comp_penalty
+            loss = edp_loss + area_loss + mismatch_penalty + comp_penalty + area_budget_penalty
             
         elif self.loss_strategy == 'strategy_B':
             # Strategy B: 加权EDP损失计算
@@ -155,34 +162,34 @@ class BaseSearcher(ABC):
             area_loss = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
             loss = (self.loss_weights['edp_weight'] * edp_loss +
-                   area_loss + mismatch_penalty + comp_penalty)
+                   area_loss + mismatch_penalty + comp_penalty + area_budget_penalty)
             
         elif self.loss_strategy == 'log_edp_plus_area':
             # 标准策略：log(EDP) + 面积惩罚
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty + area_budget_penalty
             
         elif self.loss_strategy == 'edp_plus_area':
             # EDP + 面积惩罚
             edp = latency * energy
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            loss = edp + area_penalty + mismatch_penalty + comp_penalty
+            loss = edp + area_penalty + mismatch_penalty + comp_penalty + area_budget_penalty
 
         elif self.loss_strategy == 'pure_edp':
             # Pure EDP optimisation without area or PE penalties
             edp = latency * energy
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            loss = edp + mismatch_penalty + comp_penalty
+            loss = edp + mismatch_penalty + comp_penalty + area_budget_penalty
 
         else:
             # 默认策略：与log_edp_plus_area相同
             log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
             area_penalty = self.loss_weights['area_weight'] * area
             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty
+            loss = log_edp + area_penalty + mismatch_penalty + comp_penalty + area_budget_penalty
         
         # 确保返回标量张量
         return loss.squeeze() if loss.dim() > 0 else loss
@@ -281,7 +288,198 @@ class BaseSearcher(ABC):
         
         return params
     
-    def update_best_result(self, loss: float, params: Dict[str, Any], metrics: Dict[str, float], trial: int):
+    def _compute_loss_breakdown(self, latency, energy, area, mismatch_loss, compatibility_penalty, step_count=0):
+        """
+        计算loss的详细组成部分，包括面积预算惩罚项
+        
+        Args:
+            latency: 延迟张量
+            energy: 能耗张量
+            area: 面积张量
+            mismatch_loss: 不匹配损失张量
+            compatibility_penalty: 兼容性惩罚张量
+            step_count: 当前训练步数，用于权重调度
+            
+        Returns:
+            包含loss详细组成的字典
+        """
+        # 确保所有输入都是标量张量
+        latency = latency.squeeze() if latency.dim() > 0 else latency
+        energy = energy.squeeze() if energy.dim() > 0 else energy
+        area = area.squeeze() if area.dim() > 0 else area
+        mismatch_loss = mismatch_loss.squeeze() if mismatch_loss.dim() > 0 else mismatch_loss
+        compatibility_penalty = compatibility_penalty.squeeze() if compatibility_penalty.dim() > 0 else compatibility_penalty
+        
+        # 获取兼容性惩罚权重
+        comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
+        comp_penalty = comp_penalty_weight * compatibility_penalty
+        
+        # 计算面积预算惩罚项
+        area_budget_penalty = self._compute_area_budget_penalty(area, step_count)
+        
+        breakdown = {
+            'strategy': self.loss_strategy,
+            'latency': latency.item(),
+            'energy': energy.item(),
+            'area': area.item(),
+            'area_budget_penalty': area_budget_penalty.item()
+        }
+        
+        # 根据损失策略计算各组成部分
+        if self.loss_strategy == 'strategy_A':
+            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_loss = self.loss_weights['area_weight'] * area
+            mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
+            breakdown.update({
+                'log_edp': edp_loss.item(),
+                'area_penalty': area_loss.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item()
+            })
+            
+        elif self.loss_strategy == 'strategy_B':
+            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_loss = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
+            weighted_edp = self.loss_weights['edp_weight'] * edp_loss
+            breakdown.update({
+                'weighted_log_edp': weighted_edp.item(),
+                'area_penalty': area_loss.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item()
+            })
+            
+        elif self.loss_strategy == 'log_edp_plus_area':
+            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+            breakdown.update({
+                'log_edp': log_edp.item(),
+                'area_penalty': area_penalty.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item()
+            })
+            
+        elif self.loss_strategy == 'edp_plus_area':
+            edp = latency * energy
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+            breakdown.update({
+                'edp': edp.item(),
+                'area_penalty': area_penalty.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item()
+            })
+            
+        elif self.loss_strategy == 'pure_edp':
+            edp = latency * energy
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+            breakdown.update({
+                'edp': edp.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item(),
+                'area_not_in_loss': area.item()  # 面积不计入loss但显示
+            })
+            
+        else:
+            # 默认策略：与log_edp_plus_area相同
+            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+            area_penalty = self.loss_weights['area_weight'] * area
+            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+            breakdown.update({
+                'log_edp': log_edp.item(),
+                'area_penalty': area_penalty.item(),
+                'mismatch_penalty': mismatch_penalty.item(),
+                'compatibility_penalty': comp_penalty.item()
+            })
+        
+        return breakdown
+    
+    def _compute_area_budget_penalty(self, area, step_count=0):
+        """
+        计算面积预算惩罚项
+        
+        Args:
+            area: 当前面积 (mm²)
+            step_count: 当前训练步数，用于权重调度
+            
+        Returns:
+            面积预算惩罚值 (torch.Tensor)
+        """
+        from .config import Config
+        config = Config.get_instance()
+        
+        # 如果未启用面积预算或预算为None，返回0
+        if not config.ENABLE_AREA_BUDGET or config.AREA_BUDGET_MM2 is None:
+            return torch.tensor(0.0, device=area.device, dtype=area.dtype)
+        
+        budget = config.AREA_BUDGET_MM2
+        tolerance = config.AREA_BUDGET_TOLERANCE
+        strategy = config.AREA_BUDGET_PENALTY_STRATEGY
+        
+        # 计算当前权重（支持权重调度）
+        base_weight = config.AREA_BUDGET_PENALTY_WEIGHT
+        if config.AREA_BUDGET_WEIGHT_SCHEDULE['enable']:
+            schedule_config = config.AREA_BUDGET_WEIGHT_SCHEDULE
+            initial_weight = schedule_config['initial_weight']
+            final_weight = schedule_config['final_weight']
+            warmup_steps = schedule_config['warmup_steps']
+            schedule_type = schedule_config['schedule_type']
+            
+            if step_count < warmup_steps:
+                if schedule_type == 'linear':
+                    progress = step_count / warmup_steps
+                    current_weight = initial_weight + (final_weight - initial_weight) * progress
+                elif schedule_type == 'exponential':
+                    progress = step_count / warmup_steps
+                    current_weight = initial_weight * ((final_weight / initial_weight) ** progress)
+                else:
+                    current_weight = initial_weight
+            else:
+                current_weight = final_weight
+        else:
+            current_weight = base_weight
+        
+        # 计算预算边界
+        lower_bound = budget * (1 - tolerance)
+        upper_bound = budget * (1 + tolerance)
+        
+        # 在容忍区间内不施加惩罚
+        if lower_bound <= area <= upper_bound:
+            return torch.tensor(0.0, device=area.device, dtype=area.dtype)
+        
+        # 计算偏离量
+        if area < lower_bound:
+            deviation = lower_bound - area
+        else:  # area > upper_bound
+            deviation = area - upper_bound
+        
+        # 归一化偏离量（相对于预算的百分比）
+        normalized_deviation = deviation / budget
+        
+        # 根据策略计算惩罚
+        if strategy == 'quadratic':
+            penalty = normalized_deviation ** 2
+        elif strategy == 'linear':
+            penalty = normalized_deviation
+        elif strategy == 'huber':
+            delta = config.AREA_BUDGET_HUBER_DELTA
+            if normalized_deviation <= delta:
+                penalty = 0.5 * (normalized_deviation ** 2)
+            else:
+                penalty = delta * (normalized_deviation - 0.5 * delta)
+        elif strategy == 'exponential':
+            penalty = torch.exp(normalized_deviation) - 1
+        else:
+            # 默认使用二次惩罚
+            penalty = normalized_deviation ** 2
+        
+        # 应用权重
+        final_penalty = current_weight * penalty
+        
+        return final_penalty
+
+    def update_best_result(self, loss: float, params: Dict[str, Any], metrics: Dict[str, float], trial: int, loss_breakdown: Dict[str, Any] = None):
         """
         更新最佳结果
         
@@ -290,6 +488,7 @@ class BaseSearcher(ABC):
             params: 当前参数
             metrics: 当前性能指标
             trial: 当前试验次数
+            loss_breakdown: loss的详细组成部分（可选）
         """
         if loss < self.best_loss:
             self.best_loss = loss
@@ -300,7 +499,10 @@ class BaseSearcher(ABC):
                 self.recorder.update_best(metrics, key="edp")
             # 使用StructuredLogger记录新的最佳结果事件
             if self.logger:
-                self.logger.event("new_best", step=trial, metrics={"loss": loss, **metrics})
+                event_data = {"loss": loss, **metrics}
+                if loss_breakdown:
+                    event_data["loss_breakdown"] = loss_breakdown
+                self.logger.event("new_best", step=trial, metrics=event_data)
     
     from typing import Optional
 
@@ -464,7 +666,7 @@ class FADOSASearcher(BaseSearcher):
                         )
 
                     # 使用统一的损失计算方法
-                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty)
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=trial_count)
 
                     # 反向传播
                     loss.backward()
@@ -506,8 +708,78 @@ class FADOSASearcher(BaseSearcher):
                         flat_params = self.space.to_flat(current_params)
                         _, metrics = self.evaluate(flat_params)
                 
-                    # 添加缺失的日志记录
+                    # 添加缺失的日志记录和loss详细组成打印
                     if i % 10 == 0:
+                        print(f"\n[DEBUG] Phase A - Outer Step {outer_step+1}, Inner Step {i+1}:")
+                        
+                        # 计算并显示loss的详细组成部分
+                        comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
+                        comp_penalty = comp_penalty_weight * compatibility_penalty
+                        
+                        if self.loss_strategy == 'strategy_A':
+                            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                            area_loss = self.loss_weights['area_weight'] * area
+                            mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
+                            print(f"[DEBUG] Loss详细组成 (strategy_A): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - Log(EDP): {edp_loss.item():.6f}")
+                            print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            
+                        elif self.loss_strategy == 'strategy_B':
+                            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                            area_loss = self.loss_weights['area_weight'] * area
+                            mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
+                            weighted_edp = self.loss_weights['edp_weight'] * edp_loss
+                            print(f"[DEBUG] Loss详细组成 (strategy_B): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - 加权Log(EDP): {weighted_edp.item():.6f}")
+                            print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            
+                        elif self.loss_strategy == 'log_edp_plus_area':
+                            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                            area_penalty = self.loss_weights['area_weight'] * area
+                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                            print(f"[DEBUG] Loss详细组成 (log_edp_plus_area): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            
+                        elif self.loss_strategy == 'edp_plus_area':
+                            edp = latency * energy
+                            area_penalty = self.loss_weights['area_weight'] * area
+                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                            print(f"[DEBUG] Loss详细组成 (edp_plus_area): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            
+                        elif self.loss_strategy == 'pure_edp':
+                            edp = latency * energy
+                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                            print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (未计入loss)")
+                            
+                        else:
+                            # 默认策略
+                            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                            area_penalty = self.loss_weights['area_weight'] * area
+                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                            print(f"[DEBUG] Loss详细组成 (默认策略): 总计={loss.item():.6f}")
+                            print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                        
+                        # 显示基础性能指标
+                        print(f"[DEBUG] 基础指标: 延迟={latency.item():.2e}s, 能耗={energy.item():.2e}pJ")
+                        
                         trial_count += 1
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
 
@@ -517,7 +789,9 @@ class FADOSASearcher(BaseSearcher):
                     # 更新最佳结果
                     trial_count += 1
                     old_best_loss = self.best_loss
-                    self.update_best_result(loss.item(), current_params, metrics, trial_count)
+                    # 计算loss的详细组成部分
+                    loss_breakdown = self._compute_loss_breakdown(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=trial_count)
+                    self.update_best_result(loss.item(), current_params, metrics, trial_count, loss_breakdown)
 
                     # 质量驱动的触发：当找到新的全局最优解时保存配置
                     if loss.item() < old_best_loss:
@@ -533,12 +807,46 @@ class FADOSASearcher(BaseSearcher):
 
             # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
             with torch.no_grad():
+                # 记录当前硬件参数（Phase A结束时）
+                current_hw_before = {
+                    'num_pes': self.hw_params.get_projected_num_pes().item(),
+                    'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                    'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                    'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                }
+                
                 min_hw = derive_minimal_hardware(self.mapping, self.config)
+                print(f"\n[DEBUG] Phase A结束 - 推导的最小硬件需求: {min_hw}")
+                print(f"[DEBUG] Phase A结束 - 当前硬件配置: {current_hw_before}")
+                
                 # Apply minimal hardware bounds only if configured to do so
                 if self.config.APPLY_MIN_HW_BOUNDS:
+                    print(f"[DEBUG] 应用最小硬件约束 (reset={self.config.RESET_TO_MIN_HW})")
                     # Reset hardware to the minimal configuration if configured to do so.
                     # The number of PEs is deterministically determined by ``min_hw`` when reset=True.
                     self._apply_min_hw_bounds(min_hw, reset=self.config.RESET_TO_MIN_HW)
+                    
+                    # 记录应用约束后的硬件参数
+                    current_hw_after = {
+                        'num_pes': self.hw_params.get_projected_num_pes().item(),
+                        'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                        'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                        'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                    }
+                    print(f"[DEBUG] 应用约束后硬件配置: {current_hw_after}")
+                    
+                    # 检查是否有参数发生变化
+                    changed_params = []
+                    for key in current_hw_before:
+                        if abs(current_hw_before[key] - current_hw_after[key]) > 1e-6:
+                            changed_params.append(f"{key}: {current_hw_before[key]:.2f} -> {current_hw_after[key]:.2f}")
+                    
+                    if changed_params:
+                        print(f"[DEBUG] ⚠️  硬件参数发生变化: {', '.join(changed_params)}")
+                    else:
+                        print(f"[DEBUG] ✓ 硬件参数未发生变化")
+                else:
+                    print(f"[DEBUG] 跳过最小硬件约束应用 (APPLY_MIN_HW_BOUNDS=False)")
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:
@@ -572,7 +880,7 @@ class FADOSASearcher(BaseSearcher):
                         )
 
                     # 使用统一的损失计算方法
-                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty)
+                    loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=trial_count)
 
                     # 反向传播
                     loss.backward()
@@ -611,11 +919,128 @@ class FADOSASearcher(BaseSearcher):
                         }
                         self.recorder.log_coopt_debug_step(debug_snapshot)
 
+                    # 记录优化前的硬件参数
+                    hw_before_step = {
+                        'num_pes': self.hw_params.get_projected_num_pes().item(),
+                        'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                        'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                        'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                    }
+                    
                     optimizer_hw.step()
+                    
+                    # 记录优化后的硬件参数
+                    hw_after_step = {
+                        'num_pes': self.hw_params.get_projected_num_pes().item(),
+                        'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                        'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                        'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                    }
 
                     # Enforce minimal hardware as lower bounds after the update
                     with torch.no_grad():
                         self._apply_min_hw_bounds(min_hw, reset=False)
+                        
+                        # 记录应用约束后的硬件参数
+                        hw_after_bounds = {
+                            'num_pes': self.hw_params.get_projected_num_pes().item(),
+                            'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                            'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                            'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                        }
+                        
+                        # 每10步打印一次详细的参数变化
+                        if i % 10 == 0:
+                            print(f"\n[DEBUG] Phase B - Outer Step {outer_step+1}, Inner Step {i+1}:")
+                            
+                            # 计算并显示loss的详细组成部分
+                            comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
+                            comp_penalty = comp_penalty_weight * compatibility_penalty
+                            
+                            if self.loss_strategy == 'strategy_A':
+                                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                                area_loss = self.loss_weights['area_weight'] * area
+                                mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
+                                print(f"[DEBUG] Loss详细组成 (strategy_A): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - Log(EDP): {edp_loss.item():.6f}")
+                                print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                                
+                            elif self.loss_strategy == 'strategy_B':
+                                edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                                area_loss = self.loss_weights['area_weight'] * area
+                                mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
+                                weighted_edp = self.loss_weights['edp_weight'] * edp_loss
+                                print(f"[DEBUG] Loss详细组成 (strategy_B): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - 加权Log(EDP): {weighted_edp.item():.6f}")
+                                print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                                
+                            elif self.loss_strategy == 'log_edp_plus_area':
+                                log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                                area_penalty = self.loss_weights['area_weight'] * area
+                                mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                                print(f"[DEBUG] Loss详细组成 (log_edp_plus_area): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                                print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                                
+                            elif self.loss_strategy == 'edp_plus_area':
+                                edp = latency * energy
+                                area_penalty = self.loss_weights['area_weight'] * area
+                                mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                                print(f"[DEBUG] Loss详细组成 (edp_plus_area): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                                print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                                
+                            elif self.loss_strategy == 'pure_edp':
+                                edp = latency * energy
+                                mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                                print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                                print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (未计入loss)")
+                                
+                            else:
+                                # 默认策略
+                                log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                                area_penalty = self.loss_weights['area_weight'] * area
+                                mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                                print(f"[DEBUG] Loss详细组成 (默认策略): 总计={loss.item():.6f}")
+                                print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                                print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                                print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                                print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                            
+                            # 显示基础性能指标
+                            print(f"[DEBUG] 基础指标: 延迟={latency.item():.2e}s, 能耗={energy.item():.2e}pJ")
+                            
+                            # 检查optimizer.step()造成的变化
+                            step_changes = []
+                            for key in hw_before_step:
+                                if abs(hw_before_step[key] - hw_after_step[key]) > 1e-6:
+                                    step_changes.append(f"{key}: {hw_before_step[key]:.2f} -> {hw_after_step[key]:.2f}")
+                            
+                            if step_changes:
+                                print(f"[DEBUG] Optimizer步骤变化: {', '.join(step_changes)}")
+                            
+                            # 检查应用最小硬件约束造成的变化
+                            bounds_changes = []
+                            for key in hw_after_step:
+                                if abs(hw_after_step[key] - hw_after_bounds[key]) > 1e-6:
+                                    bounds_changes.append(f"{key}: {hw_after_step[key]:.2f} -> {hw_after_bounds[key]:.2f}")
+                            
+                            if bounds_changes:
+                                print(f"[DEBUG] 最小约束调整: {', '.join(bounds_changes)}")
+                            
+                            if not step_changes and not bounds_changes:
+                                print(f"[DEBUG] ✓ 硬件参数无变化")
 
                     # 计算指标用于记录（避免再次调用 evaluate(flat_params) 造成的二次完整前向）
                     with torch.no_grad():
@@ -844,7 +1269,8 @@ class BayesianOptimizationSearcher(BaseSearcher):
             # 更新最佳结果（只有当损失值有效时）
             trial_num = len(objective.trial_history) + 1
             if loss < 1e15:  # 只有有效的损失值才更新最佳结果
-                self.update_best_result(loss, params_dict, metrics, trial_num)
+                loss_breakdown = getattr(self, '_last_loss_breakdown', None)
+                self.update_best_result(loss, params_dict, metrics, trial_num, loss_breakdown)
             
             # 记录试验历史
             objective.trial_history.append({
@@ -976,7 +1402,8 @@ class GeneticAlgorithmSearcher(BaseSearcher):
         # 更新最佳结果
         trial_num = getattr(self, '_current_trial', 0) + 1
         self._current_trial = trial_num
-        self.update_best_result(loss, params_dict, metrics, trial_num)
+        loss_breakdown = getattr(self, '_last_loss_breakdown', None)
+        self.update_best_result(loss, params_dict, metrics, trial_num, loss_breakdown)
         
         # 记录日志
         if trial_num % 10 == 0 or trial_num == 1:

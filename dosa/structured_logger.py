@@ -117,7 +117,72 @@ class StructuredLogger:
                 loss = metrics.get('loss', 0)
                 edp = metrics.get('edp', 0)
                 area = metrics.get('area_mm2', 0)
+                loss_breakdown = metrics.get('loss_breakdown', None)
+                
+                # 基本的新最佳结果信息
                 self.console(f"🎯 New Best Found! Loss: {loss:.4f}, EDP: {edp:.2e}, Area: {area:.2f}mm²")
+                
+                # 如果有loss详细组成信息，则显示
+                if loss_breakdown:
+                    strategy = loss_breakdown.get('strategy', 'unknown')
+                    self.console(f"   📊 Loss Breakdown ({strategy}):")
+                    
+                    # 根据不同策略显示相应的组成部分
+                    if strategy == 'strategy_A':
+                        log_edp = loss_breakdown.get('log_edp', 0)
+                        area_penalty = loss_breakdown.get('area_penalty', 0)
+                        mismatch_penalty = loss_breakdown.get('mismatch_penalty', 0)
+                        compatibility_penalty = loss_breakdown.get('compatibility_penalty', 0)
+                        self.console(f"      • Log(EDP): {log_edp:.6f}")
+                        self.console(f"      • Area Penalty: {area_penalty:.6f}")
+                        self.console(f"      • Mismatch Penalty: {mismatch_penalty:.6f}")
+                        self.console(f"      • Compatibility Penalty: {compatibility_penalty:.6f}")
+                        
+                    elif strategy == 'strategy_B':
+                        weighted_log_edp = loss_breakdown.get('weighted_log_edp', 0)
+                        area_penalty = loss_breakdown.get('area_penalty', 0)
+                        mismatch_penalty = loss_breakdown.get('mismatch_penalty', 0)
+                        compatibility_penalty = loss_breakdown.get('compatibility_penalty', 0)
+                        self.console(f"      • Weighted Log(EDP): {weighted_log_edp:.6f}")
+                        self.console(f"      • Area Penalty: {area_penalty:.6f}")
+                        self.console(f"      • Mismatch Penalty: {mismatch_penalty:.6f}")
+                        self.console(f"      • Compatibility Penalty: {compatibility_penalty:.6f}")
+                        
+                    elif strategy in ['log_edp_plus_area', 'default']:
+                        log_edp = loss_breakdown.get('log_edp', 0)
+                        area_penalty = loss_breakdown.get('area_penalty', 0)
+                        mismatch_penalty = loss_breakdown.get('mismatch_penalty', 0)
+                        compatibility_penalty = loss_breakdown.get('compatibility_penalty', 0)
+                        self.console(f"      • Log(EDP): {log_edp:.6f}")
+                        self.console(f"      • Area Penalty: {area_penalty:.6f}")
+                        self.console(f"      • Mismatch Penalty: {mismatch_penalty:.6f}")
+                        self.console(f"      • Compatibility Penalty: {compatibility_penalty:.6f}")
+                        
+                    elif strategy == 'edp_plus_area':
+                        edp_val = loss_breakdown.get('edp', 0)
+                        area_penalty = loss_breakdown.get('area_penalty', 0)
+                        mismatch_penalty = loss_breakdown.get('mismatch_penalty', 0)
+                        compatibility_penalty = loss_breakdown.get('compatibility_penalty', 0)
+                        self.console(f"      • EDP: {edp_val:.6f}")
+                        self.console(f"      • Area Penalty: {area_penalty:.6f}")
+                        self.console(f"      • Mismatch Penalty: {mismatch_penalty:.6f}")
+                        self.console(f"      • Compatibility Penalty: {compatibility_penalty:.6f}")
+                        
+                    elif strategy == 'pure_edp':
+                        edp_val = loss_breakdown.get('edp', 0)
+                        mismatch_penalty = loss_breakdown.get('mismatch_penalty', 0)
+                        compatibility_penalty = loss_breakdown.get('compatibility_penalty', 0)
+                        area_not_in_loss = loss_breakdown.get('area_not_in_loss', 0)
+                        self.console(f"      • EDP: {edp_val:.6f}")
+                        self.console(f"      • Mismatch Penalty: {mismatch_penalty:.6f}")
+                        self.console(f"      • Compatibility Penalty: {compatibility_penalty:.6f}")
+                        self.console(f"      • Area (not in loss): {area_not_in_loss:.2f}mm²")
+                    
+                    # 显示基础性能指标
+                    latency = loss_breakdown.get('latency', 0)
+                    energy = loss_breakdown.get('energy', 0)
+                    if latency > 0 and energy > 0:
+                        self.console(f"   ⚡ Performance: Latency={latency:.2e}s, Energy={energy:.2e}pJ")
     
     def trial(self, step: int, payload: Dict[str, Any]):
         """

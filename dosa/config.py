@@ -107,12 +107,58 @@ class Config:
         self.COMPATIBILITY_PENALTY_WEIGHT = 100.0
         # Weight for buffer mismatch penalty
         self.MISMATCH_PENALTY_WEIGHT = 0.1
+        
+        # ========== 面积预算约束配置 ==========
+        # 是否启用面积预算约束
+        self.ENABLE_AREA_BUDGET = False
+        # 面积预算值 (mm²) - 设置为None表示无预算限制
+        self.AREA_BUDGET_MM2 = None
+        # 预算容忍区间 (百分比) - 在预算±tolerance范围内不施加惩罚
+        self.AREA_BUDGET_TOLERANCE = 0.1  # 10%
+        # 面积预算惩罚权重 - 控制惩罚强度
+        self.AREA_BUDGET_PENALTY_WEIGHT = 1.0
+        # 面积预算惩罚策略: 'quadratic', 'huber', 'exponential', 'linear'
+        self.AREA_BUDGET_PENALTY_STRATEGY = 'quadratic'
+        # Huber损失的delta参数 (仅在strategy='huber'时使用)
+        self.AREA_BUDGET_HUBER_DELTA = 0.5
+        # 权重调度参数 - 惩罚权重随训练步数增加
+        self.AREA_BUDGET_WEIGHT_SCHEDULE = {
+            'enable': True,
+            'initial_weight': 0.1,  # 初始权重
+            'final_weight': 2.0,    # 最终权重
+            'warmup_steps': 100,    # 预热步数
+            'schedule_type': 'linear'  # 'linear', 'exponential'
+        }
+        
+        # 场景预设配置
+        self.SCENARIO_PRESETS = {
+            'edge': {
+                'area_budget_mm2': 5.0,
+                'tolerance': 0.05,  # 5% - 更严格
+                'penalty_weight': 2.0,  # 更强惩罚
+                'penalty_strategy': 'quadratic'
+            },
+            'cloud': {
+                'area_budget_mm2': 50.0,
+                'tolerance': 0.15,  # 15% - 更宽松
+                'penalty_weight': 0.5,  # 较弱惩罚
+                'penalty_strategy': 'huber'
+            },
+            'mobile': {
+                'area_budget_mm2': 2.0,
+                'tolerance': 0.03,  # 3% - 极严格
+                'penalty_weight': 5.0,  # 极强惩罚
+                'penalty_strategy': 'exponential'
+            }
+        }
+        
         # Consolidated loss weights for easy tuning
         self.LOSS_WEIGHTS = {
             'area_weight': self.AREA_WEIGHT,
             'mismatch_penalty_weight': self.MISMATCH_PENALTY_WEIGHT,
             'compatibility_penalty_weight': self.COMPATIBILITY_PENALTY_WEIGHT,
-            'edp_weight': 1.0
+            'edp_weight': 1.0,
+            'area_budget_penalty_weight': self.AREA_BUDGET_PENALTY_WEIGHT
         }
         
         # ========== 面积模型参数 (单位: mm²) ==========
@@ -162,7 +208,7 @@ class Config:
         # Whether to enforce minimal hardware as a hard lower bound during
         # the search. Set to ``False`` to temporarily remove this constraint
         # and allow more aggressive exploration of the hardware space.
-        self.APPLY_MIN_HW_BOUNDS = False
+        self.APPLY_MIN_HW_BOUNDS = True
     
     @classmethod
     def get_instance(cls):
@@ -188,3 +234,26 @@ class Config:
         if level_index in self.STORAGE_MATRIX and tensor_type in self.STORAGE_MATRIX[level_index]:
             return bool(self.STORAGE_MATRIX[level_index][tensor_type])
         return False
+    
+    def apply_scenario_preset(self, scenario: str):
+        """应用场景预设配置
+        
+        Args:
+            scenario: 场景名称 ('edge', 'cloud', 'mobile')
+        """
+        if scenario not in self.SCENARIO_PRESETS:
+            raise ValueError(f"Unknown scenario: {scenario}. Available: {list(self.SCENARIO_PRESETS.keys())}")
+        
+        preset = self.SCENARIO_PRESETS[scenario]
+        
+        # 启用面积预算并应用预设参数
+        self.ENABLE_AREA_BUDGET = True
+        self.AREA_BUDGET_MM2 = preset['area_budget_mm2']
+        self.AREA_BUDGET_TOLERANCE = preset['tolerance']
+        self.AREA_BUDGET_PENALTY_WEIGHT = preset['penalty_weight']
+        self.AREA_BUDGET_PENALTY_STRATEGY = preset['penalty_strategy']
+        
+        # 更新loss weights
+        self.LOSS_WEIGHTS['area_budget_penalty_weight'] = self.AREA_BUDGET_PENALTY_WEIGHT
+        
+        print(f"[CONFIG] 已应用{scenario}场景预设: 预算={self.AREA_BUDGET_MM2}mm², 容忍度={self.AREA_BUDGET_TOLERANCE*100}%, 惩罚权重={self.AREA_BUDGET_PENALTY_WEIGHT}")
