@@ -611,7 +611,7 @@ class FADOSASearcher(BaseSearcher):
             snapshot[key] = d["fused"]
         return snapshot
 
-    def _diff_mapping(self, prev, curr, tol: float = 1e-6, limit: int = 5):
+    def _diff_mapping(self, prev, curr, tol: float = 1e-6, limit: int = 50):
         """Return a summary of mapping factor changes between two snapshots."""
         changes = []
         for dim, levels in curr.items():
