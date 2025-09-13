@@ -589,6 +589,57 @@ class FADOSASearcher(BaseSearcher):
         self.loss_weights.update(new_weights)
         if self.logger:
             self.logger.console(f"Updated loss weights: {self.loss_weights}")
+
+    def _snapshot_mapping(self):
+        """Capture current mapping factors as plain floats for change tracking."""
+        with torch.no_grad():
+            factors = self.mapping.get_all_factors()
+        snapshot = {}
+        for dim, levels in factors.items():
+            snapshot[dim] = {}
+            for level, facs in levels.items():
+                snapshot[dim][level] = {k: float(v.item()) for k, v in facs.items()}
+        return snapshot
+
+    def _snapshot_fusion(self):
+        """Capture current fusion decisions for change tracking."""
+        decisions = self.fusion_params.get_fusion_decisions_serializable(self.graph)
+        snapshot = {}
+        for d in decisions:
+            group = d["group"]
+            key = "|".join(group) if isinstance(group, list) else str(group)
+            snapshot[key] = d["fused"]
+        return snapshot
+
+    def _diff_mapping(self, prev, curr, tol: float = 1e-6, limit: int = 5):
+        """Return a summary of mapping factor changes between two snapshots."""
+        changes = []
+        for dim, levels in curr.items():
+            for level, facs in levels.items():
+                for k, v in facs.items():
+                    prev_v = prev.get(dim, {}).get(level, {}).get(k)
+                    if prev_v is None or abs(v - prev_v) > tol:
+                        if prev_v is None:
+                            changes.append(f"{dim}.{level}.{k}: {v:.2f}")
+                        else:
+                            changes.append(f"{dim}.{level}.{k}: {prev_v:.2f}->{v:.2f}")
+        if len(changes) > limit:
+            return changes[:limit] + [f"... (+{len(changes) - limit} more)"]
+        return changes
+
+    def _diff_fusion(self, prev, curr, limit: int = 5):
+        """Return a summary of fusion decision changes between two snapshots."""
+        changes = []
+        for group, fused in curr.items():
+            prev_fused = prev.get(group)
+            if prev_fused is None or fused != prev_fused:
+                if prev_fused is None:
+                    changes.append(f"{group}: {fused}")
+                else:
+                    changes.append(f"{group}: {prev_fused}->{fused}")
+        if len(changes) > limit:
+            return changes[:limit] + [f"... (+{len(changes) - limit} more)"]
+        return changes
     
     def search(self, num_trials: int) -> Dict[str, Any]:
         """
@@ -617,6 +668,10 @@ class FADOSASearcher(BaseSearcher):
         os.makedirs('output', exist_ok=True)
 
         trial_count = 0
+
+        # Snapshots for tracking mapping and fusion changes across outer steps
+        prev_mapping_state = self._snapshot_mapping()
+        prev_fusion_state = self._snapshot_fusion()
 
         # 记录基线约束下的 requires_grad 状态，以防被后续阶段覆盖
         hw_params_list = list(self.hw_params.parameters())
@@ -847,6 +902,23 @@ class FADOSASearcher(BaseSearcher):
                         print(f"[DEBUG] ✓ 硬件参数未发生变化")
                 else:
                     print(f"[DEBUG] 跳过最小硬件约束应用 (APPLY_MIN_HW_BOUNDS=False)")
+
+            # Report mapping and fusion parameter changes
+            current_mapping_state = self._snapshot_mapping()
+            mapping_changes = self._diff_mapping(prev_mapping_state, current_mapping_state)
+            if mapping_changes:
+                print(f"[DEBUG] ⚠️ 映射参数变化: {', '.join(mapping_changes)}")
+            else:
+                print(f"[DEBUG] ✓ 映射参数未变化")
+            prev_mapping_state = current_mapping_state
+
+            current_fusion_state = self._snapshot_fusion()
+            fusion_changes = self._diff_fusion(prev_fusion_state, current_fusion_state)
+            if fusion_changes:
+                print(f"[DEBUG] ⚠️ 融合决策变化: {', '.join(fusion_changes)}")
+            else:
+                print(f"[DEBUG] ✓ 融合决策未变化")
+            prev_fusion_state = current_fusion_state
 
             # Phase B: 优化硬件参数（冻结映射和融合参数）
             if self.logger:

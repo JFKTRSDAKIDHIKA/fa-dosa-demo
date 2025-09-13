@@ -136,19 +136,37 @@ class Config:
                 'area_budget_mm2': 5.0,
                 'tolerance': 0.05,  # 5% - 更严格
                 'penalty_weight': 2.0,  # 更强惩罚
-                'penalty_strategy': 'quadratic'
+                'penalty_strategy': 'quadratic',
+                'initial_hw': {
+                    'num_pes': 128,
+                    'l0_kb': 1.0,
+                    'l1_kb': 2.0,
+                    'l2_kb': 32.0,
+                }
             },
             'cloud': {
                 'area_budget_mm2': 50.0,
                 'tolerance': 0.15,  # 15% - 更宽松
                 'penalty_weight': 0.5,  # 较弱惩罚
-                'penalty_strategy': 'huber'
+                'penalty_strategy': 'huber',
+                'initial_hw': {
+                    'num_pes': 4096,
+                    'l0_kb': 4.0,
+                    'l1_kb': 8.0,
+                    'l2_kb': 128.0,
+                }
             },
             'mobile': {
                 'area_budget_mm2': 2.0,
                 'tolerance': 0.03,  # 3% - 极严格
                 'penalty_weight': 5.0,  # 极强惩罚
-                'penalty_strategy': 'exponential'
+                'penalty_strategy': 'exponential',
+                'initial_hw': {
+                    'num_pes': 64,
+                    'l0_kb': 0.5,
+                    'l1_kb': 1.0,
+                    'l2_kb': 4.0,
+                }
             }
         }
         

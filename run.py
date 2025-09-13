@@ -302,6 +302,7 @@ def run_experiment(
     num_trials: int = 500,
     fusion_aware: bool = True,
     log_dir: Optional[str] = None,
+    scenario: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -320,6 +321,8 @@ def run_experiment(
     """
     # 初始化核心组件
     config = Config()
+    if scenario:
+        config.apply_scenario_preset(scenario)
     
     # 创建结构化日志器
     logger = StructuredLogger(
@@ -327,17 +330,29 @@ def run_experiment(
         minimal_console=config.MINIMAL_CONSOLE,
         log_intermediate=config.LOG_INTERMEDIATE
     )
-    
+
     # 记录实验开始
-    logger.event("experiment_start", 
-                model_name=model_name, 
-                searcher_type=searcher_type, 
-                num_trials=num_trials,
-                **kwargs)
+    logger.event(
+        "experiment_start",
+        model_name=model_name,
+        searcher_type=searcher_type,
+        num_trials=num_trials,
+        scenario=scenario,
+        **kwargs,
+    )
     logger.console(f"--- Running DSE Experiment: {searcher_type.upper()} on {model_name} ---")
-    
+
     graph = parse_onnx_to_graph(model_name)
-    hw_params = HardwareParameters()
+    if scenario:
+        init_hw = config.SCENARIO_PRESETS.get(scenario, {}).get('initial_hw', {})
+        hw_params = HardwareParameters(
+            initial_num_pes=init_hw.get('num_pes', 4.0),
+            initial_l0_kb=init_hw.get('l0_kb', 0.1),
+            initial_l1_kb=init_hw.get('l1_kb', 0.2),
+            initial_l2_kb=init_hw.get('l2_kb', 1.0),
+        )
+    else:
+        hw_params = HardwareParameters()
     mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY)
     fusion_params = FusionParameters(graph)
     perf_model = HighFidelityPerformanceModel(config, fusion_aware=fusion_aware)
@@ -510,7 +525,8 @@ def run_comparison_experiment(
     model_name: str = "resnet18",
     searcher_types: List[str] = ["fa-dosa", "random_search"],
     num_trials: int = 500,
-    fusion_aware: bool = True
+    fusion_aware: bool = True,
+    scenario: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     运行多个搜索器的对比实验
@@ -539,7 +555,8 @@ def run_comparison_experiment(
                 model_name=model_name,
                 searcher_type=searcher_type,
                 num_trials=num_trials,
-                fusion_aware=fusion_aware
+                fusion_aware=fusion_aware,
+                scenario=scenario,
             )
             all_results[searcher_type] = results
             
@@ -574,6 +591,7 @@ if __name__ == "__main__":
     parser.add_argument("--exp", default="legacy", choices=["legacy", "act1"], help="Experiment to run")
     parser.add_argument("--config", default=str(Path("configs/act1.yaml").resolve()), help="Config file for act1 experiment")
     parser.add_argument("--fusion-unaware", action="store_true", help="Disable fusion-aware performance modeling")
+    parser.add_argument("--scenario", choices=["edge", "cloud", "mobile"], help="Apply predefined area budget scenario", default=None)
     args, unknown = parser.parse_known_args()
 
     if args.exp == "act1":
@@ -598,7 +616,8 @@ if __name__ == "__main__":
         num_mapping_steps=10,  # 减少映射优化步数
         num_hardware_steps=20,  # 提高硬件优化步数以增强探索
         lr_hardware=0.05,  # 提高硬件优化学习率
-        fusion_aware=not args.fusion_unaware
+        fusion_aware=not args.fusion_unaware,
+        scenario=args.scenario,
     )
     
     # # Random search experiment - lightweight test configuration
