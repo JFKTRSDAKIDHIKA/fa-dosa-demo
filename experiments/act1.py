@@ -28,15 +28,13 @@ def run_act1(cfg_path: str | Path | None = None, scenario: str | None = None) ->
         cfg_path: Path to YAML configuration. If *None*, fallbacks to default sample.
         scenario: Scenario preset name. Overrides config file if provided.
     """
-    if isinstance(cfg_path, str):
-        cfg: dict[str, Any] = yaml.safe_load(cfg_path)
-    else:
-        cfg_path = Path(cfg_path or DEFAULT_CFG_PATH)
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    # 修复：统一处理配置文件路径
+    cfg_path = Path(cfg_path or DEFAULT_CFG_PATH)
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
 
-        with cfg_path.open("r", encoding="utf-8") as fp:
-            cfg: dict[str, Any] = yaml.safe_load(fp)
+    with cfg_path.open("r", encoding="utf-8") as fp:
+        cfg: dict[str, Any] = yaml.safe_load(fp)
 
     # Resolve scenario from CLI or config
     scenario = scenario or cfg.get("scenario") or cfg.get("shared", {}).get("scenario")
