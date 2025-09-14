@@ -37,6 +37,14 @@ class _BaseSearchRunner:
     def _build_components(self, cfg: dict[str, Any], recorder):
         graph = self._create_fallback_graph()
         config = Config.get_instance()
+        
+        # 设置优化参数（方案B）
+        config.NUM_OUTER_STEPS = cfg.get("num_outer_steps", 2)
+        config.NUM_MAPPING_STEPS = cfg.get("num_mapping_steps", 20)
+        config.NUM_HARDWARE_STEPS = cfg.get("num_hardware_steps", 20)
+        config.LR_MAPPING = cfg.get("lr_mapping", 0.01)
+        config.LR_HARDWARE = cfg.get("lr_hardware", 0.01)
+        
         device = config.DEVICE
         scenario = cfg.get("scenario")
         if scenario:

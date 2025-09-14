@@ -864,9 +864,13 @@ class FADOSASearcher(BaseSearcher):
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
 
             # Restore best parameters from Phase A before hardware optimization
-            self._set_params_from_dict(self.best_params)
-            if self.logger:
-                self.logger.console("Restored best parameters from Phase A before hardware optimization.")
+            if self.best_params is not None:
+                self._set_params_from_dict(self.best_params)
+                if self.logger:
+                    self.logger.console("Restored best parameters from Phase A before hardware optimization.")
+            else:
+                if self.logger:
+                    self.logger.console("No best parameters found in Phase A, continuing with current parameters.")
 
             # 根据当前映射推导最小硬件规模，作为硬件优化的起点
             with torch.no_grad():

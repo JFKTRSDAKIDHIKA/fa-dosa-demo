@@ -486,9 +486,9 @@ def create_searcher(
     
     # 为FA-DOSA设置默认参数
     if searcher_type == 'fa-dosa':
-        config.NUM_OUTER_STEPS = kwargs.get('num_outer_steps', 5)
-        config.NUM_MAPPING_STEPS = kwargs.get('num_mapping_steps', 50)
-        config.NUM_HARDWARE_STEPS = kwargs.get('num_hardware_steps', 100)
+        config.NUM_OUTER_STEPS = kwargs.get('num_outer_steps', 1)
+        config.NUM_MAPPING_STEPS = kwargs.get('num_mapping_steps', 20)
+        config.NUM_HARDWARE_STEPS = kwargs.get('num_hardware_steps', 20)
         config.LR_MAPPING = kwargs.get('lr_mapping', 0.01)
         config.LR_HARDWARE = kwargs.get('lr_hardware', 0.05)
         
