@@ -1136,6 +1136,15 @@ class FADOSASearcher(BaseSearcher):
                             'mismatch_loss': mismatch2.item()
                         }
                     
+                    # 在每个hardware step中检查并更新最佳结果
+                    trial_count += 1
+                    old_best_loss = self.best_loss
+                    self.update_best_result(loss.item(), current_params, metrics, trial_count)
+                    
+                    # 质量驱动的触发：当找到新的全局最优解时保存配置
+                    if loss.item() < old_best_loss:
+                        self._save_validation_config(trial_count, "quality_driven")
+                    
                     # 添加进度输出
                     if i % 2 == 0 or i == self.num_hardware_steps - 1:
                         if self.logger:
@@ -1143,21 +1152,9 @@ class FADOSASearcher(BaseSearcher):
                                 f"  Hardware Step {i+1}/{self.num_hardware_steps}: Loss={loss.item():.4f}, EDP={metrics['edp']:.2e}, Area={metrics['area_mm2']:.2f}mm²"
                             )
                 
-                # 更新最佳结果
-                trial_count += 1
-                old_best_loss = self.best_loss
-                self.update_best_result(loss.item(), current_params, metrics, trial_count)
-                
-                # 质量驱动的触发：当找到新的全局最优解时保存配置
-                if loss.item() < old_best_loss:
-                    self._save_validation_config(trial_count, "quality_driven")
-                
-                # 多样性驱动的触发：周期性保存配置
-                if i % 50 == 0:
-                    self._save_validation_config(trial_count, "diversity_driven")
-                
+                # Phase B结束后的最终记录（最佳结果已在每个hardware step中更新）
                 # 记录日志
-                if i % 10 == 0:
+                if self.num_hardware_steps % 10 == 0:
                     self.log_trial(trial_count, loss.item(), metrics, current_params)
         
         return {
