@@ -106,7 +106,7 @@ class Config:
         self.AREA_WEIGHT = 0.1
         self.COMPATIBILITY_PENALTY_WEIGHT = 100.0
         # Weight for buffer mismatch penalty
-        self.MISMATCH_PENALTY_WEIGHT = 1e9
+        self.MISMATCH_PENALTY_WEIGHT = 0.1
         
         # ========== 面积预算约束配置 ==========
         # 是否启用面积预算约束

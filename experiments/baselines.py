@@ -24,8 +24,10 @@ from dosa.config import Config
 from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
 from dosa.performance_model import HighFidelityPerformanceModel
+import os
 from dosa.utils import ComputationGraph, FusionParameters
 from dosa.searcher import FADOSASearcher
+from run import parse_onnx_to_graph
 
 
 class _BaseSearchRunner:
@@ -34,8 +36,11 @@ class _BaseSearchRunner:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def _build_components(self, cfg: dict[str, Any], recorder):
-        graph = self._create_fallback_graph()
+    def _build_components(self, cfg: dict[str, Any], recorder, model_name: str | None = None):
+        if model_name and os.path.exists(f"onnx_models/{model_name}.onnx"):
+            graph = parse_onnx_to_graph(model_name)
+        else:
+            graph = self._create_fallback_graph()
         config = Config.get_instance()
         
         # 设置优化参数（方案B）
@@ -47,6 +52,7 @@ class _BaseSearchRunner:
         
         device = config.DEVICE
         scenario = cfg.get("scenario")
+        self.scenario = scenario
         if scenario:
             init_hw = config.SCENARIO_PRESETS.get(scenario, {}).get("initial_hw", {})
             hw = HardwareParameters(
@@ -88,6 +94,52 @@ class _BaseSearchRunner:
         """Freeze parameters/initialize values according to baseline kind."""
         pass  # To be overridden by subclasses
 
+    # Helper: initialize hardware params from current scenario preset
+    def _init_hw_from_scenario(self, hw_params):
+        config = Config.get_instance()
+        scenario = getattr(self, "scenario", None)
+        if not scenario:
+            return
+        init_hw = config.SCENARIO_PRESETS.get(scenario, {}).get("initial_hw", {})
+        device = hw_params.log_num_pes.device
+        with torch.no_grad():
+            if "num_pes" in init_hw:
+                hw_params.log_num_pes.data = torch.log(torch.tensor(float(init_hw["num_pes"]), device=device))
+            if "l0_kb" in init_hw:
+                hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(float(init_hw["l0_kb"]), device=device))
+            if "l1_kb" in init_hw:
+                hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(float(init_hw["l1_kb"]), device=device))
+            if "l2_kb" in init_hw:
+                hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(float(init_hw["l2_kb"]), device=device))
+
+    # Helper: ensure hardware area does not exceed budget tolerance
+    def _ensure_area_within_budget(self, hw_params):
+        config = Config.get_instance()
+        budget = getattr(config, "AREA_BUDGET_MM2", None)
+        tolerance = getattr(config, "AREA_BUDGET_TOLERANCE", 0.0)
+        if budget is None:
+            return
+        limit = budget * (1 + tolerance)
+        area = hw_params.get_area_cost().item()
+        if area <= limit:
+            return
+        base = config.AREA_BASE_MM2
+        variable = area - base
+        allowed = limit - base
+        if variable <= 0 or allowed <= 0:
+            print(f"[WARN] Base hardware area {base:.2f}mm² exceeds budget {limit:.2f}mm²")
+            return
+        scale = allowed / variable
+        scale_tensor = torch.log(torch.tensor(scale, device=hw_params.log_num_pes.device))
+        with torch.no_grad():
+            hw_params.log_num_pes.data += scale_tensor
+            for param in hw_params.log_buffer_sizes_kb.values():
+                param.data += scale_tensor
+        final_area = hw_params.get_area_cost().item()
+        print(
+            f"[WARN] Scaled hardware by {scale:.3f} to meet area budget: {final_area:.2f}mm² (limit {limit:.2f}mm²)"
+        )
+
     # Deprecated method retained for compatibility (no-op)
     def _override_params(self, params: dict[str, Any], graph, kind: str) -> None:  # noqa: D401
         return
@@ -95,7 +147,7 @@ class _BaseSearchRunner:
     def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
         random.seed(seed)
         torch.manual_seed(seed)
-        graph, searcher = self._build_components(cfg["shared"], recorder)
+        graph, searcher = self._build_components(cfg["shared"], recorder, cfg["shared"].get("model_name"))
         # 在搜索前按基准类型应用参数冻结/初始化约束
         self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
 
@@ -120,21 +172,19 @@ class MappingOnlyA1Runner(_BaseSearchRunner):
         config = Config.get_instance()
         config.APPLY_MIN_HW_BOUNDS = False
         print("[DEBUG] A1 baseline: APPLY_MIN_HW_BOUNDS disabled; hardware fixed")
-        # 冻结所有硬件参数
+        # 初始化硬件为场景预设并冻结
+        self._init_hw_from_scenario(hw_params)
         for p in hw_params.parameters():
             p.requires_grad = False
         # 解冻映射与融合参数（默认即可，无需显式设置）
-
-        # 将硬件参数设为固定基准值
-        hw_params.log_num_pes.data = torch.log(torch.tensor(128.0, device=hw_params.log_num_pes.device))
-        hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(2.0, device=hw_params.log_buffer_sizes_kb["L0_Registers"].device))
-        hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(8.0, device=hw_params.log_buffer_sizes_kb["L1_Accumulator"].device))
-        hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(256.0, device=hw_params.log_buffer_sizes_kb["L2_Scratchpad"].device))
 
         # 固定融合策略 (较少融合)
         if graph.fusion_groups:
             with torch.no_grad():
                 fusion_params.fusion_logits.data = torch.full_like(fusion_params.fusion_logits, -2.0)
+
+        # 确保初始硬件面积在预算容忍范围内
+        self._ensure_area_within_budget(hw_params)
 
 
 class MappingOnlyA2Runner(_BaseSearchRunner):
@@ -143,15 +193,13 @@ class MappingOnlyA2Runner(_BaseSearchRunner):
 
     # 同 A1 但允许融合搜索
     def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
-        # 冻结硬件参数
+        # 初始化硬件为场景预设并冻结
+        self._init_hw_from_scenario(hw_params)
         for p in hw_params.parameters():
             p.requires_grad = False
 
-        # 设置固定硬件规模
-        hw_params.log_num_pes.data = torch.log(torch.tensor(128.0, device=hw_params.log_num_pes.device))
-        hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(2.0, device=hw_params.log_buffer_sizes_kb["L0_Registers"].device))
-        hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(8.0, device=hw_params.log_buffer_sizes_kb["L1_Accumulator"].device))
-        hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(256.0, device=hw_params.log_buffer_sizes_kb["L2_Scratchpad"].device))
+        # 确保初始硬件面积在预算容忍范围内
+        self._ensure_area_within_budget(hw_params)
 
 
 class HardwareOnlyRunner(_BaseSearchRunner):
@@ -191,13 +239,10 @@ class CooptRunner(_BaseSearchRunner):
     # 协同优化：仍允许搜索，但从专家挑选的较优初始点出发
     def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
         device = hw_params.log_num_pes.device
-        with torch.no_grad():
-            # 1) 设定一个经验上效果较好的硬件规模
-            hw_params.log_num_pes.data = torch.log(torch.tensor(256.0, device=device))
-            hw_params.log_buffer_sizes_kb["L0_Registers"].data = torch.log(torch.tensor(4.0, device=device))
-            hw_params.log_buffer_sizes_kb["L1_Accumulator"].data = torch.log(torch.tensor(16.0, device=device))
-            hw_params.log_buffer_sizes_kb["L2_Scratchpad"].data = torch.log(torch.tensor(512.0, device=device))
+        # 1) 使用场景预设的硬件初始值
+        self._init_hw_from_scenario(hw_params)
 
+        with torch.no_grad():
             # 2) 初始化映射因子为可行的基础方案
             for level_factors in mapping.factors.values():
                 for dim_dict in level_factors.values():
@@ -213,6 +258,9 @@ class CooptRunner(_BaseSearchRunner):
             # 3) 融合概率初始化为中性值，鼓励搜索但不偏向任一方案
             if graph.fusion_groups:
                 fusion_params.fusion_logits.data = torch.zeros_like(fusion_params.fusion_logits)
+
+        # 确保初始硬件面积在预算容忍范围内
+        self._ensure_area_within_budget(hw_params)
 
 
 class ParetoFrontierRunner(_BaseSearchRunner):
@@ -270,7 +318,7 @@ class ParetoFrontierRunner(_BaseSearchRunner):
             print(f"\n=== Pareto Point {i+1}/{len(self.area_weights)}: Area Weight = {area_weight} ===")
             
             # Create fresh components for each weight point
-            graph, searcher = self._build_components(cfg["shared"], recorder)
+            graph, searcher = self._build_components(cfg["shared"], recorder, cfg["shared"].get("model_name"))
             
             # Update area weight using the searcher's dynamic method
             searcher.update_loss_weights({'area_weight': area_weight})
