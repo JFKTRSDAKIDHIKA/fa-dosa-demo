@@ -748,6 +748,17 @@ class FADOSASearcher(BaseSearcher):
                     # 反向传播
                     loss.backward()
 
+                    # 基于本次前向/反向的张量，统一计算与loss一致的度量，避免后续evaluate()或参数更新导致的不一致
+                    with torch.no_grad():
+                        metrics_current = {
+                            'latency_sec': latency.item(),
+                            'energy_pj': energy.item(),
+                            'area_mm2': area.item(),
+                            'edp': (latency * energy).item(),
+                            'log_edp': (torch.log(latency + 1e-9) + torch.log(energy + 1e-9)).item(),
+                            'mismatch_loss': mismatch_loss.item()
+                        }
+
                     # ---- 调试日志记录（Phase A） ----
                     if self.recorder is not None:
                         try:
@@ -837,11 +848,13 @@ class FADOSASearcher(BaseSearcher):
                         elif self.loss_strategy == 'pure_edp':
                             edp = latency * energy
                             mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                            area_budget_penalty = self._compute_area_budget_penalty(area, i)
                             print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
                             print(f"[DEBUG]   - EDP: {edp.item():.6f}")
                             print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
                             print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (未计入loss)")
+                            print(f"[DEBUG]   - 面积预算惩罚: {area_budget_penalty.item():.6f}")
+                            print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (包含基础面积，预算惩罚已单独计算)")
                             
                         else:
                             # 默认策略
@@ -858,7 +871,7 @@ class FADOSASearcher(BaseSearcher):
                         print(f"[DEBUG] 基础指标: 延迟={latency.item():.2e}s, 能耗={energy.item():.2e}pJ")
                         
                         trial_count += 1
-                        self.log_trial(trial_count, loss.item(), metrics, current_params)
+                        self.log_trial(trial_count, loss.item(), metrics_current, current_params)
 
                     # 退火温度
                     self.mapping.anneal_tau()
@@ -868,7 +881,7 @@ class FADOSASearcher(BaseSearcher):
                     old_best_loss = self.best_loss
                     # 计算loss的详细组成部分
                     loss_breakdown = self._compute_loss_breakdown(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=trial_count)
-                    self.update_best_result(loss.item(), current_params, metrics, trial_count, loss_breakdown)
+                    self.update_best_result(loss.item(), current_params, metrics_current, trial_count, loss_breakdown)
 
                     # 质量驱动的触发：当找到新的全局最优解时保存配置
                     if loss.item() < old_best_loss:
@@ -880,7 +893,7 @@ class FADOSASearcher(BaseSearcher):
 
                     # 记录日志
                     if i % 10 == 0:
-                        self.log_trial(trial_count, loss.item(), metrics, current_params)
+                        self.log_trial(trial_count, loss.item(), metrics_current, current_params)
 
             # Restore EDP-optimal parameters from Phase A before hardware optimization
             if self.best_edp_params is not None:
@@ -1121,11 +1134,13 @@ class FADOSASearcher(BaseSearcher):
                             elif self.loss_strategy == 'pure_edp':
                                 edp = latency * energy
                                 mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                                area_budget_penalty = self._compute_area_budget_penalty(area, i)
                                 print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
                                 print(f"[DEBUG]   - EDP: {edp.item():.6f}")
                                 print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
                                 print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                                print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (未计入loss)")
+                                print(f"[DEBUG]   - 面积预算惩罚: {area_budget_penalty.item():.6f}")
+                                print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (基础面积，预算惩罚已单独计算)")
                                 
                             else:
                                 # 默认策略
