@@ -860,7 +860,12 @@ class FADOSASearcher(BaseSearcher):
                     if i % 10 == 0:
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
 
-            # 根据当前映射推导最小硬件规模，可作为硬件优化的下界约束
+            # Restore best parameters from Phase A before hardware optimization
+            self._set_params_from_dict(self.best_params)
+            if self.logger:
+                self.logger.console("Restored best parameters from Phase A before hardware optimization.")
+
+            # 根据当前映射推导最小硬件规模，作为硬件优化的起点
             with torch.no_grad():
                 # 恢复Phase A中的最佳映射/融合配置，确保后续硬件搜索基于最优映射
                 if self.best_params is not None:

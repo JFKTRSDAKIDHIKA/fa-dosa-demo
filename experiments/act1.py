@@ -21,11 +21,12 @@ import yaml
 DEFAULT_CFG_PATH = Path(__file__).resolve().parent.parent / "configs" / "act1.yaml"
 
 
-def run_act1(cfg_path: str | Path | None = None) -> None:  # noqa: D401
+def run_act1(cfg_path: str | Path | None = None, scenario: str | None = None) -> None:  # noqa: D401
     """Entry point for Act I experiment.
 
     Args:
         cfg_path: Path to YAML configuration. If *None*, fallbacks to default sample.
+        scenario: Scenario preset name. Overrides config file if provided.
     """
     if isinstance(cfg_path, str):
         cfg: dict[str, Any] = yaml.safe_load(cfg_path)
@@ -37,9 +38,17 @@ def run_act1(cfg_path: str | Path | None = None) -> None:  # noqa: D401
         with cfg_path.open("r", encoding="utf-8") as fp:
             cfg: dict[str, Any] = yaml.safe_load(fp)
 
+    # Resolve scenario from CLI or config
+    scenario = scenario or cfg.get("scenario") or cfg.get("shared", {}).get("scenario")
+    cfg.setdefault("shared", {})["scenario"] = scenario
+
     # Lazy import to avoid circular dependency before skeletons are complete
     baselines_mod = importlib.import_module("experiments.baselines")
     recorder_mod = importlib.import_module("logging_utils.recorder")
+    from dosa.config import Config
+
+    if scenario:
+        Config.get_instance().apply_scenario_preset(scenario)
 
     # Build output root directory
     from datetime import datetime
@@ -97,5 +106,6 @@ def run_act1(cfg_path: str | Path | None = None) -> None:  # noqa: D401
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Act I experiment")
     parser.add_argument("--config", default=str(DEFAULT_CFG_PATH), help="Path to YAML config file")
+    parser.add_argument("--scenario", default=None, help="Scenario preset name")
     args = parser.parse_args()
-    run_act1(args.config)
+    run_act1(args.config, args.scenario)

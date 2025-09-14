@@ -38,7 +38,17 @@ class _BaseSearchRunner:
         graph = self._create_fallback_graph()
         config = Config.get_instance()
         device = config.DEVICE
-        hw = HardwareParameters().to(device)
+        scenario = cfg.get("scenario")
+        if scenario:
+            init_hw = config.SCENARIO_PRESETS.get(scenario, {}).get("initial_hw", {})
+            hw = HardwareParameters(
+                initial_num_pes=init_hw.get("num_pes", 4.0),
+                initial_l0_kb=init_hw.get("l0_kb", 0.1),
+                initial_l1_kb=init_hw.get("l1_kb", 0.2),
+                initial_l2_kb=init_hw.get("l2_kb", 1.0),
+            ).to(device)
+        else:
+            hw = HardwareParameters().to(device)
         mapping = FineGrainedMapping(graph.problem_dims, config.MEMORY_HIERARCHY).to(device)
         fusion = FusionParameters(graph).to(device)
         perf_model = HighFidelityPerformanceModel(config).to(device)
