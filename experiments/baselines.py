@@ -109,6 +109,9 @@ class MappingOnlyA1Runner(_BaseSearchRunner):
 
     # 仅优化映射/融合，硬件固定
     def _apply_constraints(self, hw_params, mapping, fusion_params, graph, kind: str) -> None:  # noqa: D401
+        config = Config.get_instance()
+        config.APPLY_MIN_HW_BOUNDS = False
+        print("[DEBUG] A1 baseline: APPLY_MIN_HW_BOUNDS disabled; hardware fixed")
         # 冻结所有硬件参数
         for p in hw_params.parameters():
             p.requires_grad = False

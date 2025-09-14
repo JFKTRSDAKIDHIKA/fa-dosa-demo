@@ -88,7 +88,10 @@ class BaseSearcher(ABC):
         # The PE count is treated as a deterministic value from ``min_hw``
         # instead of a differentiable parameter.
         min_hw = derive_minimal_hardware(self.mapping, self.config)
-        self._apply_min_hw_bounds(min_hw, reset=False)
+        if getattr(self.config, "APPLY_MIN_HW_BOUNDS", True):
+            self._apply_min_hw_bounds(min_hw, reset=False)
+        else:
+            print("[DEBUG] Skipping minimal hardware bounds in evaluation")
 
         # 调用性能模型
         latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
@@ -914,6 +917,16 @@ class FADOSASearcher(BaseSearcher):
                         print(f"[DEBUG] ✓ 硬件参数未发生变化")
                 else:
                     print(f"[DEBUG] 跳过最小硬件约束应用 (APPLY_MIN_HW_BOUNDS=False)")
+                    current_hw_after = {
+                        'num_pes': self.hw_params.get_projected_num_pes().item(),
+                        'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                        'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                        'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                    }
+                    assert all(abs(current_hw_before[k] - current_hw_after[k]) < 1e-6 for k in current_hw_before), (
+                        "Hardware parameters changed despite APPLY_MIN_HW_BOUNDS=False"
+                    )
+                    print("[DEBUG] ✓ 硬件参数未发生变化 (APPLY_MIN_HW_BOUNDS=False)")
 
             # Report mapping and fusion parameter changes
             current_mapping_state = self._snapshot_mapping()
