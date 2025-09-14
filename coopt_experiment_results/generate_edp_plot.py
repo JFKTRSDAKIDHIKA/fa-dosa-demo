@@ -15,12 +15,7 @@ def find_result_files(directory, pattern="*.json"):
     result_files = []
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.endswith('.json') and (
-                'result' in file.lower() or 
-                'summary' in file.lower() or 
-                'best' in file.lower() or
-                'meta' in file.lower()
-            ):
+            if file.endswith('.json') and ('result' in file.lower() or 'summary' in file.lower() or 'meta' in file.lower() or 'best' in file.lower()):
                 result_files.append(os.path.join(root, file))
     return result_files
 
@@ -30,50 +25,25 @@ def extract_edp_from_file(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # 尝试不同的键名来提取EDP数据
-        edp_keys = ['edp', 'EDP', 'energy_delay_product', 'latency_energy_product']
-        latency_keys = ['latency', 'delay', 'execution_time', 'latency_sec']
-        energy_keys = ['energy', 'power', 'energy_consumption', 'energy_pj']
-        
         edp = None
-        latency = None
-        energy = None
         
-        # 检查是否有嵌套的结果数据（如run_meta.json中的best_edp_metrics）
-        if 'best_edp_metrics' in data:
-            nested_data = data['best_edp_metrics']
-            if 'edp' in nested_data:
-                edp = float(nested_data['edp'])
-                latency = nested_data.get('latency_sec')
-                energy = nested_data.get('energy_pj')
-                return edp, latency, energy
+        # 特殊处理COOPT的run_meta.json文件
+        if 'final_results' in data and isinstance(data['final_results'], dict):
+            final_results = data['final_results']
+            if 'best_edp' in final_results:
+                edp = float(final_results['best_edp'])
+            elif 'best_edp_metrics' in final_results and isinstance(final_results['best_edp_metrics'], dict):
+                if 'edp' in final_results['best_edp_metrics']:
+                    edp = float(final_results['best_edp_metrics']['edp'])
         
         # 直接查找EDP
-        for key in edp_keys:
-            if key in data:
-                edp = float(data[key])
-                break
+        if edp is None and 'edp' in data:
+            edp = float(data['edp'])
         
-        # 如果没有直接的EDP，尝试从latency和energy计算
-        if edp is None:
-            for lat_key in latency_keys:
-                if lat_key in data:
-                    latency = float(data[lat_key])
-                    break
-            
-            for eng_key in energy_keys:
-                if eng_key in data:
-                    energy = float(data[eng_key])
-                    break
-            
-            if latency is not None and energy is not None:
-                edp = latency * energy
-        
-        return edp, latency, energy
-    
+        return edp
     except Exception as e:
         print(f"解析文件 {filepath} 时出错: {e}")
-        return None, None, None
+        return None
 
 def main():
     results_dir = Path(__file__).parent
@@ -89,7 +59,7 @@ def main():
                 files = find_result_files(str(baseline_path))
                 edps = []
                 for file in files:
-                    edp, lat, eng = extract_edp_from_file(file)
+                    edp = extract_edp_from_file(file)
                     if edp is not None:
                         edps.append(edp)
                 
@@ -105,7 +75,7 @@ def main():
     if coopt_dir.exists():
         files = find_result_files(str(coopt_dir))
         for file in files:
-            edp, lat, eng = extract_edp_from_file(file)
+            edp = extract_edp_from_file(file)
             if edp is not None:
                 coopt_results.append(edp)
     
@@ -157,12 +127,12 @@ def main():
     # 调整布局
     plt.tight_layout()
     
-    # 保存图片
-    output_path = results_dir / "edp_comparison.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"EDP对比图已保存到: {output_path}")
+    # 保存图表
+    plot_path = results_dir / "edp_comparison.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"EDP对比图已保存到: {plot_path}")
     
-    # 保存数据摘要
+    # 生成实验摘要
     summary = {
         'baseline_results': baseline_results,
         'coopt_results': {
@@ -183,7 +153,7 @@ def main():
     for method, mean in zip(methods, edp_means):
         print(f"{method}: EDP = {mean:.2e}")
     
-    if len(methods) > 1:
+    if len(methods) > 1 and coopt_results:
         baseline_best = min(edp_means[:-1]) if len(edp_means) > 1 else edp_means[0]
         coopt_edp = edp_means[-1]
         improvement = (baseline_best - coopt_edp) / baseline_best * 100

@@ -37,9 +37,19 @@ class _BaseSearchRunner:
         self.name = name
 
     def _build_components(self, cfg: dict[str, Any], recorder, model_name: str | None = None):
-        if model_name and os.path.exists(f"onnx_models/{model_name}.onnx"):
+        # 使用绝对路径确保能找到ONNX文件
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        onnx_path = os.path.join(project_root, f"onnx_models/{model_name}.onnx") if model_name else None
+        print(f"[BASELINE] 检查工作负载: {model_name}")
+        print(f"[BASELINE] ONNX路径: {onnx_path}")
+        print(f"[BASELINE] 当前工作目录: {os.getcwd()}")
+        print(f"[BASELINE] ONNX文件存在: {os.path.exists(onnx_path) if onnx_path else False}")
+        
+        if model_name and onnx_path and os.path.exists(onnx_path):
+            print(f"[BASELINE] 使用ONNX模型: {model_name}")
             graph = parse_onnx_to_graph(model_name)
         else:
+            print(f"[BASELINE] 使用fallback图")
             graph = self._create_fallback_graph()
         config = Config.get_instance()
         
@@ -147,7 +157,11 @@ class _BaseSearchRunner:
     def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
         random.seed(seed)
         torch.manual_seed(seed)
-        graph, searcher = self._build_components(cfg["shared"], recorder, cfg["shared"].get("model_name"))
+        # 从配置文件中正确获取工作负载名称
+        workload_name = cfg.get("workload", {}).get("name", "resnet18")
+        # 如果workload_name包含下划线，取第一部分作为模型名称
+        model_name = workload_name.split("_")[0] if "_" in workload_name else workload_name
+        graph, searcher = self._build_components(cfg["shared"], recorder, model_name)
         # 在搜索前按基准类型应用参数冻结/初始化约束
         self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
 

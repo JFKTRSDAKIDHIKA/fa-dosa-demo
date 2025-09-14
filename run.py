@@ -34,14 +34,17 @@ def parse_onnx_to_graph(model_name: str) -> ComputationGraph:
     Returns:
         ComputationGraph: Parsed computation graph with layers and fusion groups
     """
-    # Construct ONNX file path
-    onnx_path = f"onnx_models/{model_name}.onnx"
+    # Construct ONNX file path using absolute path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    onnx_path = os.path.join(script_dir, f"onnx_models/{model_name}.onnx")
     
     try:
         # Load ONNX model
         if not os.path.exists(onnx_path):
-            # 使用fallback graph，警告将通过logger输出
+            print(f"[PARSE] ONNX文件不存在: {onnx_path}，使用fallback图")
             return _create_fallback_graph()
+        
+        print(f"[PARSE] 正在加载ONNX模型: {onnx_path}")
         
         model = onnx.load(onnx_path)
         graph = ComputationGraph()

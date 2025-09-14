@@ -152,7 +152,7 @@ def find_result_files(directory, pattern="*.json"):
     result_files = []
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.endswith('.json') and ('result' in file.lower() or 'summary' in file.lower()):
+            if file.endswith('.json') and ('result' in file.lower() or 'summary' in file.lower() or 'meta' in file.lower() or 'best' in file.lower()):
                 result_files.append(os.path.join(root, file))
     return result_files
 
@@ -164,30 +164,63 @@ def extract_edp_from_file(filepath):
         
         # 尝试不同的键名来提取EDP数据
         edp_keys = ['edp', 'EDP', 'energy_delay_product', 'latency_energy_product']
-        latency_keys = ['latency', 'delay', 'execution_time']
-        energy_keys = ['energy', 'power', 'energy_consumption']
+        latency_keys = ['latency', 'delay', 'execution_time', 'latency_sec']
+        energy_keys = ['energy', 'power', 'energy_consumption', 'energy_pj']
         
         edp = None
         latency = None
         energy = None
         
+        # 特殊处理COOPT的run_meta.json文件
+        if 'best_edp' in data:
+            edp = float(data['best_edp'])
+        elif 'final_results' in data and isinstance(data['final_results'], dict):
+            final_results = data['final_results']
+            if 'best_edp' in final_results:
+                edp = float(final_results['best_edp'])
+            elif 'best_edp_metrics' in final_results and isinstance(final_results['best_edp_metrics'], dict):
+                if 'edp' in final_results['best_edp_metrics']:
+                    edp = float(final_results['best_edp_metrics']['edp'])
+            elif 'best_metrics' in final_results and isinstance(final_results['best_metrics'], dict):
+                if 'edp' in final_results['best_metrics']:
+                    edp = float(final_results['best_metrics']['edp'])
+        elif 'best_metrics' in data and isinstance(data['best_metrics'], dict):
+            if 'edp' in data['best_metrics']:
+                edp = float(data['best_metrics']['edp'])
+        
         # 直接查找EDP
-        for key in edp_keys:
-            if key in data:
-                edp = float(data[key])
-                break
+        if edp is None:
+            for key in edp_keys:
+                if key in data:
+                    edp = float(data[key])
+                    break
         
         # 如果没有直接的EDP，尝试从latency和energy计算
         if edp is None:
-            for lat_key in latency_keys:
-                if lat_key in data:
-                    latency = float(data[lat_key])
-                    break
+            # 先尝试从best_metrics中获取
+            if 'best_metrics' in data and isinstance(data['best_metrics'], dict):
+                best_metrics = data['best_metrics']
+                for lat_key in latency_keys:
+                    if lat_key in best_metrics:
+                        latency = float(best_metrics[lat_key])
+                        break
+                for eng_key in energy_keys:
+                    if eng_key in best_metrics:
+                        energy = float(best_metrics[eng_key])
+                        break
             
-            for eng_key in energy_keys:
-                if eng_key in data:
-                    energy = float(data[eng_key])
-                    break
+            # 如果best_metrics中没有，再从根级别查找
+            if latency is None:
+                for lat_key in latency_keys:
+                    if lat_key in data:
+                        latency = float(data[lat_key])
+                        break
+            
+            if energy is None:
+                for eng_key in energy_keys:
+                    if eng_key in data:
+                        energy = float(data[eng_key])
+                        break
             
             if latency is not None and energy is not None:
                 edp = latency * energy
