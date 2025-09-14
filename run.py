@@ -381,9 +381,9 @@ def run_experiment(
     duration = end_time - start_time
     logger.event("search_completed", duration=duration)
     
-    # 输出结果摘要
-    best_metrics = results.get('best_metrics', {})
-    if results['best_loss'] != float('inf') and best_metrics:
+    # 输出结果摘要（基于全局最优 EDP）
+    best_metrics = results.get('best_edp_metrics', {})
+    if results.get('best_edp', float('inf')) != float('inf') and best_metrics:
         logger.console(f"\n--- Search Completed in {duration:.2f}s ---")
         logger.console(f"Best Loss: {results['best_loss']:.4f}")
         logger.console(f"Best EDP: {best_metrics.get('edp', 0):.2e}")
@@ -395,12 +395,12 @@ def run_experiment(
     logger.console(f"Total Trials: {results['total_trials']}")
     
     # 保存最终配置（仅当找到有效解时）
-    if results['best_params'] is not None:
+    if results.get('best_edp_params') is not None:
         final_config_filename = logger.get_run_dir() / f"final_configuration_{searcher_type.replace('-', '_')}.json"
-        
+
         # 重构映射参数
         best_mapping = {}
-        best_params = results['best_params']
+        best_params = results['best_edp_params']
         
         # 从扁平化参数重构mapping结构
         for key, value in best_params.items():
@@ -431,11 +431,11 @@ def run_experiment(
                     })
         
         # 设置硬件参数到最佳配置
-        if 'num_pes' in results['best_params']:
-            hw_params.log_num_pes.data = torch.log(torch.tensor(float(results['best_params']['num_pes'])))
+        if 'num_pes' in results['best_edp_params']:
+            hw_params.log_num_pes.data = torch.log(torch.tensor(float(results['best_edp_params']['num_pes'])))
         for level in ['l0_registers', 'l1_accumulator', 'l2_scratchpad']:
             key = f'{level}_size_kb'
-            if key in results['best_params']:
+            if key in results['best_edp_params']:
                 level_name = level.replace('_', ' ').title().replace(' ', '_')
                 if level == 'l0_registers':
                     level_name = 'L0_Registers'
@@ -444,7 +444,7 @@ def run_experiment(
                 elif level == 'l2_scratchpad':
                     level_name = 'L2_Scratchpad'
                 if level_name in hw_params.log_buffer_sizes_kb:
-                    hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_params'][key])))
+                    hw_params.log_buffer_sizes_kb[level_name].data = torch.log(torch.tensor(float(results['best_edp_params'][key])))
         
         save_configuration_to_json(
             hw_params, best_mapping, best_fusion_decisions, str(final_config_filename)
@@ -571,7 +571,7 @@ def run_comparison_experiment(
     
     for searcher_type, results in all_results.items():
         if 'error' not in results:
-            best_metrics = results.get('best_metrics', {})
+            best_metrics = results.get('best_edp_metrics', {})
             if best_metrics and 'edp' in best_metrics:
                 print(f"{searcher_type.upper():15s}: "
                       f"Best EDP = {best_metrics['edp']:.2e}, "

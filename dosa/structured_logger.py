@@ -292,13 +292,14 @@ class StructuredLogger:
         
         # 控制台输出总结
         best_loss = final_results.get('best_loss', float('inf'))
+        best_edp = final_results.get('best_edp', float('inf'))
         total_trials = final_results.get('total_trials', 0)
-        
-        if best_loss != float('inf'):
-            best_metrics = final_results.get('best_metrics', {})
+
+        if best_edp != float('inf'):
+            best_metrics = final_results.get('best_edp_metrics', {})
             edp = best_metrics.get('edp', 0)
             area = best_metrics.get('area_mm2', 0)
-            
+
             self.console(f"\n📊 Final Results:")
             self.console(f"   Best Loss: {best_loss:.4f}")
             self.console(f"   Best EDP: {edp:.2e}")

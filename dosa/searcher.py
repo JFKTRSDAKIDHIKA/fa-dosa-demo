@@ -42,9 +42,16 @@ class BaseSearcher(ABC):
         self.space = SearchSpace(graph)
         
         # 记录最佳结果
+        # - ``best_loss``/``best_params``/``best_metrics`` 保留基于损失的最优记录，
+        #   以便继续依赖质量驱动触发器等逻辑。
+        # - ``best_edp`` 及其相关字段单独跟踪 EDP 最优配置，
+        #   供 PhaseB 继续优化以及最终结果报告使用。
         self.best_loss = float('inf')
         self.best_params = None
         self.best_metrics = None
+        self.best_edp = float('inf')
+        self.best_edp_params = None
+        self.best_edp_metrics = None
         
         # 损失策略配置
         self.loss_strategy = getattr(config, 'LOSS_STRATEGY', 'log_edp_plus_area')
@@ -482,30 +489,42 @@ class BaseSearcher(ABC):
         
         return final_penalty
 
-    def update_best_result(self, loss: float, params: Dict[str, Any], metrics: Dict[str, float], trial: int, loss_breakdown: Dict[str, Any] = None):
+    def update_best_result(
+        self,
+        loss: float,
+        params: Dict[str, Any],
+        metrics: Dict[str, float],
+        trial: int,
+        loss_breakdown: Dict[str, Any] = None,
+    ):
+        """更新搜索过程中的最佳结果。
+
+        同时维护基于 ``loss`` 和 ``metrics['edp']`` 的两套最优记录：
+        - ``best_loss`` 相关字段用于保持与原有触发逻辑的兼容性；
+        - ``best_edp`` 相关字段用于在 PhaseB 中恢复 EDP 最优配置，并最终汇报。
         """
-        更新最佳结果
-        
-        Args:
-            loss: 当前损失值
-            params: 当前参数
-            metrics: 当前性能指标
-            trial: 当前试验次数
-            loss_breakdown: loss的详细组成部分（可选）
-        """
-        if loss < self.best_loss:
+
+        improved_loss = loss < self.best_loss
+        current_edp = metrics.get("edp", float("inf"))
+        improved_edp = current_edp < self.best_edp
+
+        if improved_loss:
             self.best_loss = loss
             self.best_params = params.copy()
             self.best_metrics = metrics.copy()
-            # 若集成 Recorder，则同步更新
+
+        if improved_edp:
+            self.best_edp = current_edp
+            self.best_edp_params = params.copy()
+            self.best_edp_metrics = metrics.copy()
             if self.recorder is not None:
                 self.recorder.update_best(metrics, key="edp")
-            # 使用StructuredLogger记录新的最佳结果事件
-            if self.logger:
-                event_data = {"loss": loss, **metrics}
-                if loss_breakdown:
-                    event_data["loss_breakdown"] = loss_breakdown
-                self.logger.event("new_best", step=trial, metrics=event_data)
+
+        if (improved_loss or improved_edp) and self.logger:
+            event_data = {"loss": loss, **metrics}
+            if loss_breakdown:
+                event_data["loss_breakdown"] = loss_breakdown
+            self.logger.event("new_best", step=trial, metrics=event_data)
     
     from typing import Optional
 
@@ -863,23 +882,23 @@ class FADOSASearcher(BaseSearcher):
                     if i % 10 == 0:
                         self.log_trial(trial_count, loss.item(), metrics, current_params)
 
-            # Restore best parameters from Phase A before hardware optimization
-            if self.best_params is not None:
-                self._set_params_from_dict(self.best_params)
+            # Restore EDP-optimal parameters from Phase A before hardware optimization
+            if self.best_edp_params is not None:
+                self._set_params_from_dict(self.best_edp_params)
                 if self.logger:
-                    self.logger.console("Restored best parameters from Phase A before hardware optimization.")
+                    self.logger.console("Restored best EDP parameters from Phase A before hardware optimization.")
             else:
                 if self.logger:
-                    self.logger.console("No best parameters found in Phase A, continuing with current parameters.")
+                    self.logger.console("No EDP-optimal parameters found in Phase A, continuing with current parameters.")
 
             # 根据当前映射推导最小硬件规模，作为硬件优化的起点
             with torch.no_grad():
                 # 恢复Phase A中的最佳映射/融合配置，确保后续硬件搜索基于最优映射
-                if self.best_params is not None:
-                    print("[DEBUG] Phase A结束 - 恢复最佳映射/融合配置")
-                    self._set_params_from_dict(self.best_params)
+                if self.best_edp_params is not None:
+                    print("[DEBUG] Phase A结束 - 恢复最佳映射/融合配置 (EDP 最优)")
+                    self._set_params_from_dict(self.best_edp_params)
                 else:
-                    print("[DEBUG] Phase A结束 - 无可恢复的最佳配置，使用当前参数")
+                    print("[DEBUG] Phase A结束 - 无可恢复的最佳 EDP 配置，使用当前参数")
 
                 # 记录当前硬件参数（Phase A结束时）
                 current_hw_before = {
@@ -1183,6 +1202,9 @@ class FADOSASearcher(BaseSearcher):
             'best_loss': self.best_loss,
             'best_params': self.best_params,
             'best_metrics': self.best_metrics,
+            'best_edp': self.best_edp,
+            'best_edp_params': self.best_edp_params,
+            'best_edp_metrics': self.best_edp_metrics,
             'total_trials': trial_count
         }
     
@@ -1256,7 +1278,7 @@ class RandomSearcher(BaseSearcher):
             
             # 记录日志
             if (trial + 1) % 10 == 0 or trial == 0:
-                best_edp = self.best_metrics['edp'] if self.best_metrics else float('inf')
+                best_edp = self.best_edp_metrics['edp'] if self.best_edp_metrics else float('inf')
                 print(f"Trial {trial + 1}: Loss={loss:.4f}, EDP={metrics['edp']:.2e}, Best EDP={best_edp:.2e}")
             
             self.log_trial(trial + 1, loss, metrics, random_params_dict)
@@ -1265,6 +1287,9 @@ class RandomSearcher(BaseSearcher):
             'best_loss': self.best_loss,
             'best_params': self.best_params,
             'best_metrics': self.best_metrics,
+            'best_edp': self.best_edp,
+            'best_edp_params': self.best_edp_params,
+            'best_edp_metrics': self.best_edp_metrics,
             'total_trials': num_trials
         }
 
@@ -1409,15 +1434,18 @@ class BayesianOptimizationSearcher(BaseSearcher):
         
         print(f"\nBayesian Optimization completed!")
         print(f"Best loss: {best_loss:.4f}")
-        if self.best_metrics is not None:
-            print(f"Best EDP: {self.best_metrics['edp']:.2e}")
+        if self.best_edp_metrics is not None:
+            print(f"Best EDP: {self.best_edp_metrics['edp']:.2e}")
         else:
             print("No valid solutions found during optimization.")
-        
+
         return {
             'best_loss': self.best_loss,
             'best_params': self.best_params,
             'best_metrics': self.best_metrics or {},  # 如果为None则返回空字典
+            'best_edp': self.best_edp,
+            'best_edp_params': self.best_edp_params,
+            'best_edp_metrics': self.best_edp_metrics or {},
             'total_trials': num_trials,
             'skopt_result': result  # 保存完整的 scikit-optimize 结果
         }
@@ -1655,13 +1683,17 @@ class GeneticAlgorithmSearcher(BaseSearcher):
         
         print(f"\nGenetic Algorithm completed!")
         print(f"Best loss: {best_loss:.4f}")
-        print(f"Best EDP: {self.best_metrics['edp']:.2e}")
+        if self.best_edp_metrics is not None:
+            print(f"Best EDP: {self.best_edp_metrics['edp']:.2e}")
         print(f"Total evaluations: {self._current_trial}")
-        
+
         return {
             'best_loss': self.best_loss,
             'best_params': self.best_params,
             'best_metrics': self.best_metrics,
+            'best_edp': self.best_edp,
+            'best_edp_params': self.best_edp_params,
+            'best_edp_metrics': self.best_edp_metrics,
             'total_trials': self._current_trial,
             'generations': generations,
             'population_size': self.population_size,
