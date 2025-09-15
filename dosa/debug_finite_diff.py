@@ -39,11 +39,11 @@ graph = MockGraph(problem_dims)
 
 # === 前向 ===
 lat, en, area, mm, comp = perf_model(graph, hw_params, mapping, None)
-loss = lat * en
+loss = en
 loss.backward()
 
 # === 选择一个测试参数 ===
-param_name = "factors.L0_Registers.K.temporal"
+param_name = "factors.L2_Scratchpad.S.temporal"
 named_params = dict(mapping.named_parameters())
 param = named_params[param_name]
 
@@ -51,12 +51,12 @@ print(f"\n[INFO] Testing finite difference for {param_name}")
 print(f"Autograd grad: {param.grad}")
 
 # === 有限差分 ===
-eps = 1e-6
+eps = 1e-8
 with torch.no_grad():
     old_val = param.item()
     param.copy_(torch.tensor(old_val + eps))
 lat2, en2, area2, mm2, comp2 = perf_model(graph, hw_params, mapping, None)
-loss2 = lat2 * en2
+loss2 = en2
 num_grad = (loss2.item() - loss.item()) / eps
 
 print(f"Numerical grad ≈ {num_grad:.6e}")

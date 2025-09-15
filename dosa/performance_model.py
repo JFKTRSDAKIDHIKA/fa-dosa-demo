@@ -23,6 +23,30 @@ from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
 from dosa.dmt import InPlaceFusionDMT, SkipConnectionDMT
 
+def debug_grad(target_var, mapping, path="L2_Scratchpad.R.spatial", var_name="target_var"):
+    try:
+        # Recursively get parameter
+        target = mapping.factors
+        for p in path.split("."):
+            target = getattr(target, p)
+    except AttributeError:
+        print(f"[GRADIENT DEBUG] Path not found: {path}")
+        return
+    
+    if not getattr(target, "requires_grad", False):
+        print(f"[GRADIENT DEBUG] {path} does not require gradient (requires_grad=False)")
+        return
+
+    grad = torch.autograd.grad(target_var, target,
+                               retain_graph=True, allow_unused=True)[0]
+    if grad is None:
+        print(f"[GRADIENT DEBUG] {path} gradient is None - may not be involved in computation")
+    else:
+        print(f"[GRADIENT DEBUG] ∂({var_name})/∂({path}) = {grad.item()}")
+        print(f"[GRADIENT DEBUG] {path}.value = {target.item()}")
+        print(f"[GRADIENT DEBUG] {var_name} = {target_var.item()}")
+
+
 # 获取全局配置实例
 _config = Config.get_instance()
 
@@ -330,6 +354,9 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 # 计算该张量的填充流量（字节）
                 tensor_fill_bytes = tensor_fill_accesses * self.config.BYTES_PER_ELEMENT
+
+                # debug
+                # debug_grad(tensor_fill_bytes, mapping, "L2_Scratchpad.S.temporal")
                 
                 # 映射张量类型到标准名称
                 tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
@@ -345,20 +372,28 @@ class HighFidelityPerformanceModel(nn.Module):
                     'Tiles_above': tiles.detach().cpu().item() if isinstance(tiles, torch.Tensor) else tiles
                 }
         
-        # 转换所有 torch.Tensor 为 float 以便 JSON 序列化
         result = {}
         for interface_name, interface_data in detailed_fill_traffic.items():
             result[interface_name] = {
-                'total_bytes': interface_data['total_bytes'].detach().cpu().item() if isinstance(interface_data['total_bytes'], torch.Tensor) else interface_data['total_bytes'],
-                'breakdown': {
-                    tensor_name: tensor_bytes.detach().cpu().item() if isinstance(tensor_bytes, torch.Tensor) else tensor_bytes
-                    for tensor_name, tensor_bytes in interface_data['breakdown'].items()
-                },
-                'drivers': interface_data['drivers']  # 驱动因子已经在上面转换为 float
+                'total_bytes': interface_data['total_bytes'],      # 保持 Tensor
+                'breakdown': interface_data['breakdown'],          # 保持 Tensor
+                'drivers': interface_data['drivers']               # drivers 可以是 float
             }
-        
+
+        # 如果需要序列化
+        if debug_data is not None:
+            debug_data["writeback_serialized"] = {
+                name: {
+                    'total_bytes': float(data['total_bytes'].detach().cpu().item()),
+                    'breakdown': {k: float(v.detach().cpu().item()) for k, v in data['breakdown'].items()},
+                    'drivers': data['drivers']
+                }
+                for name, data in result.items()
+            }
+
         return result
-    
+
+        
     def calculate_inter_level_writeback_traffic(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
         """
         计算层级间写回流量（自下而上的数据移动）
@@ -472,19 +507,27 @@ class HighFidelityPerformanceModel(nn.Module):
                 "final_updates_O(i)": updates_O_i.detach().cpu().item() if isinstance(updates_O_i, torch.Tensor) else updates_O_i
             }
         
-        # 转换所有 torch.Tensor 为 float 以便 JSON 序列化
         result = {}
         for interface_name, interface_data in detailed_writeback_traffic.items():
             result[interface_name] = {
-                'total_bytes': interface_data['total_bytes'].detach().cpu().item() if isinstance(interface_data['total_bytes'], torch.Tensor) else interface_data['total_bytes'],
-                'breakdown': {
-                    tensor_name: tensor_bytes.detach().cpu().item() if isinstance(tensor_bytes, torch.Tensor) else tensor_bytes
-                    for tensor_name, tensor_bytes in interface_data['breakdown'].items()
-                },
-                'drivers': interface_data['drivers']  # 驱动因子已经在上面转换为 float
+                'total_bytes': interface_data['total_bytes'],      # 保持 Tensor
+                'breakdown': interface_data['breakdown'],          # 保持 Tensor
+                'drivers': interface_data['drivers']               # drivers 可以是 float
             }
-        
+
+        # 如果需要序列化
+        if debug_data is not None:
+            debug_data["writeback_serialized"] = {
+                name: {
+                    'total_bytes': float(data['total_bytes'].detach().cpu().item()),
+                    'breakdown': {k: float(v.detach().cpu().item()) for k, v in data['breakdown'].items()},
+                    'drivers': data['drivers']
+                }
+                for name, data in result.items()
+            }
+
         return result
+
     
     def calculate_intra_level_consumption_accesses(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, debug_data: dict = None) -> dict:
         """
@@ -1081,6 +1124,7 @@ class HighFidelityPerformanceModel(nn.Module):
 
         for layer in layers:
             total_macs += calculate_macs(layer['dims'])
+            
             # weight size
             weight_elems = torch.tensor(1.0, device=self.config.DEVICE)
             for d in D_W:
@@ -1116,8 +1160,9 @@ class HighFidelityPerformanceModel(nn.Module):
                 extra_output_bytes += output_bytes * (tiles - 1) * 2
                 partial_penalty += tiles - 1
 
-        # Total DRAM traffic (weights + first input + final output + partial-sum overhead)
-        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes + extra_output_bytes
+        
+
+        # debug_grad(dram_bytes, mapping, "L2_Scratchpad.S.spatial")
 
         num_pes = hw_params.get_projected_num_pes()
 
@@ -1164,12 +1209,36 @@ class HighFidelityPerformanceModel(nn.Module):
         effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
         compute_cycles = total_macs / effective_pes
 
+        
+
+        # BUG: all_factors loses gradient information here because calculate_inter_level_fill_traffic 
+        # converts torch.Tensor to Python float internally, breaking the gradient chain
+        # Print types for debugging
+        print("=== Debug Information ===")
+        print(f"Type of all_factors['S']['L2_Scratchpad']['temporal']: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
+        print(f"Type of hw_params: {type(hw_params)}")
+        print("=== End Debug ===\n")
+
         detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(
             layer['dims'], all_factors, num_pes, hw_params, debug_data)
         detailed_writeback_traffic_info = self.calculate_inter_level_writeback_traffic(
             layer['dims'], all_factors, num_pes, debug_data)
 
         memory_cycles_list = []
+
+        print("=== Traffic Gradient Debug ===")
+        for interface, info in detailed_fill_traffic_info.items():
+            tb = info['total_bytes']
+            print(f"[DEBUG] {interface}: type={type(tb)} "
+                f"requires_grad={getattr(tb, 'requires_grad', None)} "
+                f"grad_fn={getattr(tb, 'grad_fn', None)}")
+
+            # 如果是 Tensor，尝试对它做一次 debug_grad
+            if isinstance(tb, torch.Tensor):
+                debug_grad(tb, mapping, "L2_Scratchpad.S.temporal")
+        print("=== Traffic Gradient Debug End ===")
+
+
         for interface, interface_info in detailed_fill_traffic_info.items():
             upper_level_name = interface.split('_to_')[0]
             fill_bytes_total = interface_info['total_bytes']
@@ -1180,6 +1249,8 @@ class HighFidelityPerformanceModel(nn.Module):
         for interface, interface_info in detailed_writeback_traffic_info.items():
             lower_level_name = interface.split('_to_')[0]
             writeback_bytes_total = interface_info['total_bytes']
+
+            
             bandwidth_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(lower_level_name, num_pes, self.config)
             memory_cycles = writeback_bytes_total / (bandwidth_bytes_per_cycle + torch.tensor(1e-9, device=self.config.DEVICE))
             memory_cycles_list.append(memory_cycles)
@@ -1241,6 +1312,9 @@ class HighFidelityPerformanceModel(nn.Module):
         energy_inter_level = energy_fill + energy_writeback
         energy += energy_inter_level
 
+        # 有bug
+        debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
+
         energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
         intra_level_consumption_accesses = self.calculate_intra_level_consumption_accesses(
             layer['dims'], all_factors, num_pes, debug_data)
@@ -1272,6 +1346,9 @@ class HighFidelityPerformanceModel(nn.Module):
                 buffer_deficit = torch.relu(required_kb - available_kb)
                 relative_deficit = buffer_deficit / (required_kb + 1e-9)
                 buffer_mismatch_loss += torch.pow(relative_deficit, 2)
+
+        # debug
+        debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
 
         return latency, energy, buffer_mismatch_loss
 
@@ -1314,7 +1391,13 @@ class HighFidelityPerformanceModel(nn.Module):
             all_factors = direct_mapping_table
         else:
             all_factors = mapping.get_all_factors()
-
+            print("=== Gradient Debug Information 1 ===")
+            
+            # Print type information
+            print(f"Type of temporal factor: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
+            
+            debug_grad(all_factors["S"]["L2_Scratchpad"]["temporal"],
+           mapping, "L2_Scratchpad.S.temporal")
         num_pes = hw_params.get_projected_num_pes()
 
         if self.fusion_aware and fusion_params is not None:
@@ -1354,10 +1437,12 @@ class HighFidelityPerformanceModel(nn.Module):
                 lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
                 split_latency += lat
                 split_energy += en
+                
                 split_mismatch += mismatch
 
             latency = weight * fused_latency + (1 - weight) * split_latency
-            energy = weight * fused_energy + (1 - weight) * split_energy
+            energy = weight * fused_energy + (1 - weight) * split_energy            
+
             group_buffer_mismatch_loss = weight * fused_mismatch + (1 - weight) * split_mismatch
             compatibility_penalty = weight * fused_comp + (1 - weight) * split_comp
 
@@ -1391,6 +1476,8 @@ class HighFidelityPerformanceModel(nn.Module):
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
         total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
+        
+        
 
         return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
 

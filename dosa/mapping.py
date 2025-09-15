@@ -256,8 +256,6 @@ class FineGrainedMapping(nn.Module):
                     if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
                         tensor.retain_grad()
 
-
-
         return projected_factors
 
     def has_partial_sums(self) -> bool:

@@ -109,12 +109,12 @@ for step in range(num_steps):
         grad_val = p.grad.clone()
         update_val = old_val -learning_rate * grad_val
 
-        # 打印详细更新过程
+        #  打印详细更新过程
+        print(f"   update = old_val -lr * grad = {update_val.item():.6f}")
         print(f"param{i} {name}:")
         print(f"   old = {old_val.item():.6f}")
         print(f"   grad = {grad_val.item():.6f}")
         print(f"   lr = {learning_rate}")
-        print(f"   update = old_val -lr * grad = {update_val.item():.6f}")
         
     # 执行优化器更新
     optimizer.step()
