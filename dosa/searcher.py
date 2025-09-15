@@ -7,6 +7,65 @@ import random
 from .utils import OptimizationLogger, get_divisors, derive_minimal_hardware
 from .space import SearchSpace
 
+# ==== DEBUG UTIL BEGIN ====
+import math, hashlib, io, torch, inspect
+from pprint import pformat
+
+def _hash_state_dict(sd):
+    # 对 state_dict 做稳定 hash，方便对比是否"真的变了"
+    h = hashlib.sha1()
+    for k in sorted(sd.keys()):
+        v = sd[k]
+        if torch.is_tensor(v):
+            h.update(k.encode())
+            h.update(v.detach().cpu().numpy().tobytes())
+        else:
+            h.update((k + str(v)).encode())
+    return h.hexdigest()[:10]
+
+def _dump_mapping_raw(mapping, tag="[RAW]"):
+    # 打印 log-space 参数 -> exp 后的真实因子（不做投影）
+    try:
+        print(f"{tag} mapping raw (exp(log)): hash={_hash_state_dict(mapping.state_dict())}")
+        for lvl in ["L0_Registers","L1_Accumulator","L2_Scratchpad","L3_DRAM"]:
+            if lvl not in mapping.factors:
+                continue
+            row = []
+            for dim in ["N","C","K","P","Q","R","S"]:
+                try:
+                    t = mapping.factors[lvl][dim]["temporal"]
+                    s = mapping.factors[lvl][dim]["spatial"]
+                    t_val = float(torch.exp(t).detach().cpu()) if torch.is_tensor(t) else float(t)
+                    s_val = float(torch.exp(s).detach().cpu()) if torch.is_tensor(s) else float(s)
+                    row.append(f"{dim}:T={t_val:.2f},S={s_val:.2f}")
+                except Exception:
+                    pass
+            if row:
+                print(f"{tag} {lvl}: " + " | ".join(row))
+    except Exception as e:
+        print(f"{tag} dump raw failed: {e}")
+
+def _dump_mapping_projected(mapping, tag="[PROJ]"):
+    # 打印 snapshot / projected 因子（你的 _snapshot_mapping 用的就是这个口径）
+    try:
+        if hasattr(mapping, "get_projected_factors"):
+            proj = mapping.get_projected_factors()
+        elif hasattr(mapping, "get_all_factors"):
+            proj = mapping.get_all_factors()  # 有些实现把它就当 projected 用
+        else:
+            print(f"{tag} no projected getter on mapping"); return
+        print(f"{tag} projected mapping:\n" + pformat(proj)[:3000])
+        return proj
+    except Exception as e:
+        print(f"{tag} dump projected failed: {e}")
+
+def _print_requires_grad_flags(searcher, tag="[FLAGS]"):
+    m_on = sum(1 for p in searcher.mapping.parameters() if p.requires_grad)
+    f_on = sum(1 for p in searcher.fusion_params.parameters() if p.requires_grad)
+    h_on = sum(1 for p in searcher.hw_params.parameters() if p.requires_grad)
+    print(f"{tag} requires_grad -> mapping:{m_on} on | fusion:{f_on} on | hardware:{h_on} on")
+# ==== DEBUG UTIL END ====
+
 # ===== Frozen proxy & perf-model wrapper (lock discrete mapping) =====
 class _FrozenMappingProxy:
     """Wrap mapping and force get_all_factors() to return a frozen snapshot."""
@@ -678,6 +737,21 @@ class FADOSASearcher(BaseSearcher):
             for level, facs in levels.items():
                 snapshot[dim][level] = {k: float(v.item()) for k, v in facs.items()}
         return snapshot
+    
+    def _snapshot_mapping_raw(self):
+        """Capture raw mapping factors (exp of log-space) for baselineB diff."""
+        snap = {}
+        for lvl, dims in self.mapping.factors.items():
+            snap[lvl] = {}
+            for dim, dd in dims.items():
+                t = float(torch.exp(dd["temporal"]).detach().cpu())
+                s = float(torch.exp(dd["spatial"]).detach().cpu())
+                # 为了可比性，四舍五入成整数（或保留两位小数）
+                snap.setdefault(dim, {})
+                snap[dim].setdefault(lvl, {})
+                snap[dim][lvl]["temporal"] = round(t)
+                snap[dim][lvl]["spatial"] = round(s)
+        return snap
 
     def _snapshot_fusion(self):
         """Capture current fusion decisions for change tracking."""
@@ -953,16 +1027,25 @@ class FADOSASearcher(BaseSearcher):
                         self.log_trial(trial_count, loss.item(), metrics_current, current_params)
 
             # Restore EDP-optimal parameters from Phase A before hardware optimization
-            if self.best_edp_params is not None:
+            _skip_restore = getattr(self, "skip_restore_best_mapping", False)
+            if (self.best_edp_params is not None) and (not _skip_restore):
                 self._set_params_from_dict(self.best_edp_params)
                 if self.logger:
                     self.logger.console("Restored best EDP parameters from Phase A before hardware optimization.")
             else:
                 if self.logger:
-                    self.logger.console("No EDP-optimal parameters found in Phase A, continuing with current parameters.")
+                    if _skip_restore:
+                        self.logger.console("Skip restoring best mapping (baselineB).")
+                    else:
+                        self.logger.console("No EDP-optimal parameters found in Phase A, continuing with current parameters.")
 
             # Enable Phase-B frozen mapping if we have a snapshot
-            self._freeze_discrete = self.best_discrete_factors is not None
+            _skip_restore = getattr(self, "skip_restore_best_mapping", False)
+            if _skip_restore:
+                self._freeze_discrete = False
+                self.best_discrete_factors = None  # 保险：别再用 A 期的离散快照
+            else:
+                self._freeze_discrete = self.best_discrete_factors is not None
             try:
                 self.mapping.eval()
             except Exception:
@@ -976,11 +1059,15 @@ class FADOSASearcher(BaseSearcher):
             # 根据当前映射推导最小硬件规模，作为硬件优化的起点
             with torch.no_grad():
                 # 恢复Phase A中的最佳映射/融合配置，确保后续硬件搜索基于最优映射
-                if self.best_edp_params is not None:
+                _skip_restore = getattr(self, "skip_restore_best_mapping", False)
+                if (self.best_edp_params is not None) and (not _skip_restore):
                     print("[DEBUG] Phase A结束 - 恢复最佳映射/融合配置 (EDP 最优)")
                     self._set_params_from_dict(self.best_edp_params)
                 else:
-                    print("[DEBUG] Phase A结束 - 无可恢复的最佳 EDP 配置，使用当前参数")
+                    if _skip_restore:
+                        print("[DEBUG] Phase A结束 - 跳过恢复最佳映射（baselineB）")
+                    else:
+                        print("[DEBUG] Phase A结束 - 无可恢复的最佳 EDP 配置，使用当前参数")
 
                 # 记录当前硬件参数（Phase A结束时）
                 current_hw_before = {
@@ -1033,11 +1120,56 @@ class FADOSASearcher(BaseSearcher):
                     )
                     print("[DEBUG] ✓ 硬件参数未发生变化 (APPLY_MIN_HW_BOUNDS=False)")
 
-            # Report mapping and fusion parameter changes
-            print("[DEBUG] before diff snapshot (projected):")
-            print(self._snapshot_mapping())
-            current_mapping_state = self._snapshot_mapping()
-            mapping_changes = self._diff_mapping(prev_mapping_state, current_mapping_state)
+            # A期结束 → B期开始 这一大段里，靠近你打印 before/after snapshot 的附近，加：
+            _print_requires_grad_flags(self, tag="[FLAGS][A->B]")
+            print(f"[FLAGS][A->B] runner_name={getattr(self,'runner_name','?')}, "
+                  f"skip_restore_best_mapping={getattr(self,'skip_restore_best_mapping',False)}, "
+                  f"_freeze_discrete={getattr(self,'_freeze_discrete',None)}, "
+                  f"has_best_discrete={self.best_discrete_factors is not None}")
+            
+            print("[DEBUG] BEFORE snapshot (projected) below is what diff SHOULD use as baseline:")
+            before_proj = _dump_mapping_projected(self.mapping, tag="[PROJ][before_diff]")
+            
+            print("[DEBUG] AFTER  snapshot (projected):")
+            after_proj  = _dump_mapping_projected(self.mapping, tag="[PROJ][after_phaseA]")
+            
+            # === 关键：把 diff 的基线改成 before_proj，避免用到"更早的 init 口径" ===
+            try:
+                self_prev = getattr(self, "_prev_mapping_state_for_debug", None)
+                if self_prev is None:
+                    setattr(self, "_prev_mapping_state_for_debug", before_proj)
+                    print("[DEBUG] prev_mapping_state_for_debug was None -> set to before_proj")
+                else:
+                    # 给出哈希，方便核对到底比较的是谁
+                    print("[DEBUG] prev_mapping_state_for_debug already set (not changing).")
+            except Exception as e:
+                print(f"[DEBUG] prev_mapping_state_for_debug set failed: {e}")
+            
+            # Report mapping and fusion parameter changes - 使用不同口径
+            if getattr(self, "runner_name", "") == "baselineB":
+                # baselineB 使用 raw 口径，避免投影策略的"口径差"
+                print("[DEBUG] baselineB: using RAW diff mode")
+                prev_raw = getattr(self, "_prev_mapping_state_raw", None) or self._snapshot_mapping_raw()
+                curr_raw = self._snapshot_mapping_raw()
+                mapping_changes = self._diff_mapping(prev_raw, curr_raw)
+                setattr(self, "_prev_mapping_state_raw", curr_raw)
+                print("[DEBUG] diff baseline=raw (exp of log-space), baselineB mode.")
+                # 为了后续代码兼容性，也定义 current_mapping_state
+                current_mapping_state = self._snapshot_mapping()
+            else:
+                # 其它 baseline 仍用 projected 口径
+                print("[DEBUG] before diff snapshot (projected):")
+                print(self._snapshot_mapping())
+                current_mapping_state = self._snapshot_mapping()  # = after_proj
+                
+                # 强制以"刚刚取到的 before_proj"作为基线
+                prev_for_diff = before_proj
+                mapping_changes = self._diff_mapping(prev_for_diff, current_mapping_state)
+                print("[DEBUG] diff baseline=before_proj (projected), not runner_init/other snapshots.")
+                
+                # 更新下一轮的基线
+                setattr(self, "_prev_mapping_state_for_debug", current_mapping_state)
+            
             print("[DEBUG] after Phase A snapshot (projected):")
             print(self._snapshot_mapping()) 
             if mapping_changes:

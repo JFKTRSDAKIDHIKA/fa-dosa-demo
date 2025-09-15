@@ -172,11 +172,34 @@ class _BaseSearchRunner:
         
         graph, searcher = self._build_components(cfg["shared"], recorder, model_name)
         
+        # 在 graph, searcher = self._build_components(...) 之后立刻加：
+        setattr(searcher, "runner_name", self.name)
+        
+        # 只对 baselineB 生效：跳过恢复 + 禁用冻结离散映射
+        if self.name == "baselineB":
+            setattr(searcher, "skip_restore_best_mapping", True)
+            setattr(searcher, "_freeze_discrete", False)
+            setattr(searcher, "best_discrete_factors", None)
+        
         print(f"Graph layers: {len(graph.layers)}")
         print(f"Fusion groups: {len(graph.fusion_groups)}")
         
         # 在搜索前按基准类型应用参数冻结/初始化约束
         self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
+        
+        # 打印初始化后的两种口径，明确基线
+        print("[DEBUG] runner.run() after build+apply_constraints")
+        from dosa.searcher import _dump_mapping_raw, _dump_mapping_projected
+        _dump_mapping_raw(searcher.mapping, tag="[RAW][runner_init]")
+        proj0 = _dump_mapping_projected(searcher.mapping, tag="[PROJ][runner_init]")
+        
+        # 把"diff 的基线"就定在 **projected 的这份**，避免把"初始化重写"当变化
+        try:
+            setattr(searcher, "_prev_mapping_state_for_debug", proj0)
+            print("[DEBUG] set prev_mapping_state baseline to projected(init)")
+        except Exception:
+            pass
+        
         from pprint import pformat
         snap_after_apply = searcher._snapshot_mapping()
         print("[DEBUG] baseline init mapping snapshot:\n" + pformat(snap_after_apply)[:800])
@@ -309,6 +332,12 @@ class HardwareOnlyRunner(_BaseSearchRunner):
         if graph.fusion_groups:
             with torch.no_grad():
                 fusion_params.fusion_logits.data = torch.full_like(fusion_params.fusion_logits, -2.0)
+
+        # 调试打印
+        print("[DEBUG] baselineB._apply_constraints() done.")
+        from dosa.searcher import _dump_mapping_raw, _dump_mapping_projected
+        _dump_mapping_raw(mapping, tag="[RAW][after_apply]")
+        _dump_mapping_projected(mapping, tag="[PROJ][after_apply]")
 
 
 class CooptRunner(_BaseSearchRunner):
