@@ -39,7 +39,7 @@ graph = MockGraph(problem_dims)
 
 # === 前向 ===
 lat, en, area, mm, comp = perf_model(graph, hw_params, mapping, None)
-loss = en
+loss = en * lat
 loss.backward()
 
 # === 选择一个测试参数 ===
@@ -56,7 +56,7 @@ with torch.no_grad():
     old_val = param.item()
     param.copy_(torch.tensor(old_val + eps))
 lat2, en2, area2, mm2, comp2 = perf_model(graph, hw_params, mapping, None)
-loss2 = en2
+loss2 = en2 * lat2
 num_grad = (loss2.item() - loss.item()) / eps
 
 print(f"Numerical grad ≈ {num_grad:.6e}")

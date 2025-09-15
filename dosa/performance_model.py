@@ -624,37 +624,33 @@ class HighFidelityPerformanceModel(nn.Module):
     def _coverage_upto(self, level_idx: int, dim: str, mapping_table: dict, layer_dims: dict) -> torch.Tensor:
         """
         计算维度 dim 在 ≤level_idx 的 temporal×spatial 乘积（并截断不超过 total(dim)）
+        
+        Args:
+            level_idx: 层级索引 i
+            dim: 维度名称
+            mapping_table: 映射表
+            layer_dims: 层维度信息
+            
+        Returns:
+            coverage_≤i(d): 该维度在≤i层级的覆盖范围
         """
         memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
         
-        cov = torch.tensor(1.0, device=self.config.DEVICE, requires_grad=True)
-        print(f"[DEBUG] init coverage({dim}, ≤{level_idx}) = {cov.item()}")
-
-        # 累乘 temporal/spatial factor
+        cov = torch.tensor(1.0, device=self.config.DEVICE)
         for j in range(level_idx + 1):  # 0..i
             level_name = memory_levels[j]
             if dim in mapping_table and level_name in mapping_table[dim]:
                 temporal_factor = mapping_table[dim][level_name].get('temporal', 1)
                 spatial_factor = mapping_table[dim][level_name].get('spatial', 1)
-                factor_val = temporal_factor * spatial_factor
-                cov = cov * torch.tensor(factor_val, device=self.config.DEVICE, dtype=torch.float32)
-                print(f"[DEBUG] after {level_name}: factor={factor_val}, cov={cov.item()}")
-
-        # 截断：不超过 total
+                cov *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+        
+        # 关键：截断不超过 total
         if dim in layer_dims:
-            total_dim_size = torch.tensor(layer_dims[dim], device=self.config.DEVICE, dtype=torch.float32)
-            cov_before = cov
+            total_dim_size = torch.tensor(layer_dims[dim], device=self.config.DEVICE)
             cov = torch.min(cov, total_dim_size)
-            cov.retain_grad()
-            print(f"[DEBUG] min step: before={cov_before.item()}, total={total_dim_size.item()}, after={cov.item()}")
+        
+        return torch.max(cov, torch.tensor(1.0, device=self.config.DEVICE))  # 防0
 
-        # 防止为 0
-        cov_before = cov
-        cov = torch.max(cov, torch.tensor(1.0, device=self.config.DEVICE))
-        cov.retain_grad()
-        print(f"[DEBUG] max step: before={cov_before.item()}, after={cov.item()}")
-
-        return cov
 
     
     def _can_persist_W_at_level(self, i: int, layer_dims: dict, mapping_table: dict, hw_params: HardwareParameters) -> bool:
@@ -1214,10 +1210,10 @@ class HighFidelityPerformanceModel(nn.Module):
         # BUG: all_factors loses gradient information here because calculate_inter_level_fill_traffic 
         # converts torch.Tensor to Python float internally, breaking the gradient chain
         # Print types for debugging
-        print("=== Debug Information ===")
-        print(f"Type of all_factors['S']['L2_Scratchpad']['temporal']: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
-        print(f"Type of hw_params: {type(hw_params)}")
-        print("=== End Debug ===\n")
+        # print("=== Debug Information ===")
+        # print(f"Type of all_factors['S']['L2_Scratchpad']['temporal']: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
+        # print(f"Type of hw_params: {type(hw_params)}")
+        # print("=== End Debug ===\n")
 
         detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(
             layer['dims'], all_factors, num_pes, hw_params, debug_data)
@@ -1226,17 +1222,17 @@ class HighFidelityPerformanceModel(nn.Module):
 
         memory_cycles_list = []
 
-        print("=== Traffic Gradient Debug ===")
-        for interface, info in detailed_fill_traffic_info.items():
-            tb = info['total_bytes']
-            print(f"[DEBUG] {interface}: type={type(tb)} "
-                f"requires_grad={getattr(tb, 'requires_grad', None)} "
-                f"grad_fn={getattr(tb, 'grad_fn', None)}")
+        # print("=== Traffic Gradient Debug ===")
+        # for interface, info in detailed_fill_traffic_info.items():
+        #     tb = info['total_bytes']
+        #     print(f"[DEBUG] {interface}: type={type(tb)} "
+        #         f"requires_grad={getattr(tb, 'requires_grad', None)} "
+        #         f"grad_fn={getattr(tb, 'grad_fn', None)}")
 
-            # 如果是 Tensor，尝试对它做一次 debug_grad
-            if isinstance(tb, torch.Tensor):
-                debug_grad(tb, mapping, "L2_Scratchpad.S.temporal")
-        print("=== Traffic Gradient Debug End ===")
+        #     # 如果是 Tensor，尝试对它做一次 debug_grad
+        #     if isinstance(tb, torch.Tensor):
+        #         debug_grad(tb, mapping, "L2_Scratchpad.S.temporal")
+        # print("=== Traffic Gradient Debug End ===")
 
 
         for interface, interface_info in detailed_fill_traffic_info.items():
@@ -1313,7 +1309,7 @@ class HighFidelityPerformanceModel(nn.Module):
         energy += energy_inter_level
 
         # 有bug
-        debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
+        # debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
 
         energy_intra_level = torch.tensor(0.0, device=self.config.DEVICE)
         intra_level_consumption_accesses = self.calculate_intra_level_consumption_accesses(
@@ -1348,7 +1344,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 buffer_mismatch_loss += torch.pow(relative_deficit, 2)
 
         # debug
-        debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
+        # debug_grad(energy, mapping, "L2_Scratchpad.S.temporal")
 
         return latency, energy, buffer_mismatch_loss
 
@@ -1391,13 +1387,14 @@ class HighFidelityPerformanceModel(nn.Module):
             all_factors = direct_mapping_table
         else:
             all_factors = mapping.get_all_factors()
-            print("=== Gradient Debug Information 1 ===")
+            # print("=== Gradient Debug Information 1 ===")
             
             # Print type information
-            print(f"Type of temporal factor: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
+            # print(f"Type of temporal factor: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
             
-            debug_grad(all_factors["S"]["L2_Scratchpad"]["temporal"],
-           mapping, "L2_Scratchpad.S.temporal")
+            # debug_grad(all_factors["S"]["L2_Scratchpad"]["temporal"],
+            #mapping, "L2_Scratchpad.S.temporal")
+
         num_pes = hw_params.get_projected_num_pes()
 
         if self.fusion_aware and fusion_params is not None:

@@ -76,10 +76,10 @@ for name, param in named.items():
     print(f"  {name}: shape={param.shape}, requires_grad={param.requires_grad}")
 
 # =============== 新增：优化器部分 ===============
-learning_rate = 1e-7
+learning_rate = 1e-8
 optimizer = optim.SGD(mapping.parameters(), lr=learning_rate)
 
-num_steps = 1  # 迭代步数，可以改大
+num_steps = 10  # 迭代步数，可以改大
 
 for step in range(num_steps):
     optimizer.zero_grad()
