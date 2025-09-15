@@ -108,10 +108,34 @@ class _PerfModelWrapper:
             return self._inner(graph, hw_params, mapping, fusion_params)
 
         # Phase A: sample once -> remember -> freeze for this call
+        # 🛠️ 5. 在 perf_model 里插桩 - 检查投影前后的grad_fn
+        if hasattr(mapping, 'factors') and mapping.factors:
+            # 获取第一个mapping参数作为示例
+            first_level = next(iter(mapping.factors.keys()))
+            first_dim = next(iter(mapping.factors[first_level].keys()))
+            raw_param = mapping.factors[first_level][first_dim]['temporal']
+            print(f"[DEBUG] mapping raw param grad_fn: {raw_param.grad_fn}")
+        
+        # 把 log-space 的连续参数 temporal, spatial 转换成真正的整数分块因子（discrete factors）。
         sampled = mapping.get_all_factors()
+        
+        # 检查投影后的grad_fn
+        if sampled:
+            first_dim_key = next(iter(sampled.keys()))
+            first_level_key = next(iter(sampled[first_dim_key].keys()))
+            projected_tensor = sampled[first_dim_key][first_level_key]['temporal']
+            print(f"[DEBUG] mapping projected grad_fn: {projected_tensor.grad_fn}")
+        
         self._searcher._last_eval_discrete_factors = sampled
-        mapping = _FrozenMappingProxy(mapping, sampled)
-        return self._inner(graph, hw_params, mapping, fusion_params)
+        # 🛠️ "开关式消融" - 关闭Phase-A的Frozen/Proxy机制
+        # mapping = _FrozenMappingProxy(mapping, sampled)  # <- Phase-A不再使用frozen快照
+        # Phase-A直接使用原始mapping对象，保持梯度连通性
+        latency, energy, area, mismatch, compat = self._inner(graph, hw_params, mapping, fusion_params)
+        for name, t in [("latency", latency), ("energy", energy), ("area", area), ("mismatch", mismatch), ("compat", compat)]:
+            print(f"[CHECK inner out] {name}: type={type(t)}, req_grad={getattr(t, 'requires_grad', None)}, grad_fn={getattr(t, 'grad_fn', None)}")
+
+        return latency, energy, area, mismatch, compat
+
 
 
 class BaseSearcher(ABC):
@@ -175,6 +199,13 @@ class BaseSearcher(ABC):
             'compatibility_penalty_weight': getattr(config, 'COMPATIBILITY_PENALTY_WEIGHT', 100.0),
             'edp_weight': 1.0
         })
+        
+        # 用于可视化的历史数据存储
+        self.loss_history = []  # 存储每步的loss值
+        self.grad_norm_history = []  # 存储每步的梯度范数
+        self.step_history = []  # 存储步数
+        self.phase_history = []  # 存储阶段信息 ('A' 或 'B')
+        self.param_history = []  # 存储参数历史，用于热力图
     
     @abstractmethod
     def search(self, num_trials: int) -> Dict[str, Any]:
@@ -806,6 +837,11 @@ class FADOSASearcher(BaseSearcher):
         import os
         from .utils import save_configuration_to_json
         
+        # 🛠️ 开启异常检测，定位具体算子堆栈
+        import torch
+        torch.autograd.set_detect_anomaly(True)
+        print("[DEBUG] Enabled autograd anomaly detection")
+        
         # -------- 设备同步 --------
         device = self.config.DEVICE
         self.hw_params.to(device)
@@ -856,10 +892,60 @@ class FADOSASearcher(BaseSearcher):
             # 收集可训练的映射和融合参数
             map_opt_params = [p for p in mapping_params_list + fusion_params_list if p.requires_grad]
             if map_opt_params:
+                print(f"\n[PHASE A] 开始映射和融合参数优化 - 学习率: {self.lr_mapping}")
+                print(f"[PHASE A] 可训练参数数量: {len(map_opt_params)}")
                 optimizer_map = optim.Adam(map_opt_params, lr=self.lr_mapping)
+                
+                # 🛠️ 1. 确认参数真的在优化列表里
+                for name, p in zip(["map_param_%d" % i for i in range(len(map_opt_params))], map_opt_params):
+                    # 安全处理标量和向量参数
+                    if p.data.numel() == 1:  # 标量参数
+                        value_str = f"{p.data.item():.6f}"
+                    else:  # 向量参数
+                        value_str = str(p.data.flatten()[:5].tolist())
+                    print(f"[DEBUG] param {name}: requires_grad={p.requires_grad}, shape={p.shape}, value={value_str}")
 
                 for i in range(self.num_mapping_steps):
                     optimizer_map.zero_grad()
+                    
+                    # 🛠️ 梯度连通性验证探针（仅在第一步执行）
+                    if i == 0 and getattr(self.config, "DEBUG_GRAD_PROJ", True):
+                        # 1) 任选一个可训练的映射叶子参数 p
+                        p = next((q for q in self.mapping.parameters() if q.requires_grad), None)
+                        if p is None:
+                            print("[PROBE] no trainable mapping param.")
+                        else:
+                            # 2) 把"投影后的某个张量"取出来（任选一个代表性分量）
+                            proj = self.mapping.get_all_factors()  # 使用实际的投影函数名
+                            # proj 应该是个 dict 结构，里面是 tensor；挑一个 requires_grad=True 的
+                            t = None
+                            for _, levels in proj.items():
+                                for _, dims in levels.items():
+                                    for name, v in dims.items():
+                                        if isinstance(v, torch.Tensor) and v.requires_grad:
+                                            t = v
+                                            break
+                                    if t is not None: break
+                                if t is not None: break
+                            
+                            if t is None:
+                                print("[PROBE] projected tensor has no requires_grad=True (graph likely cut).")
+                            else:
+                                # 3) 保留非叶子梯度，做一个极小的 dummy loss 直接从投影量反传
+                                t.retain_grad()
+                                self.mapping.zero_grad(set_to_none=True)
+                                dummy_loss = t.sum()
+                                dummy_loss.backward(retain_graph=True)
+                                
+                                print(f"[PROBE] p.grad is None? {p.grad is None}")
+                                if p.grad is not None:
+                                    print(f"[PROBE] p.grad mean abs = {p.grad.abs().mean().item():.3e}")
+                                print(f"[PROBE] t.grad is None? {t.grad is None}")
+                                if t.grad is not None:
+                                    print(f"[PROBE] t.grad mean abs = {t.grad.abs().mean().item():.3e}")
+                                
+                                # 清梯度回到正常路径
+                                self.mapping.zero_grad(set_to_none=True)
 
                     # 直接计算损失（保持梯度图）
                     latency, energy, area, mismatch_loss, compatibility_penalty = self.perf_model(
@@ -875,8 +961,111 @@ class FADOSASearcher(BaseSearcher):
                     # 使用统一的损失计算方法
                     loss = self._compute_loss(latency, energy, area, mismatch_loss, compatibility_penalty, step_count=trial_count)
 
+                    # 🛠️ 2. 打印 loss.backward() 之前的计算图信息
+                    print(f"[DEBUG] loss grad_fn={loss.grad_fn}")
+                    
+                    # 🛠️ 3. 检查参数的 .grad_fn
+                    test_param = map_opt_params[0]
+                    print(f"[DEBUG] param grad_fn={test_param.grad_fn}, requires_grad={test_param.requires_grad}")
+
                     # 反向传播
                     loss.backward()
+                    
+                    # 🛠️ 4. loss.backward() 之后看梯度
+                    for i, p in enumerate(map_opt_params[:3]):
+                        print(f"[DEBUG] param{i} grad={p.grad}")
+                    
+                    # 🛠️ 验证投影张量的梯度连通性
+                    if i == 0:  # 仅在第一步检查
+                        proj_factors = self.mapping.get_all_factors()
+                        proj_grad_count = 0
+                        proj_none_count = 0
+                        for dim_name, levels in proj_factors.items():
+                            for level_name, dims in levels.items():
+                                for factor_type, tensor in dims.items():
+                                    if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                                        if tensor.grad is None:
+                                            proj_none_count += 1
+                                        else:
+                                            proj_grad_count += 1
+                        print(f"[PROBE] Projected tensors: {proj_grad_count} with grad, {proj_none_count} with None grad")
+
+                    # 计算梯度范数并打印每个参数的梯度
+                    total_grad_norm = 0.0
+                    grad_norms = {}
+
+                    for name, param in [
+                        ('mapping', list(self.mapping.parameters())), 
+                        ('fusion', [self.fusion_params.fusion_logits])
+                    ]:
+                        param_grad_norm = 0.0
+                        param_count = 0
+                        
+                        for idx, p in enumerate(param if name == 'mapping' else param):
+                            if p.grad is not None:
+                                # 单个参数的梯度 L2 范数
+                                param_norm = p.grad.data.norm(2)
+                                print(f"[DEBUG] {name} param{idx} grad_norm={param_norm.item():.6e}")
+                                # 也可以打印完整的梯度向量（谨慎，可能很长）
+                                # print(f"[DEBUG] {name} param{idx} grad={p.grad.data.view(-1)[:10]} ...")
+                                
+                                param_grad_norm += param_norm.item() ** 2
+                                param_count += 1
+                            else:
+                                print(f"[DEBUG] {name} param{idx} grad=None")
+
+                        if param_count > 0:
+                            param_grad_norm = (param_grad_norm ** 0.5)
+                            grad_norms[name] = param_grad_norm
+                            total_grad_norm += param_grad_norm ** 2
+
+                    total_grad_norm = total_grad_norm ** 0.5
+
+                    print(f"[DEBUG] 梯度范数: 总计={total_grad_norm:.6f}, "
+                        f"映射={grad_norms.get('mapping', 0.0):.6f}, "
+                        f"融合={grad_norms.get('fusion', 0.0):.6f}")
+
+
+                    # 计算参数分布统计
+                    param_stats = {}
+                    # 映射参数统计
+                    mapping_values = []
+                    for p in self.mapping.parameters():
+                        if p.requires_grad:
+                            mapping_values.extend(p.data.flatten().tolist())
+                    if mapping_values:
+                        param_stats['mapping'] = {
+                            'min': min(mapping_values),
+                            'max': max(mapping_values),
+                            'mean': sum(mapping_values) / len(mapping_values)
+                        }
+                    
+                    # 融合参数统计
+                    if self.fusion_params.fusion_logits.requires_grad:
+                        fusion_values = self.fusion_params.fusion_logits.data.flatten().tolist()
+                        param_stats['fusion'] = {
+                            'min': min(fusion_values),
+                            'max': max(fusion_values),
+                            'mean': sum(fusion_values) / len(fusion_values)
+                        }
+                    
+                    # 打印参数统计
+                    for param_type, stats in param_stats.items():
+                        print(f"[DEBUG] {param_type}参数分布: min={stats['min']:.6f}, max={stats['max']:.6f}, mean={stats['mean']:.6f}")
+
+                    # 记录历史数据用于可视化
+                    current_step = len(self.loss_history)
+                    self.loss_history.append(loss.item())
+                    self.grad_norm_history.append(total_grad_norm)
+                    self.step_history.append(current_step)
+                    self.phase_history.append('A')
+                    # 记录当前参数状态用于热力图
+                    current_param_snapshot = {}
+                    if 'mapping' in param_stats:
+                        current_param_snapshot['mapping'] = param_stats['mapping']
+                    if 'fusion' in param_stats:
+                        current_param_snapshot['fusion'] = param_stats['fusion']
+                    self.param_history.append(current_param_snapshot)
 
                     # ---- 调试日志记录（Phase A） ----
                     if self.recorder is not None:
@@ -929,85 +1118,87 @@ class FADOSASearcher(BaseSearcher):
                         )
                         current_params = self._get_params_as_dict()
                 
-                    # 添加缺失的日志记录和loss详细组成打印
-                    if i % 10 == 0:
-                        print(f"\n[DEBUG] Phase A - Outer Step {outer_step+1}, Inner Step {i+1}:")
+                    # 添加缺失的日志记录和loss详细组成打印 - 每步都打印
+                    print(f"\n[DEBUG] Phase A - Outer Step {outer_step+1}, Inner Step {i+1}:")
+                    
+                    # 计算并显示loss的详细组成部分
+                    comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
+                    comp_penalty = comp_penalty_weight * compatibility_penalty
+                    
+                    if self.loss_strategy == 'strategy_A':
+                        edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                        area_loss = self.loss_weights['area_weight'] * area
+                        mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
+                        print(f"[DEBUG] Loss详细组成 (strategy_A): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - Log(EDP): {edp_loss.item():.6f}")
+                        print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
                         
-                        # 计算并显示loss的详细组成部分
-                        comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
-                        comp_penalty = comp_penalty_weight * compatibility_penalty
+                    elif self.loss_strategy == 'strategy_B':
+                        edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                        area_loss = self.loss_weights['area_weight'] * area
+                        mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
+                        weighted_edp = self.loss_weights['edp_weight'] * edp_loss
+                        print(f"[DEBUG] Loss详细组成 (strategy_B): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - 加权Log(EDP): {weighted_edp.item():.6f}")
+                        print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
                         
-                        if self.loss_strategy == 'strategy_A':
-                            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                            area_loss = self.loss_weights['area_weight'] * area
-                            mismatch_penalty = torch.log(1.0 + mismatch_loss * self.loss_weights['mismatch_penalty_weight'])
-                            print(f"[DEBUG] Loss详细组成 (strategy_A): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - Log(EDP): {edp_loss.item():.6f}")
-                            print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            
-                        elif self.loss_strategy == 'strategy_B':
-                            edp_loss = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                            area_loss = self.loss_weights['area_weight'] * area
-                            mismatch_penalty = mismatch_loss * self.loss_weights['mismatch_penalty_weight']
-                            weighted_edp = self.loss_weights['edp_weight'] * edp_loss
-                            print(f"[DEBUG] Loss详细组成 (strategy_B): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - 加权Log(EDP): {weighted_edp.item():.6f}")
-                            print(f"[DEBUG]   - Area惩罚: {area_loss.item():.6f} (面积: {area.item():.2f} mm²)")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            
-                        elif self.loss_strategy == 'log_edp_plus_area':
-                            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                            area_penalty = self.loss_weights['area_weight'] * area
-                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-                            print(f"[DEBUG] Loss详细组成 (log_edp_plus_area): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
-                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            
-                        elif self.loss_strategy == 'edp_plus_area':
-                            edp = latency * energy
-                            area_penalty = self.loss_weights['area_weight'] * area
-                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-                            print(f"[DEBUG] Loss详细组成 (edp_plus_area): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - EDP: {edp.item():.6f}")
-                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            
-                        elif self.loss_strategy == 'pure_edp':
-                            edp = latency * energy
-                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-                            area_budget_penalty = self._compute_area_budget_penalty(area, i)
-                            print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - EDP: {edp.item():.6f}")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
-                            print(f"[DEBUG]   - 面积预算惩罚: {area_budget_penalty.item():.6f}")
-                            print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (包含基础面积，预算惩罚已单独计算)")
-                            
-                        else:
-                            # 默认策略
-                            log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
-                            area_penalty = self.loss_weights['area_weight'] * area
-                            mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
-                            print(f"[DEBUG] Loss详细组成 (默认策略): 总计={loss.item():.6f}")
-                            print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
-                            print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
-                            print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
-                            print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                    elif self.loss_strategy == 'log_edp_plus_area':
+                        log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                        area_penalty = self.loss_weights['area_weight'] * area
+                        mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                        print(f"[DEBUG] Loss详细组成 (log_edp_plus_area): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                        print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
                         
-                        # 显示基础性能指标
-                        print(f"[DEBUG] 基础指标: 延迟={latency.item():.2e}s, 能耗={energy.item():.2e}pJ")
+                    elif self.loss_strategy == 'edp_plus_area':
+                        edp = latency * energy
+                        area_penalty = self.loss_weights['area_weight'] * area
+                        mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                        print(f"[DEBUG] Loss详细组成 (edp_plus_area): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                        print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
                         
-                        trial_count += 1
+                    elif self.loss_strategy == 'pure_edp':
+                        edp = latency * energy
+                        mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                        area_budget_penalty = self._compute_area_budget_penalty(area, i)
+                        print(f"[DEBUG] Loss详细组成 (pure_edp): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - EDP: {edp.item():.6f}")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                        print(f"[DEBUG]   - 面积预算惩罚: {area_budget_penalty.item():.6f}")
+                        print(f"[DEBUG]   - 面积: {area.item():.2f} mm² (包含基础面积，预算惩罚已单独计算)")
+                        
+                    else:
+                        # 默认策略
+                        log_edp = torch.log(latency + 1e-9) + torch.log(energy + 1e-9)
+                        area_penalty = self.loss_weights['area_weight'] * area
+                        mismatch_penalty = mismatch_loss * self.loss_weights.get('mismatch_penalty_weight', 0.1)
+                        print(f"[DEBUG] Loss详细组成 (默认策略): 总计={loss.item():.6f}")
+                        print(f"[DEBUG]   - Log(EDP): {log_edp.item():.6f}")
+                        print(f"[DEBUG]   - Area惩罚: {area_penalty.item():.6f} (面积: {area.item():.2f} mm²)")
+                        print(f"[DEBUG]   - Mismatch惩罚: {mismatch_penalty.item():.6f}")
+                        print(f"[DEBUG]   - Compatibility惩罚: {comp_penalty.item():.6f}")
+                        
+                    # 显示基础性能指标
+                    print(f"[DEBUG] 基础指标: 延迟={latency.item():.2e}s, 能耗={energy.item():.2e}pJ")
+                    
+                    # 每步都更新trial_count和记录日志
+                    trial_count += 1
+                    if i % 10 == 0:  # 保持原有的每10步记录一次日志的逻辑
                         self.log_trial(trial_count, loss.item(), metrics_current, current_params)
 
                     # 退火温度
-                    self.mapping.anneal_tau()
+                    # self.mapping.anneal_tau()
+                    # print(f"[PHASE A] tau = {self.mapping.tau:.6f}")
 
                     # 更新最佳结果
                     trial_count += 1
@@ -1201,6 +1392,8 @@ class FADOSASearcher(BaseSearcher):
             # 收集可训练的硬件参数
             hw_opt_params = [p for p in hw_params_list if p.requires_grad]
             if hw_opt_params:
+                print(f"\n[PHASE B] 开始硬件参数优化 - 学习率: {self.lr_hardware}")
+                print(f"[PHASE B] 可训练参数数量: {len(hw_opt_params)}")
                 optimizer_hw = optim.Adam(hw_opt_params, lr=self.lr_hardware)
                 
                 # 打印Phase B开始前的初始硬件配置
@@ -1242,6 +1435,65 @@ class FADOSASearcher(BaseSearcher):
 
                     # 反向传播
                     loss.backward()
+
+                    # 计算硬件参数梯度范数
+                    hw_grad_norm = 0.0
+                    hw_grad_details = {}
+                    for name, param in [('log_num_pes', self.hw_params.log_num_pes), 
+                                       ('log_l0_kb', self.hw_params.log_buffer_sizes_kb['L0_Registers']),
+                                       ('log_l1_kb', self.hw_params.log_buffer_sizes_kb['L1_Accumulator']),
+                                       ('log_l2_kb', self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'])]:
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2).item()
+                            hw_grad_details[name] = param_norm
+                            hw_grad_norm += param_norm ** 2
+                    hw_grad_norm = hw_grad_norm ** 0.5
+                    
+                    print(f"[DEBUG] 硬件梯度范数: 总计={hw_grad_norm:.6f}, PE={hw_grad_details.get('log_num_pes', 0.0):.6f}, L0={hw_grad_details.get('log_l0_kb', 0.0):.6f}, L1={hw_grad_details.get('log_l1_kb', 0.0):.6f}, L2={hw_grad_details.get('log_l2_kb', 0.0):.6f}")
+
+                    # 计算硬件参数分布统计
+                    hw_param_values = []
+                    hw_param_details = {}
+                    for name, param in [('log_num_pes', self.hw_params.log_num_pes), 
+                                       ('log_l0_kb', self.hw_params.log_buffer_sizes_kb['L0_Registers']),
+                                       ('log_l1_kb', self.hw_params.log_buffer_sizes_kb['L1_Accumulator']),
+                                       ('log_l2_kb', self.hw_params.log_buffer_sizes_kb['L2_Scratchpad'])]:
+                        if param.requires_grad:
+                            param_val = param.data.item()
+                            hw_param_values.append(param_val)
+                            hw_param_details[name] = param_val
+                    
+                    if hw_param_values:
+                        hw_stats = {
+                            'min': min(hw_param_values),
+                            'max': max(hw_param_values),
+                            'mean': sum(hw_param_values) / len(hw_param_values)
+                        }
+                        print(f"[DEBUG] 硬件参数分布(log空间): min={hw_stats['min']:.6f}, max={hw_stats['max']:.6f}, mean={hw_stats['mean']:.6f}")
+                        # 安全格式化硬件参数详情
+                        pe_val = hw_param_details.get('log_num_pes', 'N/A')
+                        l0_val = hw_param_details.get('log_l0_kb', 'N/A')
+                        l1_val = hw_param_details.get('log_l1_kb', 'N/A')
+                        l2_val = hw_param_details.get('log_l2_kb', 'N/A')
+                        
+                        pe_str = f"{pe_val:.6f}" if isinstance(pe_val, (int, float)) else str(pe_val)
+                        l0_str = f"{l0_val:.6f}" if isinstance(l0_val, (int, float)) else str(l0_val)
+                        l1_str = f"{l1_val:.6f}" if isinstance(l1_val, (int, float)) else str(l1_val)
+                        l2_str = f"{l2_val:.6f}" if isinstance(l2_val, (int, float)) else str(l2_val)
+                        
+                        print(f"[DEBUG] 硬件参数详情: PE={pe_str}, L0={l0_str}, L1={l1_str}, L2={l2_str}")
+
+                    # 记录历史数据用于可视化
+                    current_step = len(self.loss_history)
+                    self.loss_history.append(loss.item())
+                    self.grad_norm_history.append(hw_grad_norm)
+                    self.step_history.append(current_step)
+                    self.phase_history.append('B')
+                    # 记录硬件参数状态用于热力图
+                    current_hw_snapshot = {'hardware': hw_stats} if hw_param_values else {}
+                    if hw_param_details:
+                        current_hw_snapshot['hardware_details'] = hw_param_details
+                    self.param_history.append(current_hw_snapshot)
 
                     # ---- 调试日志记录（Phase B） ----
                     if self.recorder is not None:
@@ -1454,6 +1706,9 @@ class FADOSASearcher(BaseSearcher):
                 if self.num_hardware_steps % 10 == 0:
                     self.log_trial(trial_count, loss.item(), metrics, current_params)
         
+        # 生成可视化图表
+        self.generate_all_visualizations()
+        
         return {
             'best_loss': self.best_loss,
             'best_params': self.best_params,
@@ -1497,6 +1752,165 @@ class FADOSASearcher(BaseSearcher):
             
         except Exception as e:
             print(f"Warning: Failed to save validation config at trial {trial_count}: {e}")
+    
+    def plot_convergence_curves(self, save_path='output/convergence_curves.png'):
+        """
+        绘制收敛曲线（loss vs step）和梯度范数曲线
+        
+        Args:
+            save_path: 保存图片的路径
+        """
+        import matplotlib.pyplot as plt
+        import os
+        
+        if not self.loss_history or not self.grad_norm_history:
+            print("Warning: No history data available for plotting")
+            return
+        
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # 创建子图
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # 绘制loss收敛曲线
+        ax1.plot(self.step_history, self.loss_history, 'b-', linewidth=2, label='Loss')
+        ax1.set_xlabel('Step')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Loss Convergence Curve')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # 标记Phase A和Phase B的分界点
+        phase_changes = []
+        for i in range(1, len(self.phase_history)):
+            if self.phase_history[i] != self.phase_history[i-1]:
+                phase_changes.append(self.step_history[i])
+        
+        for change_step in phase_changes:
+            ax1.axvline(x=change_step, color='red', linestyle='--', alpha=0.7, label='Phase Change')
+        
+        # 绘制梯度范数曲线
+        ax2.plot(self.step_history, self.grad_norm_history, 'g-', linewidth=2, label='Gradient Norm')
+        ax2.set_xlabel('Step')
+        ax2.set_ylabel('Gradient Norm')
+        ax2.set_title('Gradient Norm vs Step')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 标记Phase变化
+        for change_step in phase_changes:
+            ax2.axvline(x=change_step, color='red', linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Convergence curves saved to: {save_path}")
+    
+    def plot_parameter_heatmap(self, save_path='output/parameter_heatmap.png'):
+        """
+        绘制参数热力图，显示搜索趋势
+        
+        Args:
+            save_path: 保存图片的路径
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+        
+        if not self.param_history:
+            print("Warning: No parameter history available for heatmap")
+            return
+        
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # 提取参数名称和值
+        param_names = list(self.param_history[0].keys()) if self.param_history else []
+        if not param_names:
+            print("Warning: No parameters found in history")
+            return
+        
+        # 构建参数矩阵 (steps x parameters)
+        param_matrix = []
+        for step_params in self.param_history:
+            row = []
+            for param_name in param_names:
+                value = step_params.get(param_name, 0.0)
+                # 如果是tensor，转换为标量
+                if hasattr(value, 'item'):
+                    value = value.item()
+                row.append(float(value))
+            param_matrix.append(row)
+        
+        param_matrix = np.array(param_matrix)
+        
+        # 归一化参数值到[0,1]范围以便可视化
+        param_matrix_norm = np.zeros_like(param_matrix)
+        for i in range(param_matrix.shape[1]):
+            col = param_matrix[:, i]
+            if col.max() != col.min():
+                param_matrix_norm[:, i] = (col - col.min()) / (col.max() - col.min())
+            else:
+                param_matrix_norm[:, i] = 0.5  # 如果所有值相同，设为中间值
+        
+        # 创建热力图
+        fig, ax = plt.subplots(figsize=(max(12, len(param_names) * 0.8), 8))
+        
+        im = ax.imshow(param_matrix_norm.T, cmap='viridis', aspect='auto', interpolation='nearest')
+        
+        # 设置坐标轴
+        ax.set_xlabel('Optimization Step')
+        ax.set_ylabel('Parameters')
+        ax.set_title('Parameter Evolution Heatmap (Normalized Values)')
+        
+        # 设置y轴标签
+        ax.set_yticks(range(len(param_names)))
+        ax.set_yticklabels([name.replace('_', '\n') for name in param_names], fontsize=8)
+        
+        # 添加颜色条
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Normalized Parameter Value', rotation=270, labelpad=15)
+        
+        # 标记Phase变化
+        phase_changes = []
+        for i in range(1, len(self.phase_history)):
+            if self.phase_history[i] != self.phase_history[i-1]:
+                phase_changes.append(i)
+        
+        for change_step in phase_changes:
+            ax.axvline(x=change_step, color='red', linestyle='--', alpha=0.7, linewidth=2)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Parameter heatmap saved to: {save_path}")
+    
+    def generate_all_visualizations(self, output_dir='output'):
+        """
+        生成所有可视化图表
+        
+        Args:
+            output_dir: 输出目录
+        """
+        import os
+        
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print("\n=== 生成可视化图表 ===")
+        
+        # 生成收敛曲线
+        convergence_path = os.path.join(output_dir, 'convergence_curves.png')
+        self.plot_convergence_curves(convergence_path)
+        
+        # 生成参数热力图
+        heatmap_path = os.path.join(output_dir, 'parameter_heatmap.png')
+        self.plot_parameter_heatmap(heatmap_path)
+        
+        print(f"All visualizations saved to: {output_dir}")
 
 
 class RandomSearcher(BaseSearcher):

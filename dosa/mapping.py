@@ -248,6 +248,16 @@ class FineGrainedMapping(nn.Module):
             self.has_partial_sum = False
             self.partial_sum_tiles = {}
 
+        # 🛠️ 对"投影输出"做保留梯度，验证图有没有被 detach
+        # 在返回前，对几个关键投影张量调用 retain_grad()
+        for dim_name, levels in projected_factors.items():
+            for level_name, dims in levels.items():
+                for factor_type, tensor in dims.items():
+                    if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                        tensor.retain_grad()
+
+
+
         return projected_factors
 
     def has_partial_sums(self) -> bool:
