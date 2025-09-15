@@ -20,6 +20,14 @@ import yaml
 
 DEFAULT_CFG_PATH = Path(__file__).resolve().parent.parent / "configs" / "act1.yaml"
 
+# run_act1 function overview:
+# ├─ Import baseline experiments module
+# ├─ Get list of baselines from config or use defaults
+# └─ For each baseline:
+#      └─ Get the baseline runner
+#         └─ For each random seed:
+#              └─ Create recorder and run experiment
+#                   └─ Execute core baseline logic   ← Core execution point
 
 def run_act1(cfg_path: str | Path | None = None, scenario: str | None = None) -> None:  # noqa: D401
     """Entry point for Act I experiment.
@@ -41,6 +49,9 @@ def run_act1(cfg_path: str | Path | None = None, scenario: str | None = None) ->
     cfg.setdefault("shared", {})["scenario"] = scenario
 
     # Lazy import to avoid circular dependency before skeletons are complete
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     baselines_mod = importlib.import_module("experiments.baselines")
     recorder_mod = importlib.import_module("logging_utils.recorder")
     from dosa.config import Config

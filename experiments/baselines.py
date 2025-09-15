@@ -155,26 +155,91 @@ class _BaseSearchRunner:
         return
 
     def run(self, cfg: dict[str, Any], seed: int, recorder: "Recorder") -> None:  # noqa: D401
+        import time
         random.seed(seed)
         torch.manual_seed(seed)
         # 从配置文件中正确获取工作负载名称
         workload_name = cfg.get("workload", {}).get("name", "resnet18")
         # 如果workload_name包含下划线，取第一部分作为模型名称
         model_name = workload_name.split("_")[0] if "_" in workload_name else workload_name
+        
+        print(f"\n{'='*60}")
+        print(f"Starting {self.name.upper()} Baseline Experiment")
+        print(f"{'='*60}")
+        print(f"Model: {model_name}")
+        print(f"Seed: {seed}")
+        print(f"Scenario: {cfg['shared'].get('scenario', 'default')}")
+        
         graph, searcher = self._build_components(cfg["shared"], recorder, model_name)
+        
+        print(f"Graph layers: {len(graph.layers)}")
+        print(f"Fusion groups: {len(graph.fusion_groups)}")
+        
         # 在搜索前按基准类型应用参数冻结/初始化约束
         self._apply_constraints(searcher.hw_params, searcher.mapping, searcher.fusion_params, graph, self.name)
+        from pprint import pformat
+        snap_after_apply = searcher._snapshot_mapping()
+        print("[DEBUG] baseline init mapping snapshot:\n" + pformat(snap_after_apply)[:800])
 
         num_trials = cfg["shared"].get("num_trials", 30)
+        print(f"Number of trials: {num_trials}")
+        
         start_ts = datetime.now().isoformat(timespec="seconds")
+        start_time = time.time()
+        print(f"Search started at: {start_ts}")
 
         # 主动优化：调用 searcher.search()
-        searcher.search(num_trials)
+        print(f"\n--- Running {self.name} Search ---")
+        results = searcher.search(num_trials)
 
         # 完成后刷新 Recorder 最佳记录
         recorder.finalize_best()
         end_ts = datetime.now().isoformat(timespec="seconds")
-        print(f"[{self.name}] seed={seed} completed {num_trials} trials in {start_ts}→{end_ts}.")
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        print(f"\n--- Search Completed in {duration:.2f}s ---")
+        
+        # 输出详细的搜索结果摘要
+        if hasattr(results, 'get') and results.get('best_edp_metrics'):
+            best_metrics = results.get('best_edp_metrics', {})
+            best_loss = results.get('best_loss', 'N/A')
+            print(f"Best Loss: {best_loss:.4f}" if isinstance(best_loss, (int, float)) else f"Best Loss: {best_loss}")
+            
+            edp = best_metrics.get('edp', 'N/A')
+            print(f"Best EDP: {edp:.2e}" if isinstance(edp, (int, float)) else f"Best EDP: {edp}")
+            
+            area = best_metrics.get('area_mm2', 'N/A')
+            print(f"Best Area: {area:.2f}mm²" if isinstance(area, (int, float)) else f"Best Area: {area}")
+            
+            latency = best_metrics.get('latency_ms', 'N/A')
+            print(f"Best Latency: {latency:.2f}ms" if isinstance(latency, (int, float)) else f"Best Latency: {latency}")
+            
+            energy = best_metrics.get('energy_mj', 'N/A')
+            print(f"Best Energy: {energy:.2f}mJ" if isinstance(energy, (int, float)) else f"Best Energy: {energy}")
+        elif hasattr(searcher, 'best_edp_metrics') and searcher.best_edp_metrics:
+            best_metrics = searcher.best_edp_metrics
+            best_loss = getattr(searcher, 'best_loss', 'N/A')
+            print(f"Best Loss: {best_loss:.4f}" if isinstance(best_loss, (int, float)) else f"Best Loss: {best_loss}")
+            
+            edp = best_metrics.get('edp', 'N/A')
+            print(f"Best EDP: {edp:.2e}" if isinstance(edp, (int, float)) else f"Best EDP: {edp}")
+            
+            area = best_metrics.get('area_mm2', 'N/A')
+            print(f"Best Area: {area:.2f}mm²" if isinstance(area, (int, float)) else f"Best Area: {area}")
+            
+            latency = best_metrics.get('latency_ms', 'N/A')
+            print(f"Best Latency: {latency:.2f}ms" if isinstance(latency, (int, float)) else f"Best Latency: {latency}")
+            
+            energy = best_metrics.get('energy_mj', 'N/A')
+            print(f"Best Energy: {energy:.2f}mJ" if isinstance(energy, (int, float)) else f"Best Energy: {energy}")
+        else:
+            print("No valid solutions found or metrics unavailable.")
+            
+        print(f"Total Trials: {num_trials}")
+        print(f"Duration: {start_ts} → {end_ts} ({duration:.2f}s)")
+        print(f"[{self.name}] seed={seed} completed successfully.")
+        print(f"{'='*60}\n")
 
 
 class MappingOnlyA1Runner(_BaseSearchRunner):

@@ -7,6 +7,53 @@ import random
 from .utils import OptimizationLogger, get_divisors, derive_minimal_hardware
 from .space import SearchSpace
 
+# ===== Frozen proxy & perf-model wrapper (lock discrete mapping) =====
+class _FrozenMappingProxy:
+    """Wrap mapping and force get_all_factors() to return a frozen snapshot."""
+    def __init__(self, mapping, frozen_factors):
+        self._mapping = mapping
+        self._frozen = self._deep_clone_factors(frozen_factors)
+
+    def _deep_clone_factors(self, factors):
+        """Deep clone factors dict, handling PyTorch tensors properly"""
+        if isinstance(factors, torch.Tensor):
+            return factors.detach().clone()
+        elif isinstance(factors, dict):
+            return {k: self._deep_clone_factors(v) for k, v in factors.items()}
+        elif isinstance(factors, (list, tuple)):
+            return type(factors)(self._deep_clone_factors(item) for item in factors)
+        else:
+            return factors
+
+    def get_all_factors(self, *args, **kwargs):
+        return self._deep_clone_factors(self._frozen)
+
+    def __getattr__(self, name):
+        return getattr(self._mapping, name)
+
+
+class _PerfModelWrapper:
+    """
+    Transparent wrapper for perf_model:
+    - Phase A: sample once from mapping, remember it on searcher, and evaluate with a frozen proxy.
+    - Phase B: always replace mapping with searcher.best_discrete_factors (frozen).
+    """
+    def __init__(self, searcher, inner_callable):
+        self._searcher = searcher
+        self._inner = inner_callable
+
+    def __call__(self, graph, hw_params, mapping, fusion_params):
+        # Phase B: use frozen best
+        if getattr(self._searcher, "_freeze_discrete", False) and (self._searcher.best_discrete_factors is not None):
+            mapping = _FrozenMappingProxy(mapping, self._searcher.best_discrete_factors)
+            return self._inner(graph, hw_params, mapping, fusion_params)
+
+        # Phase A: sample once -> remember -> freeze for this call
+        sampled = mapping.get_all_factors()
+        self._searcher._last_eval_discrete_factors = sampled
+        mapping = _FrozenMappingProxy(mapping, sampled)
+        return self._inner(graph, hw_params, mapping, fusion_params)
+
 
 class BaseSearcher(ABC):
     """抽象基类，定义所有搜索器的通用接口"""
@@ -32,7 +79,9 @@ class BaseSearcher(ABC):
         self.hw_params.log_num_pes.requires_grad = False
         self.mapping = mapping
         self.fusion_params = fusion_params
-        self.perf_model = perf_model
+        self._orig_perf_model = perf_model
+        self.perf_model = _PerfModelWrapper(self, perf_model)
+
         self.config = config
         self.logger = logger
         # 主调用方可选地传入 Recorder，用于记录每一步试验信息和最佳结果
@@ -52,6 +101,12 @@ class BaseSearcher(ABC):
         self.best_edp = float('inf')
         self.best_edp_params = None
         self.best_edp_metrics = None
+
+        # Scheme-B snapshots / switch
+        self._last_eval_discrete_factors: Optional[Dict[str, any]] = None
+        self.best_discrete_factors: Optional[Dict[str, any]] = None
+        self._freeze_discrete: bool = False
+
         
         # 损失策略配置
         self.loss_strategy = getattr(config, 'LOSS_STRATEGY', 'log_edp_plus_area')
@@ -517,6 +572,7 @@ class BaseSearcher(ABC):
             self.best_edp = current_edp
             self.best_edp_params = params.copy()
             self.best_edp_metrics = metrics.copy()
+            self.best_discrete_factors = self._last_eval_discrete_factors
             if self.recorder is not None:
                 self.recorder.update_best(metrics, key="edp")
 
@@ -905,6 +961,18 @@ class FADOSASearcher(BaseSearcher):
                 if self.logger:
                     self.logger.console("No EDP-optimal parameters found in Phase A, continuing with current parameters.")
 
+            # Enable Phase-B frozen mapping if we have a snapshot
+            self._freeze_discrete = self.best_discrete_factors is not None
+            try:
+                self.mapping.eval()
+            except Exception:
+                pass
+            try:
+                self.fusion_params.eval()
+            except Exception:
+                pass
+
+
             # 根据当前映射推导最小硬件规模，作为硬件优化的起点
             with torch.no_grad():
                 # 恢复Phase A中的最佳映射/融合配置，确保后续硬件搜索基于最优映射
@@ -966,8 +1034,12 @@ class FADOSASearcher(BaseSearcher):
                     print("[DEBUG] ✓ 硬件参数未发生变化 (APPLY_MIN_HW_BOUNDS=False)")
 
             # Report mapping and fusion parameter changes
+            print("[DEBUG] before diff snapshot (projected):")
+            print(self._snapshot_mapping())
             current_mapping_state = self._snapshot_mapping()
             mapping_changes = self._diff_mapping(prev_mapping_state, current_mapping_state)
+            print("[DEBUG] after Phase A snapshot (projected):")
+            print(self._snapshot_mapping()) 
             if mapping_changes:
                 print(f"[DEBUG] ⚠️ 映射参数变化: {', '.join(mapping_changes)}")
             else:
@@ -998,6 +1070,26 @@ class FADOSASearcher(BaseSearcher):
             hw_opt_params = [p for p in hw_params_list if p.requires_grad]
             if hw_opt_params:
                 optimizer_hw = optim.Adam(hw_opt_params, lr=self.lr_hardware)
+                
+                # 打印Phase B开始前的初始硬件配置
+                with torch.no_grad():
+                    initial_hw_config = {
+                        'num_pes': self.hw_params.get_projected_num_pes().item(),
+                        'L0_size_kb': self.hw_params.get_buffer_size_kb('L0_Registers').item(),
+                        'L1_size_kb': self.hw_params.get_buffer_size_kb('L1_Accumulator').item(),
+                        'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
+                    }
+                    # 计算初始面积
+                    _, _, initial_area, _, _ = self.perf_model(
+                        self.graph, self.hw_params, self.mapping, self.fusion_params
+                    )
+                    print(f"\n[HARDWARE] Phase B 开始 - 初始硬件配置:")
+                    print(f"[HARDWARE]   PE数量: {initial_hw_config['num_pes']:.0f}")
+                    print(f"[HARDWARE]   L0缓存: {initial_hw_config['L0_size_kb']:.2f} KB")
+                    print(f"[HARDWARE]   L1缓存: {initial_hw_config['L1_size_kb']:.2f} KB")
+                    print(f"[HARDWARE]   L2缓存: {initial_hw_config['L2_size_kb']:.2f} KB")
+                    print(f"[HARDWARE]   总面积: {initial_area.item():.2f} mm²")
+                    print(f"[HARDWARE] 开始 {self.num_hardware_steps} 步硬件优化...\n")
 
                 for i in range(self.num_hardware_steps):
                     optimizer_hw.zero_grad()
@@ -1083,10 +1175,18 @@ class FADOSASearcher(BaseSearcher):
                             'L2_size_kb': self.hw_params.get_buffer_size_kb('L2_Scratchpad').item()
                         }
                         
-                        # 每10步打印一次详细的参数变化
+                        # 每步都打印硬件配置信息，包括EDP
+                        edp_value = (latency * energy).item()
+                        print(f"\n[HARDWARE] Outer Step {outer_step+1}, Inner Step {i+1}:")
+                        print(f"[HARDWARE]   PE数量: {hw_after_bounds['num_pes']:.0f}")
+                        print(f"[HARDWARE]   L0缓存: {hw_after_bounds['L0_size_kb']:.2f} KB")
+                        print(f"[HARDWARE]   L1缓存: {hw_after_bounds['L1_size_kb']:.2f} KB")
+                        print(f"[HARDWARE]   L2缓存: {hw_after_bounds['L2_size_kb']:.2f} KB")
+                        print(f"[HARDWARE]   总面积: {area.item():.2f} mm²")
+                        print(f"[HARDWARE]   EDP: {edp_value:.2e} (延迟: {latency.item():.2e}s, 能耗: {energy.item():.2e}pJ)")
+                        
+                        # 每10步打印一次详细的loss组成部分
                         if i % 10 == 0:
-                            print(f"\n[DEBUG] Phase B - Outer Step {outer_step+1}, Inner Step {i+1}:")
-                            
                             # 计算并显示loss的详细组成部分
                             comp_penalty_weight = self.loss_weights.get('compatibility_penalty_weight', 100.0)
                             comp_penalty = comp_penalty_weight * compatibility_penalty
@@ -1209,6 +1309,14 @@ class FADOSASearcher(BaseSearcher):
                                 f"  Hardware Step {i+1}/{self.num_hardware_steps}: Loss={loss.item():.4f}, EDP={metrics['edp']:.2e}, Area={metrics['area_mm2']:.2f}mm²"
                             )
                 
+                # Disable Phase-B freeze and restore train
+                self._freeze_discrete = False
+                try:
+                    self.mapping.train()
+                    self.fusion_params.train()
+                except Exception:
+                    pass
+
                 # Phase B结束后的最终记录（最佳结果已在每个hardware step中更新）
                 # 记录日志
                 if self.num_hardware_steps % 10 == 0:
