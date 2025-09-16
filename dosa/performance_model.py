@@ -150,13 +150,24 @@ class HighFidelityPerformanceModel(nn.Module):
         # === 2) 在类内新增一个方法（放在类中任意位置即可） ===
     def set_group_weight_residency(self, enabled: bool, residency_level: str = 'L2_Scratchpad'):
         """
-        启用/关闭“融合组全权重常驻”模式。
+        启用/关闭"融合组全权重常驻"模式。
         若 enabled=True，则本 perf_model 实例生命周期内仅第一次对指定 residency_level 的权重填充计入流量，
         后续层的权重填充记为 0（视作已驻留）。
         """
         self._group_w_persist_enabled = bool(enabled)
         self._group_w_residency_level = residency_level
         self._group_w_first_load_done = False
+
+    def compute_invalid_penalty(self, mapping: nn.Module) -> torch.Tensor:
+        """
+        Compute penalty to ensure tiling factors >= 1.
+        This keeps optimization smooth (no hard clamp).
+        """
+        invalid_mapping_loss = torch.tensor(0.0, device=self.config.DEVICE)
+        for name, p in mapping.named_parameters():
+            real_val = torch.exp(p)  # log-param → real factor
+            invalid_mapping_loss += torch.square(torch.clamp(1 - real_val, min=0)).sum()
+        return invalid_mapping_loss
 
     def calculate_intra_level_accesses(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor) -> dict:
         """
@@ -1450,6 +1461,9 @@ class HighFidelityPerformanceModel(nn.Module):
 
         area_cost = hw_params.get_area_cost()
 
+        # Compute invalid mapping penalty
+        mapping_invalid_penalty = self.compute_invalid_penalty(mapping)
+
         if debug_data is not None and debug_output_path is not None:
             import json
             
@@ -1473,10 +1487,9 @@ class HighFidelityPerformanceModel(nn.Module):
         area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
         total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
         total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
+        penalty = mapping_invalid_penalty + total_buffer_mismatch_loss + total_compatibility_penalty
         
-        
-
-        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty
+        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty, mapping_invalid_penalty, penalty
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
