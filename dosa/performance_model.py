@@ -23,7 +23,7 @@ from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
 from dosa.dmt import InPlaceFusionDMT, SkipConnectionDMT
 
-def debug_grad(target_var, mapping, path="L2_Scratchpad.R.spatial", var_name="target_var"):
+def debug_grad(target_var, mapping, path="L2_Scratchpad.R.spatial", var_name="target_var", fusion_params=None):
     try:
         # Recursively get parameter
         target = mapping.factors
@@ -45,6 +45,16 @@ def debug_grad(target_var, mapping, path="L2_Scratchpad.R.spatial", var_name="ta
         print(f"[GRADIENT DEBUG] ∂({var_name})/∂({path}) = {grad.item()}")
         print(f"[GRADIENT DEBUG] {path}.value = {target.item()}")
         print(f"[GRADIENT DEBUG] {var_name} = {target_var.item()}")
+    
+    # Debug gradients for fusion parameters if provided
+    if fusion_params is not None:
+        for name, param in fusion_params.items():
+            if param.requires_grad:
+                grad = torch.autograd.grad(target_var, param,
+                                       retain_graph=True, allow_unused=True)[0]
+                if grad is not None:
+                    print(f"[GRADIENT DEBUG] ∂({var_name})/∂(fusion.{name}) = {grad.item()}")
+                    print(f"[GRADIENT DEBUG] fusion.{name}.value = {param.item()}")
 
 
 # 获取全局配置实例
@@ -1170,6 +1180,7 @@ class HighFidelityPerformanceModel(nn.Module):
         
 
         # debug_grad(dram_bytes, mapping, "L2_Scratchpad.S.spatial")
+        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes + extra_output_bytes
 
         num_pes = hw_params.get_projected_num_pes()
 
@@ -1408,8 +1419,14 @@ class HighFidelityPerformanceModel(nn.Module):
 
         num_pes = hw_params.get_projected_num_pes()
 
+        
         if self.fusion_aware and fusion_params is not None:
-            fusion_probs = torch.sigmoid(fusion_params.fusion_logits.squeeze())
+            # 避免squeeze导致0维张量的问题
+            fusion_logits = fusion_params.fusion_logits
+            if fusion_logits.dim() == 1 and fusion_logits.size(0) == 1:
+                fusion_probs = torch.sigmoid(fusion_logits)  # 保持1维
+            else:
+                fusion_probs = torch.sigmoid(fusion_logits.squeeze())
             fusion_groups = graph.fusion_groups
             if debug_data is not None:
                 decisions = (fusion_probs > 0.5).detach().cpu().tolist()
@@ -1432,6 +1449,10 @@ class HighFidelityPerformanceModel(nn.Module):
 
             current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
             dmt_model = self.dmt_registry.get(current_pattern) if (self.fusion_aware and fusion_params is not None) else None
+            
+            # debug
+            print(f"DMT Model for pattern {current_pattern}: {dmt_model}")
+
             if dmt_model is not None:
                 fused_latency, fused_energy, fused_mismatch, fused_comp, _ = dmt_model(group, graph, hw_params, mapping, self.config)
             else:
@@ -1448,6 +1469,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 split_mismatch += mismatch
 
+            # bug
             latency = weight * fused_latency + (1 - weight) * split_latency
             energy = weight * fused_energy + (1 - weight) * split_energy            
 
