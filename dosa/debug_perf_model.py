@@ -449,15 +449,18 @@ def run_optimization(perf_model, mapping, hw_params, fusion_params,graph):
         fusion_optimizer.zero_grad()
 
         # 前向传播：计算性能指标
-        latency, energy, area, mismatch, compat, mapping_invalid_penalty, penalty = perf_model(
+        latency, energy, area, mismatch_loss, compat, mapping_invalid_penalty, penalty = perf_model(
             graph=graph,
             hw_params=hw_params,
             mapping=mapping,
             fusion_params=fusion_params
         )
 
+        print("\n🔍 Mismatch Loss Details:")
+        print(f"   Value: {mismatch_loss.item():.6e}")
+
         # 计算总损失：性能损失 + 映射无效惩罚
-        loss = (latency * energy) + MAPPING_PENALTY_WEIGHT * mapping_invalid_penalty
+        loss = (latency * energy) + MAPPING_PENALTY_WEIGHT * mapping_invalid_penalty + 1e9 * mismatch_loss
         current_loss = loss.item()
         
         # Best-so-far 策略：检查并更新最优解
