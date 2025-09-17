@@ -11,9 +11,9 @@ from dosa.hardware_parameters import HardwareParameters
 
 # =============== 配置常量 ===============
 # 优化器配置
-LEARNING_RATE = 2e-8  # 学习率，控制参数更新步长
-NUM_OPTIMIZATION_STEPS = 10  # 优化迭代次数
-MAPPING_PENALTY_WEIGHT = 1e8  # 映射无效惩罚权重
+LEARNING_RATE = 1e-8  # 学习率，控制参数更新步长
+NUM_OPTIMIZATION_STEPS = 5  # 优化迭代次数
+MAPPING_PENALTY_WEIGHT = 1e9  # 映射无效惩罚权重
 
 # =============== 工具函数 ===============
 def print_mapping_parameters(mapping, title="Mapping参数详情", show_projected=True):
@@ -55,13 +55,13 @@ def print_mapping_parameters(mapping, title="Mapping参数详情", show_projecte
     
     print(f"{'='*60}")
 
-def print_optimization_step(step, latency, energy, penalty, loss, current_loss, best_loss):
+def print_optimization_step(step, latency, energy, mapping_invalid_penalty, loss, current_loss, best_loss):
     """
     打印优化步骤的信息
     
     Args:
         step: 当前步数
-        latency, energy, penalty, loss: 性能指标
+        latency, energy, mapping_invalid_penalty, loss: 性能指标
         current_loss: 当前损失
         best_loss: 历史最优损失
     """
@@ -77,7 +77,7 @@ def print_optimization_step(step, latency, energy, penalty, loss, current_loss, 
     
     # 惩罚项
     print(f"\n⚠️  惩罚项:")
-    print(f"   🚫 Mapping Invalid Penalty: {penalty.item():.6e}")
+    print(f"   🚫 Mapping Invalid Penalty: {mapping_invalid_penalty.item():.6e}")
     
     # 总损失
     print(f"\n🎯 总损失: {loss.item():.6e}")
@@ -275,7 +275,7 @@ def print_best_solution_summary(best_step, best_loss, best_metrics):
 
 def create_mock_graph(problem_dims):
     """
-    Create a mock graph with simple Conv-BN-ReLU fusion
+    Create a mock graph with a single Conv layer
     """
     class MockGraph:
         def __init__(self, dims):
@@ -290,27 +290,13 @@ def create_mock_graph(problem_dims):
                 'output_shape': [dims['N'], dims['C'], dims['P'] + dims['R'] - 1, dims['Q'] + dims['S'] - 1]
             }
 
-            # Conv-BN-ReLU fusion block
+            # Single Conv layer
             self.layers['conv1'] = {
                 'type': 'Conv',
                 'dims': dims,
                 'input_shape': [dims['N'], dims['C'], dims['P'] + dims['R'] - 1, dims['Q'] + dims['S'] - 1],
                 'output_shape': [dims['N'], dims['K'], dims['P'], dims['Q']],
                 'weight_shape': [dims['K'], dims['C'], dims['R'], dims['S']]
-            }
-
-            self.layers['bn1'] = {
-                'type': 'BatchNormalization',
-                'dims': dims,
-                'input_shape': [dims['N'], dims['K'], dims['P'], dims['Q']],
-                'output_shape': [dims['N'], dims['K'], dims['P'], dims['Q']]
-            }
-
-            self.layers['relu1'] = {
-                'type': 'ReLU',
-                'dims': dims,
-                'input_shape': [dims['N'], dims['K'], dims['P'], dims['Q']],
-                'output_shape': [dims['N'], dims['K'], dims['P'], dims['Q']]
             }
 
             # Output layer
@@ -321,14 +307,14 @@ def create_mock_graph(problem_dims):
                 'output_shape': [dims['N'], dims['K'], dims['P'], dims['Q']]
             }
 
-            # Define single fusion group for Conv-BN-ReLU
+            # Define single fusion group for Conv only
             self.fusion_groups = [
-                ['conv1', 'bn1', 'relu1']
+                ['conv1']
             ]
             
             # Define layer execution order
             self.layer_order = [
-                'input', 'conv1', 'bn1', 'relu1', 'output'
+                'input', 'conv1', 'output'
             ]
             
             self.adjacency = {}  # Empty for simple case
@@ -460,7 +446,7 @@ def run_optimization(perf_model, mapping, hw_params, fusion_params,graph):
         print(f"   Value: {mismatch_loss.item():.6e}")
 
         # 计算总损失：性能损失 + 映射无效惩罚
-        loss = (latency * energy) + MAPPING_PENALTY_WEIGHT * mapping_invalid_penalty + 1e9 * mismatch_loss
+        loss = (latency * energy) + MAPPING_PENALTY_WEIGHT * mapping_invalid_penalty # + 1e7 * mismatch_loss
         current_loss = loss.item()
         
         # Best-so-far 策略：检查并更新最优解
@@ -483,13 +469,13 @@ def run_optimization(perf_model, mapping, hw_params, fusion_params,graph):
             print_fusion_parameters(fusion_params, graph, f"步数 {step} - 最优Fusion参数")
         
         # 打印当前步骤的优化信息
-        print_optimization_step(step, latency, energy, penalty, loss, current_loss, best_loss)
+        print_optimization_step(step, latency, energy, mapping_invalid_penalty, loss, current_loss, best_loss)
         
         # 反向传播：计算梯度
         loss.backward()
         
         # 打印参数梯度和更新信息
-        # print_parameter_gradients(mapping, LEARNING_RATE)
+        print_parameter_gradients(mapping, LEARNING_RATE)
         
         # 打印fusion参数的梯度信息
         print_fusion_gradients(fusion_params, f"Step {step} - Fusion参数梯度")
@@ -499,12 +485,12 @@ def run_optimization(perf_model, mapping, hw_params, fusion_params,graph):
         fusion_optimizer.step()
         
         # 打印更新后的mapping参数
-        # print_mapping_parameters(mapping, f"Step {step+1} - 更新后的Mapping参数")
+        print_mapping_parameters(mapping, f"Step {step+1} - 更新后的Mapping参数")
 
     # 优化结束后的最优解恢复
     if best_mapping_params is not None:
         # 打印最优解摘要
-        # print_best_solution_summary(best_step, best_loss, best_metrics)
+        print_best_solution_summary(best_step, best_loss, best_metrics)
         
         # 恢复最优参数到mapping对象
         for name, param in mapping.named_parameters():

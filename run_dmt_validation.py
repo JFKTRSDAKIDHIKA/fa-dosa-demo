@@ -76,22 +76,21 @@ FUSION_GROUPS_TO_TEST = [
 
 # 2. Hardware Configuration Space
 HW_CONFIG_SPACE = {
-    "num_pes": [64, 256],
-    "l2_scratchpad_size_kb": [256, 512]
+    "num_pes": [64],
+    "l2_scratchpad_size_kb": [256]
 }
 
 # 3. Mapping Space (simplified, needs to be dimension-dependent)
 # A more robust implementation would dynamically get divisors
 MAPPING_SPACE = {
-    "K": [16, 32, 64],
-    "C": [16, 32, 64]
+    "K": [16],
+    "C": [16]
 }
 
 # 4. Workload Dimensions (example for a specific layer)
 # In a real scenario, this would be loaded dynamically per layer
 WORKLOAD_DIMS = {
-    "layer1.0.conv1": {"N": 1, "C": 64, "K": 64, "P": 56, "Q": 56, "R": 3, "S": 3},
-    "layer1.0.relu": {"N": 1, "C": 64, "K": 64, "P": 56, "Q": 56, "R": 1, "S": 1} # ReLU output dims match Conv output dims
+    "layer1.0.conv1": {"N": 1, "C": 64, "K": 64, "P": 56, "Q": 56, "R": 3, "S": 3}
 }
 
 
@@ -935,96 +934,84 @@ def main():
     else:
         print("[INFO] Running full validation sweep")
 
-    try:
-        # Generate validation configurations
-        validation_configs = generate_validation_configs(max_runs)
-        print(f"[INFO] Generated {len(validation_configs)} validation configurations")
+    # Generate validation configurations
+    validation_configs = generate_validation_configs(max_runs)
+    print(f"[INFO] Generated {len(validation_configs)} validation configurations")
+    
+    for validation_point_id, config in validation_configs:
+        print(f"--- Running Validation Point {validation_point_id} ---")
         
-        for validation_point_id, config in validation_configs:
-            print(f"--- Running Validation Point {validation_point_id} ---")
-            
-            # Store configuration in master dictionary
-            master_configs[str(validation_point_id)] = config
-            
-            # Create workspace directory in output folder
-            work_dir = output_dir / f'validation_workspace_{validation_point_id}'
-            work_dir.mkdir(exist_ok=True)
-            
-            try:
-                # Run dual-track evaluation
-                dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
-                timeloop_results = run_timeloop_simulation(config, work_dir)
-                
-                # Combine results
-                flat_config = {
-                    "validation_point_id": validation_point_id,
-                    "group_name": config['fusion_group_info']['group_name'],
-                    **config['hardware_config']
-                }
-                combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success"}
-                all_results.append(combined_result)
-                success_count += 1
-                
-                print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
-                
-            except Exception as e:
-                print(f"[ERROR] Validation point {validation_point_id} failed: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Add error result
-                flat_config = {
-                    "validation_point_id": validation_point_id,
-                    "group_name": config['fusion_group_info']['group_name'],
-                    **config['hardware_config']
-                }
-                error_result = {**flat_config, "predicted_latency_s": -1.0, "predicted_energy_pj": -1.0, 
-                               "simulated_latency_s": -1.0, "simulated_energy_pj": -1.0, 
-                               "status": "error", "error_message": str(e)}
-                all_results.append(error_result)
-                error_count += 1
-
-        # Save results to CSV file
-        if all_results:
-            csv_file = output_dir / "dmt_validation_results.csv"
-            df = pd.DataFrame(all_results)
-            # Ensure all required columns are present
-            required_columns = ['validation_point_id', 'group_name', 'num_pes', 'l2_scratchpad_size_kb', 
-                               'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 'status']
-            for col in required_columns:
-                if col not in df.columns:
-                    df[col] = -1.0 if 'latency' in col or 'energy' in col else 'unknown'
-            
-            df.to_csv(csv_file, index=False)
-            print(f"[INFO] Results saved to {csv_file}")
+        # Store configuration in master dictionary
+        master_configs[str(validation_point_id)] = config
         
-        # Debug JSON files are already saved directly to output directory
+        # Create workspace directory in output folder
+        work_dir = output_dir / f'validation_workspace_{validation_point_id}'
+        work_dir.mkdir(exist_ok=True)
         
-        # Final statistics
-        total_points = len(all_results)
-        if total_points > 0:
-            print(f"\nValidation complete. Total: {total_points}, Succeeded: {success_count}, Failed: {error_count}, Timed out: {timeout_count}")
-        else:
-            print("\nValidation run finished, but no results were collected.")
-            
-        # Save configuration information to JSON file in output directory
         try:
-            config_file = output_dir / "validation_configs.json"
-            with open(config_file, 'w') as f:
-                json.dump(master_configs, f, indent=4)
-            print(f"[INFO] Configuration information saved to {config_file}")
-            print(f"[INFO] Total configurations saved: {len(master_configs)}")
-        except Exception as json_error:
-            print(f"[ERROR] Failed to save configuration JSON: {json_error}")
+            # Run dual-track evaluation
+            dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
+            timeloop_results = run_timeloop_simulation(config, work_dir)
             
-    except Exception as e:
-        print(f"[ERROR] Main validation loop failed: {e}")
-        import traceback
-        traceback.print_exc()
+            # Combine results
+            flat_config = {
+                "validation_point_id": validation_point_id,
+                "group_name": config['fusion_group_info']['group_name'],
+                **config['hardware_config']
+            }
+            combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success"}
+            all_results.append(combined_result)
+            success_count += 1
             
-    finally:
-        # All files are now organized in the output directory
-        print(f"[INFO] All validation results and workspaces are preserved in: {output_dir.resolve()}")
+            print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
+            
+        except Exception as e:
+            print(f"[ERROR] Validation point {validation_point_id} failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error result
+            flat_config = {
+                "validation_point_id": validation_point_id,
+                "group_name": config['fusion_group_info']['group_name'],
+                **config['hardware_config']
+            }
+            error_result = {**flat_config, "predicted_latency_s": -1.0, "predicted_energy_pj": -1.0, 
+                            "simulated_latency_s": -1.0, "simulated_energy_pj": -1.0, 
+                            "status": "error", "error_message": str(e)}
+            all_results.append(error_result)
+            error_count += 1
+
+    # Save results to CSV file
+    if all_results:
+        csv_file = output_dir / "dmt_validation_results.csv"
+        df = pd.DataFrame(all_results)
+        # Ensure all required columns are present
+        required_columns = ['validation_point_id', 'group_name', 'num_pes', 'l2_scratchpad_size_kb', 
+                            'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 'status']
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = -1.0 if 'latency' in col or 'energy' in col else 'unknown'
+        
+        df.to_csv(csv_file, index=False)
+        print(f"[INFO] Results saved to {csv_file}")
+    
+    # Debug JSON files are already saved directly to output directory
+    
+    # Final statistics
+    total_points = len(all_results)
+    if total_points > 0:
+        print(f"\nValidation complete. Total: {total_points}, Succeeded: {success_count}, Failed: {error_count}, Timed out: {timeout_count}")
+    else:
+        print("\nValidation run finished, but no results were collected.")
+        
+    # Save configuration information to JSON file in output directory
+    config_file = output_dir / "validation_configs.json"
+    with open(config_file, 'w') as f:
+        json.dump(master_configs, f, indent=4)
+    print(f"[INFO] Configuration information saved to {config_file}")
+    print(f"[INFO] Total configurations saved: {len(master_configs)}")
+
 
 if __name__ == "__main__":
     main()

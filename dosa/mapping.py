@@ -154,16 +154,28 @@ class FineGrainedMapping(nn.Module):
 
         # 只为片上存储（on-chip buffers）创建可学习的参数
         on_chip_levels = [level['name'] for level in hierarchy if level['type'] == 'buffer']
+
+        # # 只允许这两个维度并行
+        ALLOWED_SPATIAL_DIMS = {"C", "K"}  # 只允许这两个维度并行
         
         for level_name in on_chip_levels:
             self.factors[level_name] = nn.ModuleDict()
             for dim_name in self.dims.keys():
                 # 使用ParameterDict来正确注册参数
                 # 初始化为1（在log空间中为0），确保是标量张量
-                self.factors[level_name][dim_name] = nn.ParameterDict({
-                    'temporal': nn.Parameter(torch.tensor(0.0)), # log(1) = 0, 标量
-                    'spatial': nn.Parameter(torch.tensor(0.0))   # log(1) = 0, 标量
-                })
+                # 注意：这里只是在PE 这边和CK维度存在空间并行
+                if dim_name in ALLOWED_SPATIAL_DIMS and level_name == 'L0_Registers':
+                    # ✅ 对 C 和 K，在 PE 层创建可学习的参数
+                    self.factors[level_name][dim_name] = nn.ParameterDict({
+                        'temporal': nn.Parameter(torch.tensor(0.0)),  # log(1)=0
+                        'spatial': nn.Parameter(torch.tensor(0.0))
+                    })
+                else:
+                    # ❌ 对其他维度 / 层级，spatial 固定为常数 0 (log(1)=0)，不训练
+                    self.factors[level_name][dim_name] = nn.ParameterDict({
+                        'temporal': nn.Parameter(torch.tensor(0.0)),
+                        'spatial': nn.Parameter(torch.tensor(0.0), requires_grad=False)  # 冻结
+                    })
 
         # Flag storage for partial-sum detection
         self.partial_sum_violations = {}
