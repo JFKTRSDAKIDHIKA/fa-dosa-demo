@@ -164,7 +164,6 @@ def format_mapping_as_all_factors(mapping):
 
     return formatted
 
-
 class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
@@ -323,6 +322,12 @@ class HighFidelityPerformanceModel(nn.Module):
                 
                 # 计算填充流量 = C_i,t × Tiles_above(i)
                 tensor_fill_accesses = C_i_t * tiles
+
+                # === DEBUG: 打印 REG 的 fill 次数 ===
+                if destination_level_name == "L0_Registers":
+                    print(f"[DEBUG] REG Fill: tensor={tensor_type}, "
+                        f"destination={destination_level_name}, "
+                        f"fill_accesses={tensor_fill_accesses.detach().cpu().item()}")
                 
                 # 收集详细的调试数据
                 if debug_data is not None:
@@ -431,6 +436,14 @@ class HighFidelityPerformanceModel(nn.Module):
         bytes_per_O = self.config.BYTES_PER_ELEMENT  # 若有 per-tensor 精度，替成 per-O
         write_bytes = updates_L1 * bytes_per_O
 
+
+        # === DEBUG 打印 ===
+        print("[DEBUG][L1 Updates]")
+        print(f"  MACs           = {macs.item() if isinstance(macs, torch.Tensor) else macs}")
+        print(f"  F_S_O(L1)      = {F_S_O_L0.item() if isinstance(F_S_O_L0, torch.Tensor) else F_S_O_L0}")
+        print(f"  Updates_O(L1)  = {updates_L1.item() if isinstance(updates_L1, torch.Tensor) else updates_L1}")
+        print(f"  Write bytes    = {write_bytes.item() if isinstance(write_bytes, torch.Tensor) else write_bytes}")
+
         # 4) 组织结果（接口命名：PE 到 L1）
         interface_name = 'PE_to_L1_Accumulator'
         result = {
@@ -452,14 +465,7 @@ class HighFidelityPerformanceModel(nn.Module):
             }
         }
 
-        # 可选：调试信息
-        if debug_data is not None:
-            debug_data['updates_pe_to_l1'] = {
-                'MACs': float(macs),
-                'F_S_O_L1': float(F_S_O_L0),
-                'Updates_O_L1': float(updates_L1),
-                'bytes': float(write_bytes)
-            }
+
 
         return result
 
@@ -545,31 +551,33 @@ class HighFidelityPerformanceModel(nn.Module):
     
     def _tiles_above_for_W(self, i: int, layer_dims: dict, mapping_table: dict, persist_W: bool) -> torch.Tensor:
         """
-        Tiles_above(i, W) —— DOSA 口径（基线）：
-            只乘“i 之外各层”的【时间分块因子】，
-            只乘 W 自身的索引维 D_W = {K, C, R, S}，
-            不乘空间因子；不把 {N, P, Q} 乘进来；
-            不用 ceil(total/coverage)。
-
-        说明：
-        - 为保持兼容性保留 persist_W 参数，但此处不使用（忽略）。
-        - 不依赖 loop order；仅依赖 mapping_table 中各层的 temporal 因子。
+        Tiles_above(i, W) —— L0 之外所有层级的 temporal 因子乘积：
+        - 必须包含 W 相关维 D_W = {K, C, R, S}
+        - 以及 W 无关维 {N, P, Q}   # 这正是你漏掉的！
+        - 只乘 temporal；不乘 spatial；不做广播折扣（广播在 reads 阶段做）
         """
         dev = self.config.DEVICE
         D_W = ('K', 'C', 'R', 'S')
+        # D_indep = ('N', 'P', 'Q')
 
-        # Fixed memory hierarchy order from inner to outer levels
-        levels_order = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+        # 这里最好别写死层级顺序，直接复用你已有的 memory_levels
+        levels_order = ['L0_Registers','L1_Accumulator','L2_Scratchpad','L3_DRAM']
 
         tiles = torch.tensor(1.0, device=dev)
-        # 只乘“i 的外层(k>i)”的时间因子
-        for k in range(i + 1, len(levels_order)):
+        for k in range(i + 1, len(levels_order)):       # 只看“外层”
             lvl = levels_order[k]
+            # 1) 相关维（K,C,R,S）
             for d in D_W:
                 tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
                 if not isinstance(tf, torch.Tensor):
                     tf = torch.tensor(float(tf), device=dev)
                 tiles = tiles * torch.clamp(tf, min=1.0)
+            # 2) 无关维（N,P,Q）—— 这一步是关键新增
+            # for d in D_indep:
+            #     tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
+            #     if not isinstance(tf, torch.Tensor):
+            #         tf = torch.tensor(float(tf), device=dev)
+            #     tiles = tiles * torch.clamp(tf, min=1.0)
 
         return tiles
 
@@ -649,7 +657,7 @@ class HighFidelityPerformanceModel(nn.Module):
             if tensor_type == 'I':
                 dims = ('K',)
             elif tensor_type == 'W':
-                dims = ('C', 'K')
+                dims = ('P', 'Q', 'N')
             elif tensor_type == 'O':
                 dims = ('C',)
             else:
@@ -696,6 +704,13 @@ class HighFidelityPerformanceModel(nn.Module):
         C_i_I = self._calculate_data_block_size(i, 'I', layer_dims, mapping_table)
         tiles_i_I = self._tiles_above_for_I(i, layer_dims, mapping_table)
         base_I_L3_to_L2 = C_i_I * tiles_i_I  # 元素计
+        
+        # Print L3 Input reads
+        print("[DEBUG][L3 Input Reads]")
+        print(f"  C_i_I = {C_i_I.item() if isinstance(C_i_I, torch.Tensor) else C_i_I}")
+        print(f"  tiles_i_I = {tiles_i_I.item() if isinstance(tiles_i_I, torch.Tensor) else tiles_i_I}")
+        print(f"  base_I_L3_to_L2 = {base_I_L3_to_L2.item() if isinstance(base_I_L3_to_L2, torch.Tensor) else base_I_L3_to_L2}")
+        
         _add(
             'L3_DRAM_to_L2_Scratchpad',
             'Input',
@@ -708,6 +723,30 @@ class HighFidelityPerformanceModel(nn.Module):
             }
         )
 
+        # ---------- Weight Reads ----------
+        # W: L3 -> L2 （无广播）
+        i = memory_levels.index('L2_Scratchpad')
+        C_i_W = self._calculate_data_block_size(i, 'W', layer_dims, mapping_table)
+        tiles_i_W = self._tiles_above_for_W(i, layer_dims, mapping_table, persist_W=False)
+        base_W_L3_to_L2 = C_i_W * tiles_i_W
+
+        # Print L3 Weight reads
+        print("[DEBUG][L3 Weight Reads]")
+        print(f"  C_i_W = {C_i_W.item() if isinstance(C_i_W, torch.Tensor) else C_i_W}")
+        print(f"  tiles_i_W = {tiles_i_W.item() if isinstance(tiles_i_W, torch.Tensor) else tiles_i_W}")
+        print(f"  base_W_L3_to_L2 = {base_W_L3_to_L2.item() if isinstance(base_W_L3_to_L2, torch.Tensor) else base_W_L3_to_L2}")
+
+        _add(
+            'L3_DRAM_to_L2_Scratchpad',
+            'Weight',
+            base_W_L3_to_L2,
+            {
+                'C_i,t': float(C_i_W.item()) if isinstance(C_i_W, torch.Tensor) else C_i_W,
+                'Tiles_above': float(tiles_i_W.item()) if isinstance(tiles_i_W, torch.Tensor) else tiles_i_W,
+                'broadcast_factor': 1.0,
+                'note': 'Weight read L3->L2 (no broadcast)'
+            }
+        )
         # I: L2 -> PE  （有广播，独立维 K）
         bcast_I_L2 = _bcast_factor('I', mapping_table, dev)
         read_I_L2_to_PE = total_macs  / torch.clamp(bcast_I_L2, min=1.0)
@@ -722,78 +761,93 @@ class HighFidelityPerformanceModel(nn.Module):
             }
         )
 
-        # ---------- Weight Reads ----------
-        # W: L3 -> L2 （无广播）
-        i = memory_levels.index('L2_Scratchpad')
-        C_i_W = self._calculate_data_block_size(i, 'W', layer_dims, mapping_table)
-        tiles_i_W = self._tiles_above_for_W(i, layer_dims, mapping_table, persist_W=False)
-        base_W_L3_to_L2 = C_i_W * tiles_i_W
-        _add(
-            'L3_DRAM_to_L2_Scratchpad',
-            'Weight',
-            base_W_L3_to_L2,
-            {
-                'C_i,t': float(C_i_W.item()) if isinstance(C_i_W, torch.Tensor) else C_i_W,
-                'Tiles_above': float(tiles_i_W.item()) if isinstance(tiles_i_W, torch.Tensor) else tiles_i_W,
-                'broadcast_factor': 1.0,
-                'note': 'Weight read L3->L2 (no broadcast)'
-            }
-        )
-
-        # W: L2 -> L0 （有广播，独立维 C,K）
+        # W: L2 -> L0 (with broadcast over C,K dimensions)
         i_L0 = memory_levels.index('L0_Registers')
         C_L0_W = self._calculate_data_block_size(i_L0, 'W', layer_dims, mapping_table)
         tiles_L0_W = self._tiles_above_for_W(i_L0, layer_dims, mapping_table, persist_W=False)
         base_W_L2_to_L0 = C_L0_W * tiles_L0_W
         bcast_W_L2 = _bcast_factor('W', mapping_table, dev)
-        read_W_L2_to_L0 = base_W_L2_to_L0 / torch.clamp(bcast_W_L2, min=1.0)
+        fanout_L0_W = torch.tensor(1.0, device=dev)
+
+        for d in ('K', 'C', 'R', 'S'):
+            s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
+            if not isinstance(s, torch.Tensor):
+                s = torch.tensor(float(s), device=dev)
+            fanout_L0_W *= torch.clamp(s, min=1.0)
+
+        read_W_L2_to_L0 = (base_W_L2_to_L0 * fanout_L0_W) / torch.clamp(bcast_W_L2, min=1.0)
+
+        # Print calculation process
+        print("\n=== Weight L2->L0 Traffic Calculation ===")
+        print(f"1. Data block size at L0 (C_L0_W) = {C_L0_W.item() if isinstance(C_L0_W, torch.Tensor) else C_L0_W}")
+        print(f"2. Tiles above L0 (tiles_L0_W) = {tiles_L0_W.item() if isinstance(tiles_L0_W, torch.Tensor) else tiles_L0_W}")
+        print(f"3. Base traffic (C_L0_W * tiles_L0_W) = {base_W_L2_to_L0.item() if isinstance(base_W_L2_to_L0, torch.Tensor) else base_W_L2_to_L0}")
+        print(f"4. Broadcast factor (C,K@L2) = {bcast_W_L2.item() if isinstance(bcast_W_L2, torch.Tensor) else bcast_W_L2}")
+        print(f"5. Final traffic after broadcast = {read_W_L2_to_L0.item() if isinstance(read_W_L2_to_L0, torch.Tensor) else read_W_L2_to_L0}")
+        
         _add(
             'L2_Scratchpad_to_L0_Registers',
             'Weight',
             read_W_L2_to_L0,
             {
                 'base_elements(L0)': float(base_W_L2_to_L0.item()) if isinstance(base_W_L2_to_L0, torch.Tensor) else base_W_L2_to_L0,
-                'broadcast_factor(C,K@L2)': float(bcast_W_L2.item()),
+                'broadcast_factor': float(bcast_W_L2.item()),
                 'note': 'Weight read L2->L0 with broadcast over C,K'
             }
         )
 
-        # W: L0 -> PE （**无广播**）
-        read_W_L0_to_PE = total_macs
+        # === DEBUG: 合并打印 L2 的总读流量 ===
+        total_read_L2 = read_I_L2_to_PE + read_W_L2_to_L0
+        print("[DEBUG][L2 Reads]")
+        print(f"  Input  (L2->PE)       = {read_I_L2_to_PE.item() if isinstance(read_I_L2_to_PE, torch.Tensor) else read_I_L2_to_PE}")
+        print(f"  Weight (L2->L0)       = {read_W_L2_to_L0.item() if isinstance(read_W_L2_to_L0, torch.Tensor) else read_W_L2_to_L0}")
+        print(f"  Total L2 Read Traffic = {total_read_L2.item() if isinstance(total_read_L2, torch.Tensor) else total_read_L2}")
+
+        # W: L0 -> PE (with broadcast over P,Q,N @ L0)
+        bcast_W_L0 = _bcast_factor('W', mapping_table, dev)
+        read_W_L0_to_PE = total_macs / torch.clamp(bcast_W_L0, min=1.0)
+
+        print("[DEBUG][Weight Reads L0->PE]")
+        print(f"  total_macs = {total_macs.item() if isinstance(total_macs, torch.Tensor) else total_macs}")
+        print(f"  bcast(P,Q,N @ L0) = {bcast_W_L0.item() if isinstance(bcast_W_L0, torch.Tensor) else bcast_W_L0}")
+        print(f"  read_W_L0_to_PE = {read_W_L0_to_PE.item() if isinstance(read_W_L0_to_PE, torch.Tensor) else read_W_L0_to_PE}")
+
         _add(
             'L0_Registers_to_PE',
             'Weight',
             read_W_L0_to_PE,
             {
-                'base_elements(L0)': float(base_W_L2_to_L0.item()) if isinstance(base_W_L2_to_L0, torch.Tensor) else base_W_L2_to_L0,
-                'broadcast_factor': 1.0,
-                'note': 'Weight read L0->PE (no broadcast)'
+                'bcast(P,Q,N@L0)': float(bcast_W_L0.item()) if isinstance(bcast_W_L0, torch.Tensor) else bcast_W_L0,
+                'note': 'Weight read L0->PE with broadcast over P,Q,N at L0 (if any)'
             }
         )
 
 
         # ---------- Output Reads ----------
         # O: L1 -> PE  （有广播，独立维 C；基数按 MACs）
-        # 你偏好用统一接口：total_macs = calculate_macs(layer['dims'])；这里直接用 layer_dims
+        # 偏好统一接口：total_macs = calculate_macs(layer['dims'])；这里直接用 layer_dims
         total_macs = calculate_macs(layer_dims)
         bcast_O_L1 = _bcast_factor('O', mapping_table, dev)
         read_O_L1_to_PE = total_macs / torch.clamp(bcast_O_L1, min=1.0)
+
+        # === DEBUG 打印 ===
+        print("[DEBUG][Output Reads]")
+        print(f"  total_macs = {total_macs.item() if isinstance(total_macs, torch.Tensor) else total_macs}")
+        print(f"  bcast_O_L1 = {bcast_O_L1.item() if isinstance(bcast_O_L1, torch.Tensor) else bcast_O_L1}")
+        print(f"  read_O_L1_to_PE = {read_O_L1_to_PE.item() if isinstance(read_O_L1_to_PE, torch.Tensor) else read_O_L1_to_PE}")
+
+        # 收集到 detailed traffic
         _add(
             'L1_Accumulator_to_PE',
             'Output',
             read_O_L1_to_PE,
             {
                 'MACs': float(total_macs.item()) if isinstance(total_macs, torch.Tensor) else total_macs,
-                'broadcast_factor(C@L1)': float(bcast_O_L1.item()),
+                'broadcast_factor(C@L1)': float(bcast_O_L1.item()) if isinstance(bcast_O_L1, torch.Tensor) else bcast_O_L1,
                 'note': 'Output read L1->PE; base=MACs, broadcast over C'
             }
         )
 
-        # ---- 调试轨迹（可选） ----
-        if debug_data is not None:
-            debug_data["inter_level_read_traffic_trace"] = {
-                **debug_data.get("inter_level_read_traffic_trace", {})
-            }
 
         # ---- 收尾：组装返回 ----
         result = {}
@@ -840,46 +894,82 @@ class HighFidelityPerformanceModel(nn.Module):
             return size
             
         elif tensor_type == 'I':
-            # C_i,I (Equation 3 for Inputs - 最复杂):
-            # Inner(i, d) = Π(f_k,j,d) (其中 k,j 范围同 C_i,W)
-            # C_i,I = Π_{d∈{C,N}} (f_k,j,d) × (P_stride × (Inner(i,P) - 1) + Inner(i,R)) × (Q_stride × (Inner(i,Q) - 1) + Inner(i,S))
-            
-            def calculate_inner(dim_name):
-                """计算 Inner(i, d) - 某个维度 d 在层级 i 及其内层的总 tile size"""
-                inner_size = torch.tensor(1.0, device=self.config.DEVICE)
+            """
+            C_i,I —— 对 Input 的块大小。
+            口径（与 DOSA/Timeloop 对齐）：
+            - 若 level == L2_Scratchpad：把 L2 自身 P/Q 方向多 tile 带来的“两端 halo（R-1 / S-1）”
+              作为一次性载荷并入 C_i,I（只补一次，不随外层 tiles_i_I 反复补）。
+            - 其它层级沿用现有 Inner 公式（你的代码原逻辑），不用 halo。
+            """
+            dev = self.config.DEVICE
+            memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
+            level_name = memory_levels[i]
+
+            # 维度
+            N = int(layer_dims['N']); C = int(layer_dims['C'])
+            P = int(layer_dims['P']); Q = int(layer_dims['Q'])
+            R = int(layer_dims['R']); S = int(layer_dims['S'])
+
+            # 小工具：取某层某维的 temporal tiles（用于判断 L2 是否多 tile）
+            import math
+            def _num_tiles_at(mapping_table: dict, level: str, dim: str) -> int:
+                t = mapping_table.get(dim, {}).get(level, {}).get('temporal', 1.0)
+                try:
+                    ft = float(t)
+                    return int(ft) if ft.is_integer() else int(math.ceil(ft))
+                except Exception:
+                    return 1
+
+            # --- 情况 A：在 L2 计算 C_i,I（把 halo 一次性并入） ---
+            if level_name == 'L2_Scratchpad':
+                # 基本覆盖（stride=1，无 dilation；若有需要你再扩展）
+                H_in = P + (R - 1)
+                W_in = Q + (S - 1)
+
+                # 若 L2 在 P/Q 上有 >1 个时间 tile，则两端 halo 只在整次执行中各补一次
+                extra_P = (R - 1) if _num_tiles_at(mapping_table, 'L2_Scratchpad', 'P') > 1 else 0
+                extra_Q = (S - 1) if _num_tiles_at(mapping_table, 'L2_Scratchpad', 'Q') > 1 else 0
+
+                H_load = H_in + extra_P
+                W_load = W_in + extra_Q
+
+                size = float(N * C * H_load * W_load)
+                return torch.tensor(size, device=dev)
+
+            # --- 情况 B：其它层级，沿用你原先的 Inner 公式（不含 halo） ---
+            def calculate_inner(dim_name: str) -> torch.Tensor:
+                """Inner(i, d)：从最内层到 i 层的（temporal*spatial）乘积"""
+                inner_size = torch.tensor(1.0, device=dev)
                 for j in range(i + 1):
-                    level_name = memory_levels[j]
-                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                        inner_size *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
+                    lvl = memory_levels[j]
+                    if dim_name in layer_dims and dim_name in mapping_table and lvl in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][lvl].get('temporal', 1)
+                        spatial_factor  = mapping_table[dim_name][lvl].get('spatial', 1)
+                        inner_size *= torch.tensor(temporal_factor * spatial_factor, device=dev)
                 return inner_size
-            
-            # 假设 P_stride 和 Q_stride 为 1
+
             P_stride = 1
             Q_stride = 1
-            
-            # 计算各个维度的 Inner 值
+
             inner_P = calculate_inner('P')
             inner_R = calculate_inner('R')
             inner_Q = calculate_inner('Q')
             inner_S = calculate_inner('S')
-            
-            # 计算 C 和 N 维度在所有内层层级的因子连乘积
-            cn_factors = torch.tensor(1.0, device=self.config.DEVICE)
+
+            # C/N 在内层的乘积
+            cn_factors = torch.tensor(1.0, device=dev)
             for j in range(i + 1):
-                level_name = memory_levels[j]
+                lvl = memory_levels[j]
                 for dim_name in ['C', 'N']:
-                    if dim_name in layer_dims and dim_name in mapping_table and level_name in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][level_name].get('temporal', 1)
-                        spatial_factor = mapping_table[dim_name][level_name].get('spatial', 1)
-                        cn_factors *= torch.tensor(temporal_factor * spatial_factor, device=self.config.DEVICE)
-            
-            # 根据公式组合这些部分
+                    if dim_name in layer_dims and dim_name in mapping_table and lvl in mapping_table[dim_name]:
+                        temporal_factor = mapping_table[dim_name][lvl].get('temporal', 1)
+                        spatial_factor  = mapping_table[dim_name][lvl].get('spatial', 1)
+                        cn_factors *= torch.tensor(temporal_factor * spatial_factor, device=dev)
+
             size = cn_factors * (P_stride * (inner_P - 1) + inner_R) * (Q_stride * (inner_Q - 1) + inner_S)
-            
             return size
-            
+
+
         else:
             # 对于未知张量类型，返回默认值
             return torch.tensor(1.0, device=self.config.DEVICE)
@@ -1162,9 +1252,9 @@ class HighFidelityPerformanceModel(nn.Module):
                     spatial_factor = level_factors['spatial']
 
                     # 打印原始值和类型
-                    print(f"[DEBUG] dim={dim_name}, level={level_name}, "
-                        f"raw spatial_factor={spatial_factor} "
-                        f"(type={type(spatial_factor)})")
+                    # print(f"[DEBUG] dim={dim_name}, level={level_name}, "
+                    #     f"raw spatial_factor={spatial_factor} "
+                    #     f"(type={type(spatial_factor)})")
 
                     # 类型转换
                     if not isinstance(spatial_factor, torch.Tensor):
@@ -1172,15 +1262,15 @@ class HighFidelityPerformanceModel(nn.Module):
                             float(spatial_factor),
                             device=self.config.DEVICE
                         )
-                        print(f"[DEBUG] converted spatial_factor={spatial_factor}")
+                    #    print(f"[DEBUG] converted spatial_factor={spatial_factor}")
 
                     # 累乘之前
                     prev_val = utilized_pes.clone()
                     utilized_pes *= spatial_factor
 
                     # 打印累乘结果
-                    print(f"[DEBUG] utilized_pes update: {prev_val.item()} * "
-                        f"{spatial_factor.item()} = {utilized_pes.item()}")
+                    # print(f"[DEBUG] utilized_pes update: {prev_val.item()} * "
+                    #     f"{spatial_factor.item()} = {utilized_pes.item()}")
 
 
         effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
@@ -1190,6 +1280,8 @@ class HighFidelityPerformanceModel(nn.Module):
         print(f"[DEBUG] Utilized PEs: {utilized_pes}")
 
         compute_cycles = total_macs / effective_pes
+
+        print(f"[DEBUG] compute_cycles: {compute_cycles}")
 
         detailed_fill_traffic_info = self.calculate_inter_level_fill_traffic(
             layer['dims'], all_factors, num_pes, hw_params, debug_data)
@@ -1223,6 +1315,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 continue
             bytes_total = info['total_bytes']
             per_level_writes[dst] = per_level_writes[dst] + bytes_total
+            print(f"[DEBUG] Fill traffic: {iface} -> {bytes_total.item():.2f} bytes")
 
         # 2) read → 从源层被读出（Reads(src)）
         #   （确保你已经有 detailed_read_traffic_info；若没有，请先调用你写的 read 统计函数）
@@ -1232,6 +1325,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 continue
             bytes_total = info['total_bytes']
             per_level_reads[src] = per_level_reads[src] + bytes_total
+            print(f"[DEBUG] Read traffic: {iface} -> {bytes_total.item():.2f} bytes")
 
         # 3) writeback/update → 写入到目的层（Updates(dst)）
         for iface, info in detailed_writeback_traffic_info.items():
@@ -1240,6 +1334,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 continue
             bytes_total = info['total_bytes']
             per_level_updates[dst] = per_level_updates[dst] + bytes_total
+            print(f"[DEBUG] Writeback traffic: {iface} -> {bytes_total.item():.2f} bytes")
 
         # ===== 计算每层的内存侧延迟：Accesses(i)/BW(i) =====
         eps = torch.tensor(1e-9, device=device)
@@ -1251,7 +1346,17 @@ class HighFidelityPerformanceModel(nn.Module):
             bw_bytes_per_cycle = calculate_bandwidth_bytes_per_cycle(lvl, num_pes, self.config)
             mem_cycles = accesses_bytes / (bw_bytes_per_cycle + eps)
             memory_cycles_list.append(mem_cycles)
-            # 可选：调试
+            
+            # Print debug info for each memory level
+            print(f"[DEBUG] Memory Level: {lvl}")
+            print(f"  - Reads:    {float(per_level_reads[lvl].detach().cpu().item()):.2f} bytes")
+            print(f"  - Writes:   {float(per_level_writes[lvl].detach().cpu().item()):.2f} bytes") 
+            print(f"  - Updates:  {float(per_level_updates[lvl].detach().cpu().item()):.2f} bytes")
+            print(f"  - Total:    {float(accesses_bytes.detach().cpu().item()):.2f} bytes")
+            print(f"  - BW:       {float(bw_bytes_per_cycle.detach().cpu().item() if isinstance(bw_bytes_per_cycle, torch.Tensor) else bw_bytes_per_cycle):.2f} bytes/cycle")
+            print(f"  - Cycles:   {float(mem_cycles.detach().cpu().item()):.2f}")
+            
+            # Store debug info
             per_level_cycles_debug[lvl] = {
                 'Reads_bytes':   float(per_level_reads[lvl].detach().cpu().item()),
                 'Writes_bytes':  float(per_level_writes[lvl].detach().cpu().item()),
@@ -1268,7 +1373,15 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # ===== Roofline 组合：与 compute 比较 =====
         stall_cycles = torch.relu(bottleneck_memory_cycles - compute_cycles)
+
+        print(f"[DEBUG] compute_cycles: {compute_cycles}")
+        print(f"[DEBUG] bottleneck_memory_cycles: {bottleneck_memory_cycles}")
+        
+
         total_cycles = compute_cycles + stall_cycles
+
+        print(f"[DEBUG] total_cycles: {total_cycles}")
+
         latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
 
 
@@ -1276,6 +1389,9 @@ class HighFidelityPerformanceModel(nn.Module):
         # 能耗计算
         energy = torch.tensor(0.0, device=self.config.DEVICE)
         energy_compute = total_macs * self.config.PE_MAC_EPA_PJ
+
+        print(f"[DEBUG] energy_compute: {energy_compute}")
+
         energy += energy_compute
 
         energy_fill = torch.tensor(0.0, device=self.config.DEVICE)
@@ -1325,22 +1441,36 @@ class HighFidelityPerformanceModel(nn.Module):
             source_level_name = interface.split('_to_')[0]   # read 从 source 发出
             read_bytes = interface_info['total_bytes']
             read_words = read_bytes / self.config.BYTES_PER_ELEMENT
+
             if source_level_name == 'L0_Registers':
                 epa = self.config.L0_REG_BASE_EPA_PJ
             elif source_level_name == 'L1_Accumulator':
                 size_kb = hw_params.get_buffer_size_kb(source_level_name)
                 num_pes_sqrt = torch.sqrt(num_pes)
                 epa = (self.config.L1_ACCUM_BASE_EPA_PJ +
-                       self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt))
+                    self.config.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB * (size_kb / num_pes_sqrt))
             elif source_level_name == 'L2_Scratchpad':
                 size_kb = hw_params.get_buffer_size_kb(source_level_name)
                 epa = (self.config.L2_SPM_BASE_EPA_PJ +
-                       self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb)
+                    self.config.L2_SPM_CAPACITY_COEFF_PJ_PER_KB * size_kb)
             elif source_level_name == 'L3_DRAM':
                 epa = self.config.L3_DRAM_EPA_PJ
             else:
                 epa = torch.tensor(0.0, device=self.config.DEVICE)
-            energy_read += read_words * epa
+
+            # 本项能量
+            energy_item = read_words * epa
+            energy_read += energy_item
+
+            # 打印调试信息
+            print(f"[DEBUG][ReadEnergy] interface={interface}, "
+                f"src={source_level_name}, "
+                f"bytes={read_bytes}, words={read_words}, "
+                f"epa={float(epa):.4f} pJ, "
+                f"energy={float(energy_item):.2f} pJ")
+
+        print(f"[DEBUG][ReadEnergy] total={float(energy_read):.2f} pJ")
+
 
         # ===== Total Energy =====
         energy = energy_compute + energy_fill + energy_writeback + energy_read
@@ -1481,11 +1611,11 @@ class HighFidelityPerformanceModel(nn.Module):
             else:
                 for layer_name in group:
                     
-                    print(f"[DEBUG] Evaluating layer {layer_name} with mapping:")
+                    # print(f"[DEBUG] Evaluating layer {layer_name} with mapping:")
                     for name, param in mapping.named_parameters():
                         print(f"  {name}: {param.data}")
                         
-                    print(f"[DEBUG] all_factors for {layer_name}:", all_factors)
+                    # print(f"[DEBUG] all_factors for {layer_name}:", all_factors)
                     lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
                     fused_latency += lat
                     fused_energy += en

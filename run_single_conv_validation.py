@@ -72,14 +72,14 @@ CONV_LAYER_CONFIG = {
 
 # 2. Hardware Configuration Space
 HW_CONFIG_SPACE = {
-    "num_pes": [64],
-    "l2_scratchpad_size_kb": [256]
+    "num_pes": [16, 32, 64, 128, 256],
+    "l2_scratchpad_size_kb": [128, 256, 512]
 }
 
 # 3. Mapping Space (simplified, needs to be dimension-dependent)
 MAPPING_SPACE = {
-    "K": [16],
-    "C": [16]
+    "K": [1, 4, 8, 16, 32],
+    "C": [1, 4, 8, 16, 32]
 }
 
 def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str) -> dict:
@@ -155,10 +155,10 @@ def get_fixed_validation_config():
         },
         "mapping_config": {
             "conv1": {
-                "DRAM": {"temporal": {"N":1,"C":1,"K":1,"P":1,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
+                "DRAM": {"temporal": {"N":1,"C":1,"K":1,"P":8,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
                 "L2_Scratchpad": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
                 "L1_Accumulator": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
-                "L0_Registers": {"temporal": {"N":1,"C":32,"K":2,"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":2,"K":8}, "permutation": "K N C P Q S R"}
+                "L0_Registers": {"temporal": {"N":1,"C":8,"K":2,"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":8,"K":8}, "permutation": "K N C P Q S R"}
             }
         },
         "layer_info": {
@@ -259,7 +259,7 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
 
     hw_params = HardwareParameters(
         initial_num_pes=hw_config['num_pes'],
-        initial_l0_kb=hw_config.get('l0_registers_size_kb', 2.0),
+        initial_l0_kb=hw_config.get('l0_registers_size_kb', 128.0),
         initial_l1_kb=hw_config.get('l1_accumulator_size_kb', 4.0),
         initial_l2_kb=hw_config['l2_scratchpad_size_kb']
     )
@@ -289,22 +289,22 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
     mapping.to(dosa_config.DEVICE)
     
     # Print mapping information
-    print("\n[INFO] Mapping Configuration:")
-    for level_name, level_factors in mapping.factors.items():
-        print(f"\nLevel: {level_name}")
-        print("Temporal factors:", {dim: factors['temporal'] for dim, factors in level_factors.items()})
-        if any('spatial' in factors for factors in level_factors.values()):
-            print("Spatial factors:", {dim: factors['spatial'] for dim, factors in level_factors.items() if 'spatial' in factors})
+    # print("\n[INFO] Mapping Configuration:")
+    # for level_name, level_factors in mapping.factors.items():
+    #     print(f"\nLevel: {level_name}")
+    #     print("Temporal factors:", {dim: factors['temporal'] for dim, factors in level_factors.items()})
+    #     if any('spatial' in factors for factors in level_factors.values()):
+    #         print("Spatial factors:", {dim: factors['spatial'] for dim, factors in level_factors.items() if 'spatial' in factors})
     
     # 5. 创建计算图
     graph = ComputationGraph()
     graph.add_layer(layer_name, problem_dims, layer_info['layer_type'])
     
     # Print graph information
-    print("\n[INFO] Computation Graph:")
-    print(f"Layer Name: {layer_name}")
-    print(f"Layer Type: {layer_info['layer_type']}")
-    print(f"Problem Dimensions: {problem_dims}")
+    # print("\n[INFO] Computation Graph:")
+    # print(f"Layer Name: {layer_name}")
+    # print(f"Layer Type: {layer_info['layer_type']}")
+    # print(f"Problem Dimensions: {problem_dims}")
     
     
 
@@ -365,7 +365,7 @@ def run_timeloop_simulation(config: dict, work_dir: Path) -> dict:
             # 获取原始值并明确单位
             simulated_cycles = float(stats.cycles)
             simulated_energy_uj = float(stats.energy)
-            simulated_energy_pj = simulated_energy_uj * 1e6
+            simulated_energy_pj = simulated_energy_uj * 1e12
             
             # 获取DosaConfig实例以访问时钟频率
             dosa_config = DosaConfig()
@@ -610,7 +610,7 @@ def generate_timeloop_files(config: dict, work_dir: Path):
     spatial_perm = generate_spatial_permutation()
 
     # 调试打印（可保留可去掉）
-    print("[DEBUG] Final dimension factors:")
+    # print("[DEBUG] Final dimension factors:")
     for d in ['N','C','K','P','Q','R','S']:
         s  = dim_factors[d].get('spatial', 1)
         l0 = dim_factors[d].get('L0_Registers', 1)
@@ -619,10 +619,10 @@ def generate_timeloop_files(config: dict, work_dir: Path):
         dr = dim_factors[d].get('DRAM', 1)
         product = s*l0*l1*l2*dr
         expected = int(dims[d])
-        print(f"  {d}: spatial={s}, L0={l0}, L1={l1}, L2={l2}, DRAM={dr}, product={product}, expected={expected}")
+        # print(f"  {d}: spatial={s}, L0={l0}, L1={l1}, L2={l2}, DRAM={dr}, product={product}, expected={expected}")
         assert product == expected, f"Dimension {d}: product {product} != expected {expected}"
 
-    print(f"[DEBUG] Generated spatial permutation: {spatial_perm}")
+    # print(f"[DEBUG] Generated spatial permutation: {spatial_perm}")
 
     # 目标约束
     targets = []

@@ -23,7 +23,7 @@ class Config:
         
         # ========== 基础硬件参数 ==========
         self.DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.BYTES_PER_ELEMENT = 4  # float32
+        self.BYTES_PER_ELEMENT = 2  # float16
         self.CLOCK_FREQUENCY_MHZ = 1000  # 1GHz
         
         # ========== 多级存储层次定义 ==========
@@ -90,8 +90,9 @@ class Config:
         self.L1_ACCUM_CAPACITY_COEFF_PJ_PER_KB = 0.1005
         
         # L2缓存能耗模型: EPA_L2 = Base + Coeff * Capacity_KB
-        self.L2_SPM_BASE_EPA_PJ = 31.0663
-        self.L2_SPM_CAPACITY_COEFF_PJ_PER_KB = 0.3
+        self.L2_SPM_BASE_EPA_PJ = 20.0
+        self.L2_SPM_CAPACITY_COEFF_PJ_PER_KB = 0.015
+
         
         # L3 DRAM访问能耗
         self.L3_DRAM_EPA_PJ = 128.0
