@@ -70,16 +70,29 @@ CONV_LAYER_CONFIG = {
     "dims": {"N": 1, "C": 64, "K": 64, "P": 56, "Q": 56, "R": 3, "S": 3}
 }
 
-# 2. Hardware Configuration Space
-HW_CONFIG_SPACE = {
-    "num_pes": [16, 32, 64, 128, 256],
-    "l2_scratchpad_size_kb": [128, 256, 512]
-}
+def make_hw_config(num_pes: int = 64, l0_kb: float = 128.0, l1_kb: float = 128.0, l2_kb: float = 256.0) -> dict:
+    """创建标准化的硬件配置字典，避免硬编码和重复定义。
+    
+    Args:
+        num_pes: PE数量
+        l0_kb: L0寄存器大小（KB）
+        l1_kb: L1累加器大小（KB）  
+        l2_kb: L2暂存器大小（KB）
+        
+    Returns:
+        dict: 标准化的硬件配置字典
+    """
+    return {
+        "num_pes": num_pes,
+        "l0_registers_size_kb": l0_kb,
+        "l1_accumulator_size_kb": l1_kb,
+        "l2_scratchpad_size_kb": l2_kb
+    }
 
 # 3. Mapping Space (simplified, needs to be dimension-dependent)
 MAPPING_SPACE = {
-    "K": [1, 4, 8, 16, 32],
-    "C": [1, 4, 8, 16, 32]
+    "K": [1, 2, 4, 8, 16, 32],
+    "C": [1, 2, 4, 8, 16, 32]
 }
 
 def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str) -> dict:
@@ -110,7 +123,7 @@ def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str
         if strategy == "performance":
             # 性能优先：从L0开始，从剩余约数中随机选一个，然后迭代
             temp_size = remaining_size
-            for level in ['L0', 'L1', 'L2']:
+            for level in ['L1', 'L2']:
                 if temp_size == 1: break
                 level_divs = [d for d in get_divisors(temp_size).tolist() if d > 1]
                 if not level_divs: continue
@@ -126,7 +139,7 @@ def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str
         elif strategy == "random":
             # 均衡随机：将剩余尺寸随机分解给 L0, L1, L2, DRAM
             temp_size = remaining_size
-            levels = ['L0', 'L1', 'L2', 'DRAM']
+            levels = ['L1', 'L2', 'DRAM']
             random.shuffle(levels)
             for level in levels:
                 if temp_size == 1: break
@@ -149,16 +162,27 @@ def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str
 def get_fixed_validation_config():
     """返回 validation_point_id=1 的固定配置字典"""
     config_vp1 = {
-        "hardware_config": {
-            "num_pes": 64,
-            "l2_scratchpad_size_kb": 256
-        },
+        "hardware_config": make_hw_config(num_pes=64, l0_kb=128.0, l1_kb=4.0, l2_kb=256.0),
         "mapping_config": {
             "conv1": {
-                "DRAM": {"temporal": {"N":1,"C":1,"K":1,"P":8,"Q":1,"R":1,"S":1}, "permutation": "K N C P Q S R"},
-                "L2_Scratchpad": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":7,"R":1,"S":1}, "permutation": "K N C P Q S R"},
-                "L1_Accumulator": {"temporal": {"N":1,"C":1,"K":2,"P":1,"Q":2,"R":1,"S":1}, "permutation": "K N C P Q S R"},
-                "L0_Registers": {"temporal": {"N":1,"C":8,"K":2,"P":7,"Q":2,"R":3,"S":3}, "spatial": {"C":8,"K":8}, "permutation": "K N C P Q S R"}
+                # 外层：K/C 在最外，R/S 其后；N/P/Q 放到最内侧，保障在 L0 内做时间复用
+                "DRAM": {
+                    "temporal": {"N":1,"C":4,"K":1,"P":8,"Q":1,"R":1,"S":1},
+                    "permutation": "P Q K C R S N"
+                },
+                "L2_Scratchpad": {
+                    "temporal": {"N":1,"C":4,"K":4,"P":7,"Q":7,"R":1,"S":3},
+                    "permutation": "P Q K C R S N"
+                },
+                "L1_Accumulator": {
+                    "temporal": {"N":1,"C":2,"K":2,"P":1,"Q":4,"R":3,"S":1},
+                    "permutation": "P Q K C R S N"
+                },
+                "L0_Registers": {
+                    "temporal": {"N":1,"C":1,"K":1,"P":1,"Q":1,"R":1,"S":1},
+                    "spatial":  {"C":2,"K":8},  
+                    "permutation": "P Q K C R S N"
+                }
             }
         },
         "layer_info": {
@@ -180,7 +204,7 @@ def generate_configurations(num_configs: int):
     """
     # Define some typical permutation patterns
     permutation_patterns = [
-        'K N C P Q S R'
+        'K', 'C', 'R', 'S', 'N', 'P', 'Q',
     ]
     
     # Define available strategies
@@ -191,10 +215,8 @@ def generate_configurations(num_configs: int):
         layer_name = CONV_LAYER_CONFIG["layer_name"]
         dims = CONV_LAYER_CONFIG["dims"]
         
-        # Randomly sample hardware configuration
-        hardware_config = {}
-        for hw_key, hw_value_list in HW_CONFIG_SPACE.items():
-            hardware_config[hw_key] = random.choice(hw_value_list)
+        # Generate hardware configuration using make_hw_config with default parameters
+        hardware_config = make_hw_config()
         
         # Calculate PE mesh size for spatial constraints
         pe_mesh_size = int(hardware_config['num_pes'] ** 0.5)
@@ -289,12 +311,12 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
     mapping.to(dosa_config.DEVICE)
     
     # Print mapping information
-    # print("\n[INFO] Mapping Configuration:")
-    # for level_name, level_factors in mapping.factors.items():
-    #     print(f"\nLevel: {level_name}")
-    #     print("Temporal factors:", {dim: factors['temporal'] for dim, factors in level_factors.items()})
-    #     if any('spatial' in factors for factors in level_factors.values()):
-    #         print("Spatial factors:", {dim: factors['spatial'] for dim, factors in level_factors.items() if 'spatial' in factors})
+    print("\n[INFO] Mapping Configuration:")
+    for level_name, level_factors in mapping.factors.items():
+        print(f"\nLevel: {level_name}")
+        print("Temporal factors:", {dim: factors['temporal'] for dim, factors in level_factors.items()})
+        if any('spatial' in factors for factors in level_factors.values()):
+            print("Spatial factors:", {dim: factors['spatial'] for dim, factors in level_factors.items() if 'spatial' in factors})
     
     # 5. 创建计算图
     graph = ComputationGraph()
@@ -451,7 +473,7 @@ def generate_timeloop_files(config: dict, work_dir: Path):
                                             'name': 'L1_Accumulator',
                                             'class': 'SRAM',
                                             'attributes': {
-                                                'depth': get_depth(hw_config.get('l1_buffer_size_kb', 4.0)),
+                                                'depth': get_depth(hw_config.get('l1_accumulator_size_kb', 4.0)),
                                                 'width': datawidth,
                                                 'datawidth': datawidth
                                             }
@@ -466,7 +488,7 @@ def generate_timeloop_files(config: dict, work_dir: Path):
                                                     'name': 'L0_Registers',
                                                     'class': 'regfile',
                                                     'attributes': {
-                                                        'depth': get_depth(hw_config.get('l0_registers_size_kb', 2.0)),
+                                                        'depth': get_depth(hw_config.get('l0_registers_size_kb', 128.0)),
                                                         'width': datawidth,
                                                         'datawidth': datawidth
                                                     }

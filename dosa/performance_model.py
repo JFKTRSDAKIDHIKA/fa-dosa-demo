@@ -135,34 +135,67 @@ def calculate_bandwidth_bytes_per_cycle(level_name: str, num_pes: torch.Tensor, 
     return bandwidth_bytes_per_cycle
 
 def format_mapping_as_all_factors(mapping):
-    """
-    将 mapping.factors 转换为 all_factors 的嵌套结构，
-    但保持原始数值（不做乘积/累积转换）。
-    """
     formatted = {}
-
-    # 遍历每一层级
     for level_name, dims in mapping.factors.items():
         for dim_name, factor_dict in dims.items():
             if dim_name not in formatted:
                 formatted[dim_name] = {}
-
-            # 拿到 spatial/temporal，没有的话默认 1.0
             spatial_val = factor_dict.get("spatial", 1.0)
             temporal_val = factor_dict.get("temporal", 1.0)
-
-            # 转成 torch.Tensor，保持和 get_all_factors 输出一致的风格
             if not isinstance(spatial_val, torch.Tensor):
                 spatial_val = torch.tensor(float(spatial_val), device="cuda:0")
             if not isinstance(temporal_val, torch.Tensor):
                 temporal_val = torch.tensor(float(temporal_val), device="cuda:0")
-
             formatted[dim_name][level_name] = {
                 "spatial": spatial_val,
                 "temporal": temporal_val,
             }
 
+    # --- Complete L3_DRAM ---
+    for d in ['N','K','C','P','Q','R','S']:
+        if d in mapping.dims:  # Only process existing dimensions
+            # Ensure dimension exists in formatted
+            if d not in formatted:
+                formatted[d] = {}
+            
+            # Check if L3_DRAM mapping already exists
+            if 'L3_DRAM' not in formatted[d]:
+                # Calculate product of temporal factors for all on-chip levels
+                on_chip_temporal_product = torch.tensor(1.0, device="cuda:0")
+                print(f"\nProcessing dimension {d}:")
+                print(f"Initial on-chip temporal product = {on_chip_temporal_product}")
+                
+                for level_name in formatted[d]:
+                    temporal_factor = formatted[d][level_name].get('temporal', torch.tensor(1.0, device="cuda:0"))
+                    on_chip_temporal_product *= temporal_factor
+                    print(f"  {level_name} temporal factor = {temporal_factor}")
+                    print(f"  Updated product = {on_chip_temporal_product}")
+
+                on_chip_product = torch.tensor(1.0, device="cuda:0")
+                for level_name in formatted[d]:
+                    spatial_factor = formatted[d][level_name].get('spatial', torch.tensor(1.0, device="cuda:0"))
+                    temporal_factor = formatted[d][level_name].get('temporal', torch.tensor(1.0, device="cuda:0"))
+                    on_chip_product *= spatial_factor * temporal_factor
+
+                                
+                # DRAM temporal factor is the remaining portion
+                problem_dim_size = torch.tensor(float(mapping.dims[d]), device="cuda:0")
+                print(f"Problem dimension size = {problem_dim_size}")
+                
+                dram_temporal = problem_dim_size / torch.clamp(on_chip_product, min=1.0)
+                print(f"Calculated DRAM temporal factor = {dram_temporal}")
+                
+                # Clamp to ensure minimum of 1
+                clamped_dram_temporal = torch.clamp(dram_temporal, min=1.0)
+                print(f"Final clamped DRAM temporal factor = {clamped_dram_temporal}")
+                
+                formatted[d]['L3_DRAM'] = {
+                    "spatial": torch.tensor(1.0, device="cuda:0"),
+                    "temporal": clamped_dram_temporal
+                }
+
     return formatted
+
 
 class HighFidelityPerformanceModel(nn.Module):
     """
@@ -188,6 +221,7 @@ class HighFidelityPerformanceModel(nn.Module):
         self._group_w_first_load_done = False
 
         # === 2) 在类内新增一个方法（放在类中任意位置即可） ===
+    
     def set_group_weight_residency(self, enabled: bool, residency_level: str = 'L2_Scratchpad'):
         """
         启用/关闭"融合组全权重常驻"模式。
@@ -208,7 +242,6 @@ class HighFidelityPerformanceModel(nn.Module):
             real_val = torch.exp(p)  # log-param → real factor
             invalid_mapping_loss += torch.square(torch.clamp(1 - real_val, min=0)).sum()
         return invalid_mapping_loss
-
 
     def calculate_inter_level_fill_traffic(self, layer_dims: dict, mapping_table: dict, num_pes: torch.Tensor, hw_params: HardwareParameters, debug_data: dict = None) -> dict:
         """
@@ -563,21 +596,41 @@ class HighFidelityPerformanceModel(nn.Module):
         # 这里最好别写死层级顺序，直接复用你已有的 memory_levels
         levels_order = ['L0_Registers','L1_Accumulator','L2_Scratchpad','L3_DRAM']
 
+        # Print calculation header
+        print("\n=== Tiles Above Calculation ===")
+        print(f"Starting level index i = {i} ({levels_order[i]})")
+        print("Initial tiles = 1.0")
+
         tiles = torch.tensor(1.0, device=dev)
-        for k in range(i + 1, len(levels_order)):       # 只看“外层”
+        
+        # Track all multipliers for final summary
+        multipliers = []
+        
+        for k in range(i + 1, len(levels_order)):       # 只看"外层"
             lvl = levels_order[k]
+            print(f"\nProcessing level {lvl}:")
+            
             # 1) 相关维（K,C,R,S）
+            level_multiplier = torch.tensor(1.0, device=dev)
             for d in D_W:
                 tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
                 if not isinstance(tf, torch.Tensor):
                     tf = torch.tensor(float(tf), device=dev)
-                tiles = tiles * torch.clamp(tf, min=1.0)
-            # 2) 无关维（N,P,Q）—— 这一步是关键新增
-            # for d in D_indep:
-            #     tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
-            #     if not isinstance(tf, torch.Tensor):
-            #         tf = torch.tensor(float(tf), device=dev)
-            #     tiles = tiles * torch.clamp(tf, min=1.0)
+                tf_clamped = torch.clamp(tf, min=1.0)
+                level_multiplier *= tf_clamped
+                print(f"  {d}: temporal factor = {tf} (clamped to {tf_clamped})")
+            
+            tiles *= level_multiplier
+            multipliers.append((lvl, level_multiplier))
+            print(f"  Level multiplier = {level_multiplier.item()}")
+            print(f"  Running product = {tiles.item()}")
+
+        # Print final summary
+        print("\n=== Final Summary ===")
+        print("Multipliers by level:")
+        for lvl, mult in multipliers:
+            print(f"  {lvl}: {mult.item()}")
+        print(f"Final tiles value = {tiles.item()}")
 
         return tiles
 
@@ -767,15 +820,15 @@ class HighFidelityPerformanceModel(nn.Module):
         tiles_L0_W = self._tiles_above_for_W(i_L0, layer_dims, mapping_table, persist_W=False)
         base_W_L2_to_L0 = C_L0_W * tiles_L0_W
         bcast_W_L2 = _bcast_factor('W', mapping_table, dev)
-        fanout_L0_W = torch.tensor(1.0, device=dev)
+        # fanout_L0_W = torch.tensor(1.0, device=dev)
 
-        for d in ('K', 'C', 'R', 'S'):
-            s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
-            if not isinstance(s, torch.Tensor):
-                s = torch.tensor(float(s), device=dev)
-            fanout_L0_W *= torch.clamp(s, min=1.0)
+        # for d in ('K', 'C', 'R', 'S'):
+        #     s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
+        #     if not isinstance(s, torch.Tensor):
+        #         s = torch.tensor(float(s), device=dev)
+        #     fanout_L0_W *= torch.clamp(s, min=1.0)
 
-        read_W_L2_to_L0 = (base_W_L2_to_L0 * fanout_L0_W) / torch.clamp(bcast_W_L2, min=1.0)
+        read_W_L2_to_L0 = (base_W_L2_to_L0 ) / torch.clamp(bcast_W_L2, min=1.0)
 
         # Print calculation process
         print("\n=== Weight L2->L0 Traffic Calculation ===")
@@ -1252,9 +1305,9 @@ class HighFidelityPerformanceModel(nn.Module):
                     spatial_factor = level_factors['spatial']
 
                     # 打印原始值和类型
-                    # print(f"[DEBUG] dim={dim_name}, level={level_name}, "
-                    #     f"raw spatial_factor={spatial_factor} "
-                    #     f"(type={type(spatial_factor)})")
+                    print(f"[DEBUG] dim={dim_name}, level={level_name}, "
+                        f"raw spatial_factor={spatial_factor} "
+                        f"(type={type(spatial_factor)})")
 
                     # 类型转换
                     if not isinstance(spatial_factor, torch.Tensor):
@@ -1262,7 +1315,7 @@ class HighFidelityPerformanceModel(nn.Module):
                             float(spatial_factor),
                             device=self.config.DEVICE
                         )
-                    #    print(f"[DEBUG] converted spatial_factor={spatial_factor}")
+                    print(f"[DEBUG] converted spatial_factor={spatial_factor}")
 
                     # 累乘之前
                     prev_val = utilized_pes.clone()
@@ -1270,7 +1323,7 @@ class HighFidelityPerformanceModel(nn.Module):
 
                     # 打印累乘结果
                     # print(f"[DEBUG] utilized_pes update: {prev_val.item()} * "
-                    #     f"{spatial_factor.item()} = {utilized_pes.item()}")
+                    #    f"{spatial_factor.item()} = {utilized_pes.item()}")
 
 
         effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
