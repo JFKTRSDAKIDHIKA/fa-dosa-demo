@@ -618,7 +618,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 multipliers.append((lvl, level_multiplier))
         else:
             # For other levels, only consider dependent dims
-            for k in range(i, len(levels_order)):
+            for k in range(i + 1, len(levels_order)):
                 lvl = levels_order[k]
                 level_multiplier = torch.tensor(1.0, device=dev)
 
@@ -816,11 +816,11 @@ class HighFidelityPerformanceModel(nn.Module):
         # W: L2 -> L0 (with broadcast over C,K dimensions)
         i_L0 = memory_levels.index('L0_Registers')
         print(f"[DEBUG][L2 Weight Reads] L0 index = {i_L0}")
-        C_L0_W = self._calculate_data_block_size(i_L0, 'W', layer_dims, mapping_table)
-        tiles_L0_W = self._tiles_above_for_W(i_L0, layer_dims, mapping_table, persist_W=False)
+        C_L0_W = self._calculate_data_block_size(i_L0, 'W', layer_dims, mapping_table) # Utilzed PE
+        tiles_L0_W = self._tiles_above_for_W(i_L0, layer_dims, mapping_table, persist_W=False) # 需要算上和W的无关维度
         base_W_L2_to_L0 = C_L0_W * tiles_L0_W
         bcast_W_L2 = _bcast_factor('W', mapping_table, dev)
-        fanout_L0_W = torch.tensor(1.0, device=dev)
+        fanout_L0_W = torch.tensor(1.0, device=dev) # 相当于PE数目
 
         for d in ('K', 'C', 'R', 'S'):
             s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
@@ -931,7 +931,7 @@ class HighFidelityPerformanceModel(nn.Module):
             for dim_name in relevant_dims:
                 if dim_name in layer_dims:
                     total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
-                    coverage = self._coverage_upto(i-1, dim_name, mapping_table, layer_dims)
+                    coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
                     
                     # print(f"  {dim_name}:")
                     # print(f"    Total size: {total_dim_size.item()}")
