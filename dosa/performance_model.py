@@ -196,7 +196,6 @@ def format_mapping_as_all_factors(mapping):
 
     return formatted
 
-
 class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
@@ -532,8 +531,6 @@ class HighFidelityPerformanceModel(nn.Module):
         
         return torch.max(cov, torch.tensor(1.0, device=self.config.DEVICE))  # 防0
 
-
-    
     def _can_persist_W_at_level(self, i: int, layer_dims: dict, mapping_table: dict, hw_params: HardwareParameters) -> bool:
         """
         判断权重W是否可以在层级i持久化
@@ -585,52 +582,54 @@ class HighFidelityPerformanceModel(nn.Module):
     def _tiles_above_for_W(self, i: int, layer_dims: dict, mapping_table: dict, persist_W: bool) -> torch.Tensor:
         """
         Tiles_above(i, W) —— L0 之外所有层级的 temporal 因子乘积：
-        - 必须包含 W 相关维 D_W = {K, C, R, S}
-        - 以及 W 无关维 {N, P, Q}   # 这正是你漏掉的！
+        - 包含 W 相关维 D_W = {K, C, R, S}
+        - 以及 W 无关维 {N, P, Q}   # Timeloop 的口径需要
         - 只乘 temporal；不乘 spatial；不做广播折扣（广播在 reads 阶段做）
         """
         dev = self.config.DEVICE
-        D_W = ('K', 'C', 'R', 'S')
-        # D_indep = ('N', 'P', 'Q')
+        D_W = ('K', 'C', 'R', 'S') # 相关维度
+        D_indep = ('N', 'P', 'Q')  # 无关维度
 
-        # 这里最好别写死层级顺序，直接复用你已有的 memory_levels
         levels_order = ['L0_Registers','L1_Accumulator','L2_Scratchpad','L3_DRAM']
 
-        # Print calculation header
-        print("\n=== Tiles Above Calculation ===")
-        print(f"Starting level index i = {i} ({levels_order[i]})")
-        print("Initial tiles = 1.0")
-
         tiles = torch.tensor(1.0, device=dev)
-        
-        # Track all multipliers for final summary
         multipliers = []
-        
-        for k in range(i + 1, len(levels_order)):       # 只看"外层"
-            lvl = levels_order[k]
-            print(f"\nProcessing level {lvl}:")
-            
-            # 1) 相关维（K,C,R,S）
-            level_multiplier = torch.tensor(1.0, device=dev)
-            for d in D_W:
-                tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
-                if not isinstance(tf, torch.Tensor):
-                    tf = torch.tensor(float(tf), device=dev)
-                tf_clamped = torch.clamp(tf, min=1.0)
-                level_multiplier *= tf_clamped
-                print(f"  {d}: temporal factor = {tf} (clamped to {tf_clamped})")
-            
-            tiles *= level_multiplier
-            multipliers.append((lvl, level_multiplier))
-            print(f"  Level multiplier = {level_multiplier.item()}")
-            print(f"  Running product = {tiles.item()}")
 
-        # Print final summary
-        print("\n=== Final Summary ===")
-        print("Multipliers by level:")
-        for lvl, mult in multipliers:
-            print(f"  {lvl}: {mult.item()}")
-        print(f"Final tiles value = {tiles.item()}")
+        # For L0 weight calculation, consider both dependent and independent dims （L2->L2流量）
+        if i == 0:
+            # For L0 weight calculation, consider both dependent and independent dims
+            for k in range(i + 1, len(levels_order)):   # Only look at outer levels
+                lvl = levels_order[k]
+                level_multiplier = torch.tensor(1.0, device=dev)
+
+                # Related dims {K,C,R,S} 
+                for d in D_W:
+                    tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
+                    tf = torch.tensor(float(tf), device=dev) if not isinstance(tf, torch.Tensor) else tf
+                    level_multiplier *= torch.clamp(tf, min=1.0)
+
+                # Independent dims {N,P,Q}
+                for d in D_indep:
+                    tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
+                    tf = torch.tensor(float(tf), device=dev) if not isinstance(tf, torch.Tensor) else tf
+                    level_multiplier *= torch.clamp(tf, min=1.0)
+
+                tiles *= level_multiplier
+                multipliers.append((lvl, level_multiplier))
+        else:
+            # For other levels, only consider dependent dims
+            for k in range(i, len(levels_order)):
+                lvl = levels_order[k]
+                level_multiplier = torch.tensor(1.0, device=dev)
+
+                # Only related dims {K,C,R,S}
+                for d in D_W:
+                    tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
+                    tf = torch.tensor(float(tf), device=dev) if not isinstance(tf, torch.Tensor) else tf
+                    level_multiplier *= torch.clamp(tf, min=1.0)
+
+                tiles *= level_multiplier
+                multipliers.append((lvl, level_multiplier))
 
         return tiles
 
@@ -647,7 +646,7 @@ class HighFidelityPerformanceModel(nn.Module):
         levels_order = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']  #['L0_Registers','L1_Accumulator','L2_Scratchpad','L3_DRAM']
 
         tiles = torch.tensor(1.0, device=dev)
-        for lvl in levels_order[i+1:]:  # 只看外层
+        for lvl in levels_order[i + 1:]:  # 只看外层
             for d in D_I:
                 tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
                 if not isinstance(tf, torch.Tensor):
@@ -667,7 +666,7 @@ class HighFidelityPerformanceModel(nn.Module):
         levels_order = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']  #['L0_Registers','L1_Accumulator','L2_Scratchpad','L3_DRAM']
 
         tiles = torch.tensor(1.0, device=dev)
-        for lvl in levels_order[i+1:]:  # 只看 i 的外层
+        for lvl in levels_order[i + 1:]:  # 只看 i 的外层
             for d in D_O:
                 tf = mapping_table.get(d, {}).get(lvl, {}).get('temporal', 1.0)
                 if not isinstance(tf, torch.Tensor):
@@ -816,19 +815,20 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # W: L2 -> L0 (with broadcast over C,K dimensions)
         i_L0 = memory_levels.index('L0_Registers')
+        print(f"[DEBUG][L2 Weight Reads] L0 index = {i_L0}")
         C_L0_W = self._calculate_data_block_size(i_L0, 'W', layer_dims, mapping_table)
         tiles_L0_W = self._tiles_above_for_W(i_L0, layer_dims, mapping_table, persist_W=False)
         base_W_L2_to_L0 = C_L0_W * tiles_L0_W
         bcast_W_L2 = _bcast_factor('W', mapping_table, dev)
-        # fanout_L0_W = torch.tensor(1.0, device=dev)
+        fanout_L0_W = torch.tensor(1.0, device=dev)
 
-        # for d in ('K', 'C', 'R', 'S'):
-        #     s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
-        #     if not isinstance(s, torch.Tensor):
-        #         s = torch.tensor(float(s), device=dev)
-        #     fanout_L0_W *= torch.clamp(s, min=1.0)
+        for d in ('K', 'C', 'R', 'S'):
+            s = mapping_table.get(d, {}).get('L0_Registers', {}).get('spatial', 1.0)
+            if not isinstance(s, torch.Tensor):
+                s = torch.tensor(float(s), device=dev)
+            fanout_L0_W *= torch.clamp(s, min=1.0)
 
-        read_W_L2_to_L0 = (base_W_L2_to_L0 ) / torch.clamp(bcast_W_L2, min=1.0)
+        read_W_L2_to_L0 = (base_W_L2_to_L0 * fanout_L0_W) / torch.clamp(bcast_W_L2, min=1.0)
 
         # Print calculation process
         print("\n=== Weight L2->L0 Traffic Calculation ===")
@@ -925,12 +925,24 @@ class HighFidelityPerformanceModel(nn.Module):
             size = torch.tensor(1.0, device=self.config.DEVICE)
             relevant_dims = D_W  # {R, S, C, K}
             
+            print(f"\n[DEBUG] Computing C_{i},W:")
+            print(f"  Relevant dimensions: {relevant_dims}")
+            
             for dim_name in relevant_dims:
                 if dim_name in layer_dims:
                     total_dim_size = torch.tensor(layer_dims[dim_name], device=self.config.DEVICE)
-                    coverage = self._coverage_upto(i, dim_name, mapping_table, layer_dims)
+                    coverage = self._coverage_upto(i-1, dim_name, mapping_table, layer_dims)
+                    
+                    # print(f"  {dim_name}:")
+                    # print(f"    Total size: {total_dim_size.item()}")
+                    # print(f"    Coverage: {coverage.item()}")
+                    # print(f"    Min value: {torch.min(total_dim_size, coverage).item()}")
+                    
+                    prev_size = size.clone()
                     size *= torch.min(total_dim_size, coverage)
+                    # print(f"    Running product: {prev_size.item()} * {torch.min(total_dim_size, coverage).item()} = {size.item()}")
             
+            # print(f"  Final C_{i},W = {size.item()}\n")
             return size
             
         elif tensor_type == 'O':
@@ -948,80 +960,49 @@ class HighFidelityPerformanceModel(nn.Module):
             
         elif tensor_type == 'I':
             """
-            C_i,I —— 对 Input 的块大小。
-            口径（与 DOSA/Timeloop 对齐）：
-            - 若 level == L2_Scratchpad：把 L2 自身 P/Q 方向多 tile 带来的“两端 halo（R-1 / S-1）”
-              作为一次性载荷并入 C_i,I（只补一次，不随外层 tiles_i_I 反复补）。
-            - 其它层级沿用现有 Inner 公式（你的代码原逻辑），不用 halo。
+            论文口径（Eq.3）：
+            C_{i,I} 只由“内层覆盖（j<i）的时空因子”构造：
+            C_{i,I} = (N_inner * C_inner) *
+                        [P_stride*(Inner(i,P)-1) + Inner(i,R)] *
+                        [Q_stride*(Inner(i,Q)-1) + Inner(i,S)]
+            注意：不包含当前层 i，也不包含更外层；不在这里加入整图像或 L2 特判。
             """
             dev = self.config.DEVICE
             memory_levels = ['L0_Registers', 'L1_Accumulator', 'L2_Scratchpad', 'L3_DRAM']
-            level_name = memory_levels[i]
 
-            # 维度
-            N = int(layer_dims['N']); C = int(layer_dims['C'])
-            P = int(layer_dims['P']); Q = int(layer_dims['Q'])
-            R = int(layer_dims['R']); S = int(layer_dims['S'])
-
-            # 小工具：取某层某维的 temporal tiles（用于判断 L2 是否多 tile）
-            import math
-            def _num_tiles_at(mapping_table: dict, level: str, dim: str) -> int:
-                t = mapping_table.get(dim, {}).get(level, {}).get('temporal', 1.0)
-                try:
-                    ft = float(t)
-                    return int(ft) if ft.is_integer() else int(math.ceil(ft))
-                except Exception:
-                    return 1
-
-            # --- 情况 A：在 L2 计算 C_i,I（把 halo 一次性并入） ---
-            if level_name == 'L2_Scratchpad':
-                # 基本覆盖（stride=1，无 dilation；若有需要你再扩展）
-                H_in = P + (R - 1)
-                W_in = Q + (S - 1)
-
-                # 若 L2 在 P/Q 上有 >1 个时间 tile，则两端 halo 只在整次执行中各补一次
-                extra_P = (R - 1) if _num_tiles_at(mapping_table, 'L2_Scratchpad', 'P') > 1 else 0
-                extra_Q = (S - 1) if _num_tiles_at(mapping_table, 'L2_Scratchpad', 'Q') > 1 else 0
-
-                H_load = H_in + extra_P
-                W_load = W_in + extra_Q
-
-                size = float(N * C * H_load * W_load)
-                return torch.tensor(size, device=dev)
-
-            # --- 情况 B：其它层级，沿用你原先的 Inner 公式（不含 halo） ---
-            def calculate_inner(dim_name: str) -> torch.Tensor:
-                """Inner(i, d)：从最内层到 i 层的（temporal*spatial）乘积"""
-                inner_size = torch.tensor(1.0, device=dev)
-                for j in range(i + 1):
+            def _inner_lt_i(dim_name: str) -> torch.Tensor:
+                val = torch.tensor(1.0, device=dev)
+                for j in range(i):  # 关键：严格 j < i
                     lvl = memory_levels[j]
-                    if dim_name in layer_dims and dim_name in mapping_table and lvl in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][lvl].get('temporal', 1)
-                        spatial_factor  = mapping_table[dim_name][lvl].get('spatial', 1)
-                        inner_size *= torch.tensor(temporal_factor * spatial_factor, device=dev)
-                return inner_size
+                    if dim_name in mapping_table and lvl in mapping_table[dim_name]:
+                        t = mapping_table[dim_name][lvl].get('temporal', 1)
+                        s = mapping_table[dim_name][lvl].get('spatial', 1)
+                        val *= torch.tensor(float(t) * float(s), device=dev)
+                return val
 
-            P_stride = 1
-            Q_stride = 1
+            # strides（如需：从 prob 读）——当前按 1 处理
+            P_stride = 1.0
+            Q_stride = 1.0
 
-            inner_P = calculate_inner('P')
-            inner_R = calculate_inner('R')
-            inner_Q = calculate_inner('Q')
-            inner_S = calculate_inner('S')
+            inner_P = _inner_lt_i('P')
+            inner_Q = _inner_lt_i('Q')
+            inner_R = _inner_lt_i('R')
+            inner_S = _inner_lt_i('S')
+            inner_N = _inner_lt_i('N')
+            inner_C = _inner_lt_i('C')
 
-            # C/N 在内层的乘积
-            cn_factors = torch.tensor(1.0, device=dev)
-            for j in range(i + 1):
-                lvl = memory_levels[j]
-                for dim_name in ['C', 'N']:
-                    if dim_name in layer_dims and dim_name in mapping_table and lvl in mapping_table[dim_name]:
-                        temporal_factor = mapping_table[dim_name][lvl].get('temporal', 1)
-                        spatial_factor  = mapping_table[dim_name][lvl].get('spatial', 1)
-                        cn_factors *= torch.tensor(temporal_factor * spatial_factor, device=dev)
+            H = P_stride * (inner_P - 1.0) + inner_R
+            W = Q_stride * (inner_Q - 1.0) + inner_S
 
-            size = cn_factors * (P_stride * (inner_P - 1) + inner_R) * (Q_stride * (inner_Q - 1) + inner_S)
+            size = inner_N * inner_C * H * W
+
+            # 可选：调试打印
+            print(f"[DEBUG][C_i_I paper] i={i} levels< i: {memory_levels[:i]}")
+            print(f"  Inner(P)={inner_P.item()}, Inner(Q)={inner_Q.item()}, Inner(R)={inner_R.item()}, Inner(S)={inner_S.item()}")
+            print(f"  Inner(N)={inner_N.item()}, Inner(C)={inner_C.item()}")
+            print(f"  H={H.item()}, W={W.item()},  C_i_I={float(size.item())}")
+
             return size
-
 
         else:
             # 对于未知张量类型，返回默认值
@@ -1527,9 +1508,6 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # ===== Total Energy =====
         energy = energy_compute + energy_fill + energy_writeback + energy_read
-
-
-
 
         buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
         for i, level in enumerate(self.config.MEMORY_HIERARCHY):

@@ -11,8 +11,8 @@ from dosa.hardware_parameters import HardwareParameters
 
 # =============== 配置常量 ===============
 # 优化器配置
-LEARNING_RATE = 1e-8  # 学习率，控制参数更新步长
-NUM_OPTIMIZATION_STEPS = 5  # 优化迭代次数
+LEARNING_RATE = 1e-12  # 学习率，控制参数更新步长
+NUM_OPTIMIZATION_STEPS = 20  # 优化迭代次数
 MAPPING_PENALTY_WEIGHT = 1e9  # 映射无效惩罚权重
 
 # =============== 工具函数 ===============
@@ -34,7 +34,12 @@ def print_mapping_parameters(mapping, title="Mapping参数详情", show_projecte
     
     for i, (name, param) in enumerate(mapping.named_parameters()):
         continuous_val = param.data.item()
-        real_val = math.exp(continuous_val)
+        
+        # 安全地计算exp，避免overflow
+        try:
+            real_val = math.exp(min(continuous_val, 700))  # 限制在700以内避免overflow
+        except (OverflowError, ValueError):
+            real_val = float('inf')
         
         print(f"\n📌 参数 {i+1}: {name}")
         print(f"   📊 连续值 (log): {continuous_val:.6f}")
@@ -126,7 +131,6 @@ def print_fusion_gradients(fusion_params, title="Fusion参数梯度详情"):
             print(f"   ❌ 梯度为 None (可能未参与计算图)")
     print(f"{'='*60}")
 
-
 def print_parameter_gradients(mapping, learning_rate):
     """
     打印参数梯度和更新信息
@@ -146,8 +150,16 @@ def print_parameter_gradients(mapping, learning_rate):
         grad_val = param.grad.clone()
         update_val = old_val - learning_rate * grad_val
 
-        real_old = math.exp(old_val.item())
-        real_update = math.exp(update_val.item())
+        # 安全地计算exp，避免overflow
+        try:
+            real_old = math.exp(min(old_val.item(), 700))  # 限制在700以内避免overflow
+        except (OverflowError, ValueError):
+            real_old = float('inf')
+            
+        try:
+            real_update = math.exp(min(update_val.item(), 700))  # 限制在700以内避免overflow
+        except (OverflowError, ValueError):
+            real_update = float('inf')
 
         print(f"\n📌 参数 {i+1}: {name}")
         print(f"   📊 当前值 (log): {old_val.item():.6f} → 真实值: {real_old:.6f}")

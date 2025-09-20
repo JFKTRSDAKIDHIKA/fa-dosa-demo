@@ -167,20 +167,20 @@ def get_fixed_validation_config():
             "conv1": {
                 # 外层：K/C 在最外，R/S 其后；N/P/Q 放到最内侧，保障在 L0 内做时间复用
                 "DRAM": {
-                    "temporal": {"N":1,"C":4,"K":1,"P":8,"Q":1,"R":1,"S":1},
+                    "temporal": {"N":1,"C":1,"K":1,"P":7,"Q":7,"R":1,"S":1},
                     "permutation": "P Q K C R S N"
                 },
                 "L2_Scratchpad": {
-                    "temporal": {"N":1,"C":4,"K":4,"P":7,"Q":7,"R":1,"S":3},
+                    "temporal": {"N":1,"C":1,"K":4,"P":1,"Q":1,"R":1,"S":1},
                     "permutation": "P Q K C R S N"
                 },
                 "L1_Accumulator": {
-                    "temporal": {"N":1,"C":2,"K":2,"P":1,"Q":4,"R":3,"S":1},
+                    "temporal": {"N":1,"C":8,"K":2,"P":1,"Q":1,"R":3,"S":3},
                     "permutation": "P Q K C R S N"
                 },
                 "L0_Registers": {
-                    "temporal": {"N":1,"C":1,"K":1,"P":1,"Q":1,"R":1,"S":1},
-                    "spatial":  {"C":2,"K":8},  
+                    "temporal": {"N":1,"C":1,"K":1,"P":8,"Q":8,"R":1,"S":1},
+                    "spatial":  {"C":8,"K":8},  
                     "permutation": "P Q K C R S N"
                 }
             }
@@ -653,7 +653,7 @@ def generate_timeloop_files(config: dict, work_dir: Path):
         'target': 'PE_array_container',
         'type': 'spatial',
         'factors': format_factors('spatial', 'L0_Registers'),
-        'permutation': ' '.join(spatial_perm)
+        'permutation': "P Q K C R S N"
     })
 
     # 时间目标：DRAM/L2/L1/L0（permutation 使用映射里给的）
