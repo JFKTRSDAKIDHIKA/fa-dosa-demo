@@ -200,27 +200,91 @@ class HighFidelityPerformanceModel(nn.Module):
     """
     NEW: 高精度性能模型，能够处理多级存储和细粒度映射。
     """
-    def __init__(self, config: Config, debug_latency: bool = False, fusion_aware: bool = True):
+    def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.debug_latency = debug_latency
-        self.fusion_aware = fusion_aware
-        self.dmt_registry = {
-            ('Conv', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
-            ('Conv', 'BatchNormalization', 'ReLU'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
-            ('MatMul', 'Add'): InPlaceFusionDMT(debug_latency=self.debug_latency, debug_output_path="debug_performance_model.json"),
-            # ResNet skip connection patterns
-            ('Conv', 'BatchNormalization', 'ReLU', 'Add'): SkipConnectionDMT(),
-            ('Conv', 'Add'): SkipConnectionDMT(),
-            ('ReLU', 'Add'): SkipConnectionDMT(),
-            # Add more patterns as needed
-        }
-        self._group_w_persist_enabled = False
-        self._group_w_residency_level = 'L2_Scratchpad'
-        self._group_w_first_load_done = False
+        # 用于存放“层间边界融合决策”的可训练参数字典。
+        # key: "l0->l1" 表示从 layer0 到 layer1 的边界
+        # val: nn.Parameter，存的是 logit（需要经过 sigmoid 转换为概率）
+        #     - sigmoid(logit) ≈ 1 表示倾向于把输出留在 L2（融合）
+        #     - sigmoid(logit) ≈ 0 表示倾向于写回 DRAM（不融合）
+        self.fusion_boundary_logits = nn.ParameterDict()
+
+    def init_fusion_boundaries(self, group_layers):
+        """为一条融合链的每个边界(l->l+1)创建一个可训练logit。"""
+        for i in range(len(group_layers)-1):
+            key = f"{group_layers[i]}->{group_layers[i+1]}"
+            if key not in self.fusion_boundary_logits:
+                # 折中初始化：sigmoid(0.7) ≈ 0.668
+                self.fusion_boundary_logits[key] = nn.Parameter(
+                    torch.tensor(0.7, device=self.config.DEVICE)
+                )
+
 
         # === 2) 在类内新增一个方法（放在类中任意位置即可） ===
     
+    def backprop_lb_from_output_tile(self, group_layers, graph, out_tile_last):
+        """
+        给定最后一层的输出tile (P_o, Q_o, K_o, N_o)，
+        沿融合链从后往前反推每层的 I/O tile 的几何下界（LB），并返回每层的 I/O 字节下界。
+        out_tile_last: dict，如 {'P':Po_L, 'Q':Qo_L, 'K':Ko_L, 'N':No_L}
+        返回:
+        lb = {
+            layer_name: {
+            'O': {'P':..., 'Q':..., 'K':..., 'N':...,'bytes': Tensor},
+            'I': {'P':..., 'Q':..., 'C':..., 'N':...,'bytes': Tensor},
+            }
+        }
+        """
+        dev = self.config.DEVICE
+        BYTES = self.config.BYTES_PER_ELEMENT
+
+        # 结果容器（从后往前填，再返回正向顺序字典）
+        lb_rev = {}
+        # 当前层的输出tile（初始化为最后一层的输出tile）
+        cur_Po = torch.tensor(float(out_tile_last.get('P', 1.0)), device=dev)
+        cur_Qo = torch.tensor(float(out_tile_last.get('Q', 1.0)), device=dev)
+        cur_Ko = torch.tensor(float(out_tile_last.get('K', 1.0)), device=dev)
+        cur_No = torch.tensor(float(out_tile_last.get('N', 1.0)), device=dev)
+
+        for name in reversed(group_layers):
+            layer = graph.layers[name]
+            # 提取完整卷积层的几何参数
+            R = torch.tensor(float(layer['dims'].get('R', 1)), device=dev)
+            S = torch.tensor(float(layer['dims'].get('S', 1)), device=dev)
+            tP = torch.tensor(float(layer.get('stride_P', 1)), device=dev)
+            tQ = torch.tensor(float(layer.get('stride_Q', 1)), device=dev)
+
+            # 本层输出 LB（就是当前 cur_*）
+            O_P = torch.clamp(cur_Po, min=1.0)
+            O_Q = torch.clamp(cur_Qo, min=1.0)
+            O_K = torch.clamp(cur_Ko, min=1.0)
+            O_N = torch.clamp(cur_No, min=1.0)
+
+            # 由 O 反推 I 的几何覆盖 LB: (P_o-1)*stride + R
+            I_P = (O_P - 1.0) * tP + R
+            I_Q = (O_Q - 1.0) * tQ + S
+            I_C = torch.tensor(float(layer['dims'].get('C', 1)), device=dev)  # 与上一层K对齐由链条保证
+            I_N = O_N  # batch不变
+
+            # 字节数下界（不考虑复用，即 fully-recompute 的必需体量）
+            I_bytes = I_N * I_C * I_P * I_Q * BYTES
+            O_bytes = O_N * O_K * O_P * O_Q * BYTES
+
+            lb_rev[name] = {
+                'O': {'P': O_P, 'Q': O_Q, 'K': O_K, 'N': O_N, 'bytes': O_bytes},
+                'I': {'P': I_P, 'Q': I_Q, 'C': I_C, 'N': I_N, 'bytes': I_bytes}
+            }
+
+            # 把本层 I 的 (C) 映射到上一层的 O 的 (K)，把几何 I(P,Q) 作为上一层 O(P,Q)
+            # K/通道数沿网络定义走，这里只做几何链，C/K 对齐由 layer dims 管理
+            prev_Ko = torch.tensor(float(layer['dims'].get('C', 1)), device=dev)
+            cur_Po, cur_Qo, cur_Ko, cur_No = I_P, I_Q, prev_Ko, I_N
+
+        # 翻转成正序
+        lb = {k: lb_rev[k] for k in group_layers}
+        return lb
+
     def set_group_weight_residency(self, enabled: bool, residency_level: str = 'L2_Scratchpad'):
         """
         启用/关闭"融合组全权重常驻"模式。
@@ -1160,110 +1224,227 @@ class HighFidelityPerformanceModel(nn.Module):
             return accesses, detailed_info
         return accesses
 
-    def evaluate_group_depth_first(self, group_layers: list, graph, hw_params: HardwareParameters,
-                                   mapping: FineGrainedMapping, direct_mapping_table: dict = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Evaluate a fusion group using depth-first scheduling and weight residency.
+    def evaluate_group_depth_first(
+        self,
+        group_layers: list,
+        graph,
+        hw_params: "HardwareParameters",
+        mapping: "FineGrainedMapping",
+        direct_mapping_table: dict = None,
+        debug_data: dict = None,
+    ):
+        dev   = self.config.DEVICE
+        BYTES = self.config.BYTES_PER_ELEMENT
 
-        WARNING: This implementation has serious issues:
-        - Does not properly handle gradient propagation for mapping parameters
-        - Oversimplified memory access patterns
-        - Inaccurate modeling of partial sums
-        - Memory bandwidth calculations need revision
-        
-        This model assumes:
-        * All intermediate activations stay on-chip (depth-first execution).
-        * Weights for all layers are loaded once if they fit in L2.
+        # =============== 辅助工具：从 all_factors 生成“夹过LB的”有效视图 =================
+        def _apply_lb_to_output_tiles(all_factors_in, lb_dict):
+            """
+            仅对每层 O-tile 做可微下界重参数化：
+                O_eff = LB_O + softplus(O_raw - LB_O)
+            其它映射参数保持不变。返回一个新的 mapping 视图（不修改原 mapping/all_factors）。
+            """
+            # 浅拷贝到新的字典（避免改动原对象）
+            eff = {k: {kk: vv for kk, vv in v.items()} for k, v in all_factors_in.items()}
+            for lname in group_layers:
+                if lname not in eff:  # 保险：all_factors里可能不存在该层键
+                    eff[lname] = {}
+                # 取 LB（都是 Tensor）
+                LB_P = lb_dict[lname]["O"]["P"]
+                LB_Q = lb_dict[lname]["O"]["Q"]
+                LB_K = lb_dict[lname]["O"]["K"]
+                LB_N = lb_dict[lname]["O"]["N"]
+                # 读原始 O-tile，若没有就跳过（保持原状）
+                P_key, Q_key, K_key, N_key = "O_tile_P", "O_tile_Q", "O_tile_K", "O_tile_N"
+                if P_key in eff[lname]:
+                    eff[lname][P_key] = LB_P + torch.nn.functional.softplus(eff[lname][P_key] - LB_P)
+                if Q_key in eff[lname]:
+                    eff[lname][Q_key] = LB_Q + torch.nn.functional.softplus(eff[lname][Q_key] - LB_Q)
+                if K_key in eff[lname]:
+                    eff[lname][K_key] = LB_K + torch.nn.functional.softplus(eff[lname][K_key] - LB_K)
+                if N_key in eff[lname]:
+                    eff[lname][N_key] = LB_N + torch.nn.functional.softplus(eff[lname][N_key] - LB_N)
+            return eff
 
-        Args:
-            group_layers: List of layer names in the fusion group.
-            graph: Computation graph providing layer metadata.
-            hw_params: Hardware parameters instance.
-            mapping: Mapping parameters (unused in simplified model).
-            direct_mapping_table: Optional mapping table (unused).
+        # =============== 边界 logit（可训练），初始化偏向 L2（sigmoid≈0.67） =================
+        self.init_fusion_boundaries(group_layers)
 
-        Returns:
-            Tuple of (latency, energy, area_cost, buffer_mismatch_loss, compatibility_penalty).
-        """
+        # =============== 反推 LB（几何下界，保证跨层兼容） =================
+        last_dims = graph.layers[group_layers[-1]]["dims"]
+        out_tile_last = {
+            "P": float(last_dims.get("P", 1)), "Q": float(last_dims.get("Q", 1)),
+            "K": float(last_dims.get("K", 1)), "N": float(last_dims.get("N", 1)),
+        }
+        lb = self.backprop_lb_from_output_tile(group_layers, graph, out_tile_last)
+        lb_O_bytes = [lb[name]["O"]["bytes"] for name in group_layers]
+        lb_I_bytes = [lb[name]["I"]["bytes"] for name in group_layers]
 
-        # Gather layer information
-        layers = [graph.layers[name] for name in group_layers]
-        # Update mapping info for partial-sum detection
-        all_factors = mapping.get_all_factors()
+        # =============== 解析 factor，并用 LB“夹住”每层 O-tile 的有效视图 =================
+        all_factors_raw = format_mapping_as_all_factors(mapping)
+        all_factors_eff = _apply_lb_to_output_tiles(all_factors_raw, lb)
 
-        # === 二道闸：禁止 partial sum ===
-        if hasattr(mapping, 'has_partial_sums') and mapping.has_partial_sums():
-            big = torch.tensor(1e6, device=self.config.DEVICE)
-            return big, big, big, big, big
+        # =============== 逐层用单层公式计算 read / fill(write) / writeback 的基线流量 =================
+        per_layer = []
+        total_macs = torch.tensor(0.0, device=dev)
 
-        # Compute total MACs across the group
+        # 安全访问 breakdown 小工具
+        def _get_bd(d, iface, tensor):
+            if d is None: 
+                return torch.tensor(0.0, device=dev)
+            if iface not in d: 
+                return torch.tensor(0.0, device=dev)
+            v = d[iface]["breakdown"].get(tensor, torch.tensor(0.0, device=dev))
+            return v if isinstance(v, torch.Tensor) else torch.tensor(float(v), device=dev)
+
         from dosa.utils import calculate_macs
-        total_macs = torch.tensor(0.0, device=self.config.DEVICE)
-        total_weight_bytes = torch.tensor(0.0, device=self.config.DEVICE)
 
-        for layer in layers:
-            total_macs += calculate_macs(layer['dims'])
-            
-            # weight size
-            weight_elems = torch.tensor(1.0, device=self.config.DEVICE)
-            for d in D_W:
-                weight_elems *= torch.tensor(layer['dims'].get(d, 1), device=self.config.DEVICE)
-            total_weight_bytes += weight_elems * self.config.BYTES_PER_ELEMENT
+        for lname in group_layers:
+            layer = graph.layers[lname]
+            dims  = layer["dims"]
 
-        # Determine if weights can stay resident in L2
-        l2_bytes = hw_params.get_buffer_size_kb('L2_Scratchpad') * 1024
-        if total_weight_bytes > l2_bytes:
-            reload_factor = torch.ceil(total_weight_bytes / l2_bytes)
-            weight_bytes_to_load = total_weight_bytes * reload_factor
-        else:
-            weight_bytes_to_load = total_weight_bytes
+            # --- 单层三张表：read / fill(write) / writeback ---
+            read_dict = self.calculate_inter_level_read_traffic(
+                layer_dims=dims,
+                mapping_table=all_factors_eff,                       # ★ 用“夹过LB”的视图
+                num_pes=hw_params.get_projected_num_pes(),
+                hw_params=hw_params,
+                debug_data=None,
+            )
+            fill_dict = self.calculate_inter_level_fill_traffic(
+                layer_dims=dims,
+                mapping_table=all_factors_eff,                       # ★ 用“夹过LB”的视图
+                num_pes=hw_params.get_projected_num_pes(),
+                hw_params=hw_params,
+                debug_data=None,
+            )
+            write_dict = self.calculate_inter_level_writeback_traffic(
+                layer_dims=dims,
+                mapping_table=all_factors_eff,                       # ★ 用“夹过LB”的视图
+                num_pes=hw_params.get_projected_num_pes(),
+                debug_data=None,
+            )
 
-        # First input and final output bytes
-        first_layer = layers[0]
-        last_layer = layers[-1]
-        input_elems = torch.tensor(1.0, device=self.config.DEVICE)
-        for d in D_I:
-            input_elems *= torch.tensor(first_layer['dims'].get(d, 1), device=self.config.DEVICE)
-        output_elems = torch.tensor(1.0, device=self.config.DEVICE)
-        for d in D_O:
-            output_elems *= torch.tensor(last_layer['dims'].get(d, 1), device=self.config.DEVICE)
+            # L3 服务候选：I/W 的 L3->L2；O 的 L1->L3（基线写回）
+            I_L3_to_L2_base = _get_bd(read_dict, "L3_DRAM_to_L2_Scratchpad", "Input")
+            W_L3_to_L2_base = _get_bd(read_dict, "L3_DRAM_to_L2_Scratchpad", "Weight")
+            O_L1_to_L3_write_base = _get_bd(fill_dict, "L1_Accumulator_to_L3_DRAM", "Output")
 
-        input_bytes = input_elems * self.config.BYTES_PER_ELEMENT
-        output_bytes = output_elems * self.config.BYTES_PER_ELEMENT
+            # L2 服务候选：I 的 L2->PE；W 的 L2->L0（权重从 L2 到寄存器）
+            I_L2_to_PE  = _get_bd(read_dict, "L2_Scratchpad_to_PE", "Input")
+            W_L2_to_L0  = _get_bd(read_dict, "L2_Scratchpad_to_L0_Registers", "Weight")
 
-        # Handle extra traffic if partial sums exist
-        extra_output_bytes = torch.tensor(0.0, device=self.config.DEVICE)
-        partial_penalty = torch.tensor(0.0, device=self.config.DEVICE)
-        if mapping.has_partial_sums():
-            for tiles in mapping.get_partial_sum_tiles().values():
-                extra_output_bytes += output_bytes * (tiles - 1) * 2
-                partial_penalty += tiles - 1
+            # copy-bundle(L1->L2)：不计能耗/时延（但可用于 debug）
+            O_L1_to_L2_copy = _get_bd(fill_dict, "L1_Accumulator_to_L2_Scratchpad", "Output")
 
-        
+            # PE->L1（用于能耗参考；不计 L2/L3 服务）
+            PE_to_L1 = _get_bd(write_dict, "PE_to_L1_Accumulator", "Output")
 
-        # debug_grad(dram_bytes, mapping, "L2_Scratchpad.S.spatial")
-        dram_bytes = weight_bytes_to_load + input_bytes + output_bytes + extra_output_bytes
+            # 记录
+            per_layer.append({
+                "name": lname, "dims": dims,
+                # L3 服务
+                "I_L3_to_L2": I_L3_to_L2_base,      # 后续乘(1-s)
+                "W_L3_to_L2": W_L3_to_L2_base,
+                "O_L1_to_L3_write_base": O_L1_to_L3_write_base,   # 这层自然写回（非跨层融合导致）
+                "O_to_L3_extra": torch.tensor(0.0, device=dev),   # 占位：边界(1-s)*LB_O 产生的额外写回
+                # L2 服务
+                "I_L2_to_PE": I_L2_to_PE,
+                "W_L2_to_L0": W_L2_to_L0,            # ★ 关键：权重 L2->寄存器
+                # 其它
+                "O_L1_to_L2_copy": O_L1_to_L2_copy,  # 仅 debug
+                "PE_to_L1": PE_to_L1,                # 仅能耗参考
+            })
 
+            total_macs += calculate_macs(dims)
+
+        # =============== 边界概率 s：倾向留 L2（融合），或回写 L3（不融合） =================
+        s_list = []
+        for i in range(len(group_layers) - 1):
+            key = f"{group_layers[i]}->{group_layers[i+1]}"
+            s_list.append(torch.sigmoid(self.fusion_boundary_logits[key]))
+
+        # 用 s 修正跨层：减少下一层 I 的 L3->L2；增加本层 O 的“几何必需额外写回”
+        for i in range(len(group_layers) - 1):
+            nxt = i + 1
+            s_i = s_list[i]
+            per_layer[nxt]["I_L3_to_L2"] = (1.0 - s_i) * per_layer[nxt]["I_L3_to_L2"]
+            per_layer[i]["O_to_L3_extra"] = (1.0 - s_i) * lb_O_bytes[i]
+
+        # =============== 汇总服务字节，显式统计 W(L2->L0) =================
+        total_L3_bytes     = torch.tensor(0.0, device=dev)
+        total_L2_bytes     = torch.tensor(0.0, device=dev)
+        total_W_L2_to_L0   = torch.tensor(0.0, device=dev)
+
+        for rec in per_layer:
+            # L3服务 = I_L3->L2 + W_L3->L2 + 本层自然写回 + 边界额外写回
+            total_L3_bytes += rec["I_L3_to_L2"] + rec["W_L3_to_L2"] \
+                            + rec["O_L1_to_L3_write_base"] + rec["O_to_L3_extra"]
+            # L2服务 = I_L2->PE + W_L2->L0
+            total_L2_bytes += rec["I_L2_to_PE"] + rec["W_L2_to_L0"]
+            total_W_L2_to_L0 += rec["W_L2_to_L0"]
+
+        if debug_data is not None:
+            debug_data.setdefault("group_counters", {})[tuple(group_layers)] = {
+                "total_W_bytes_L2_to_L0": float(total_W_L2_to_L0.detach().cpu().item()),
+                "total_L3_bytes": float(total_L3_bytes.detach().cpu().item()),
+                "total_L2_bytes": float(total_L2_bytes.detach().cpu().item()),
+                "s_boundaries": [float(s.detach().cpu().item()) for s in s_list],
+            }
+
+        # =============== Roofline：内存 vs 计算 =================
         num_pes = hw_params.get_projected_num_pes()
+        clk_hz  = self.config.CLOCK_FREQUENCY_MHZ * 1e6
 
-        # Compute cycles
-        compute_cycles = total_macs / torch.clamp(num_pes, min=torch.tensor(1.0, device=num_pes.device))
+        compute_cycles = total_macs / torch.clamp(
+            torch.tensor(float(num_pes), device=dev), min=torch.tensor(1.0, device=dev)
+        )
 
-        # Memory cycles based on DRAM bandwidth
-        bandwidth = calculate_bandwidth_bytes_per_cycle('L3_DRAM', num_pes, self.config)
-        memory_cycles = dram_bytes / torch.clamp(bandwidth, min=torch.tensor(1e-9, device=bandwidth.device))
+        bw_L3 = calculate_bandwidth_bytes_per_cycle('L3_DRAM', num_pes, self.config)
+        bw_L2 = calculate_bandwidth_bytes_per_cycle('L2_Scratchpad', num_pes, self.config)
 
-        total_cycles = torch.max(compute_cycles, memory_cycles)
-        latency = total_cycles / (self.config.CLOCK_FREQUENCY_MHZ * 1e6)
+        mem_cycles = torch.max(
+            total_L3_bytes / torch.clamp(bw_L3, min=torch.tensor(1e-9, device=dev)),
+            total_L2_bytes / torch.clamp(bw_L2, min=torch.tensor(1e-9, device=dev)),
+        )
+        total_cycles = torch.max(compute_cycles, mem_cycles)
+        latency = total_cycles / clk_hz
 
-        # Energy estimation (compute + DRAM)
-        compute_energy = total_macs * self.config.PE_MAC_EPA_PJ
-        dram_energy = (dram_bytes / self.config.BYTES_PER_ELEMENT) * self.config.L2_SPM_BASE_EPA_PJ
-        energy = compute_energy + dram_energy
+        # =============== 能耗：PE + L3 + L2（不计 copy-bundle L1->L2） =================
+        e_pe = total_macs * self.config.PE_MAC_EPA_PJ
+        e_l3 = (total_L3_bytes / BYTES) * hw_params.get_epa_pj('L3_DRAM')
+        e_l2 = (total_L2_bytes / BYTES) * hw_params.get_epa_pj('L2_Scratchpad')
+        energy = e_pe + e_l3 + e_l2
 
-        area_cost = hw_params.get_area_cost()
+        # =============== L2 容量软惩罚（保守峰值，无 overlap） =================
+        l2_cap = hw_params.get_buffer_size_kb('L2_Scratchpad') * 1024.0
+        guard  = 0.05 * l2_cap
+        # 近似峰值：W（整组上界） + 活跃 I/O + 为下一层预留的 O（s_i * LB_O）
+        W_resident = torch.tensor(0.0, device=dev)
+        for lname in group_layers:
+            dims = graph.layers[lname]["dims"]
+            W_elems = torch.tensor(1.0, device=dev)
+            for d in ("K", "C", "R", "S"):
+                W_elems *= torch.tensor(float(dims.get(d, 1)), device=dev)
+            W_resident += W_elems * BYTES
+        W_resident = torch.clamp(W_resident, max=torch.tensor(l2_cap, device=dev))
 
-        zero = torch.tensor(0.0, device=self.config.DEVICE)
-        return latency.squeeze(), energy.squeeze(), area_cost, zero, partial_penalty
+        U_candidates = []
+        for i, lname in enumerate(group_layers):
+            io_active = lb_I_bytes[i] + lb_O_bytes[i]
+            stash = (s_list[i] * lb_O_bytes[i]) if i < len(group_layers) - 1 else torch.tensor(0.0, device=dev)
+            U_i = W_resident + io_active + stash
+            U_candidates.append(U_i)
+        U_L2_peak = torch.stack(U_candidates).max()
+
+        kappa   = 0.05 * l2_cap
+        cap_pen = torch.nn.functional.softplus((U_L2_peak - (l2_cap - guard)) / kappa) ** 2
+
+        # 兼容性罚：LB反推后相邻天然兼容，这里记0，保留接口
+        comp_pen = torch.tensor(0.0, device=dev)
+
+        # 方便画图/校核：暴露本组 W(L2->L0) 总字节
+        self._last_group_W_L2_to_L0 = total_W_L2_to_L0.detach()
+
+        return latency, energy, comp_pen, cap_pen
 
     def _evaluate_single_layer(self, layer_name: str, graph, hw_params: HardwareParameters,
                                mapping: FineGrainedMapping, all_factors: dict,
@@ -1525,185 +1706,70 @@ class HighFidelityPerformanceModel(nn.Module):
 
     def forward(self, graph, hw_params: HardwareParameters, mapping: FineGrainedMapping,
                 fusion_params: nn.Module = None, direct_mapping_table: dict = None,
-                debug_output_path: str = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                debug_output_path: str = None):
         """
-        高保真度性能模型的前向传播方法 - 实现完整的PPA计算逻辑。
-        
-        严格遵循DOSA论文的屋顶线时延模型（公式12）和三段式能耗模型（公式13）。
-        
         Args:
             graph: 计算图
             hw_params: 硬件参数
-            mapping: FineGrainedMapping实例（用于训练路径）
-            direct_mapping_table: （可选）离散映射表，用于验证模式
+            mapping: FineGrainedMapping实例
         
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                (total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty)
+            (total_latency, total_energy, area_cost,
+            total_buffer_mismatch_loss, total_compatibility_penalty,
+            mapping_invalid_penalty, penalty)
         """
-        total_latency = torch.tensor(0.0, device=self.config.DEVICE)
-        total_energy = torch.tensor(0.0, device=self.config.DEVICE)
-        total_buffer_mismatch_loss = torch.tensor(0.0, device=self.config.DEVICE)
-        total_compatibility_penalty = torch.tensor(0.0, device=self.config.DEVICE)
-        
-        # 初始化调试数据容器
-        debug_data = None
-        if self.debug_latency and debug_output_path:
-            debug_data = {
-                "calculation_summary": {},
-                "memory_interface_analysis": {},
-                "detailed_traffic_formula_trace": {},
-                "inter_level_fill_traffic_trace": {},
-                "inter_level_writeback_traffic_trace": {}
-            }
-        
-        # 确定映射表来源
-        # if direct_mapping_table:
-        #     all_factors = direct_mapping_table
-        # else:
+        dev = self.config.DEVICE
 
+        # 累计量初始化
+        total_latency  = torch.tensor(0.0, device=dev)
+        total_energy   = torch.tensor(0.0, device=dev)
+        total_buffer_mismatch_loss = torch.tensor(0.0, device=dev)
+        total_compatibility_penalty = torch.tensor(0.0, device=dev)
+        total_capacity_penalty = torch.tensor(0.0, device=dev)
 
-
-        # 格式转换版本（数值不变，只是结构化）
+        # factor 解析
         all_factors = format_mapping_as_all_factors(mapping)
 
-
-            # print("=== Gradient Debug Information 1 ===")
-            
-            # Print type information
-            # print(f"Type of temporal factor: {type(all_factors['S']['L2_Scratchpad']['temporal'])}")
-            
-            # debug_grad(all_factors["S"]["L2_Scratchpad"]["temporal"],
-            #mapping, "L2_Scratchpad.S.temporal")
-
-        # num_pes = hw_params.get_projected_num_pes()
-
-        
-        if self.fusion_aware and fusion_params is not None:
-            # 避免squeeze导致0维张量的问题
-            fusion_logits = fusion_params.fusion_logits
-            if fusion_logits.dim() == 1 and fusion_logits.size(0) == 1:
-                fusion_probs = torch.sigmoid(fusion_logits)  # 保持1维
-            else:
-                fusion_probs = torch.sigmoid(fusion_logits.squeeze())
-            fusion_groups = graph.fusion_groups
-            if debug_data is not None:
-                decisions = (fusion_probs > 0.5).detach().cpu().tolist()
-                debug_data["fusion_decisions"] = decisions
+        # === 确定融合组 ===
+        if len(graph.fusion_groups) == 0:
+            fusion_groups = [[layer_name] for layer_name in graph.layers.keys()]
         else:
-            # 如果 fusion_groups 为空，就退化为单层模式
-            if len(graph.fusion_groups) == 0:
-                fusion_groups = [[layer_name] for layer_name in graph.layers.keys()]
-                fusion_probs = torch.ones(len(fusion_groups), device=self.config.DEVICE)
-            else:
-                fusion_probs = torch.ones(len(graph.fusion_groups), device=self.config.DEVICE)
-                fusion_groups = (
-                    [[layer_name] for group in graph.fusion_groups for layer_name in group]
-                    if not self.fusion_aware else graph.fusion_groups
+            fusion_groups = graph.fusion_groups
+
+        # === 遍历融合组 ===
+        for _, group in enumerate(fusion_groups):
+            if len(group) == 1:
+                # 单层
+                layer_name = group[0]
+                lat, en, mismatch = self._evaluate_single_layer(
+                    layer_name, graph, hw_params, mapping, all_factors, debug_data=None
                 )
-
-            # Debug 打印
-            # print("\n[DEBUG] Fusion Info ----------------------------")
-            # print("[DEBUG] fusion_aware =", self.fusion_aware)
-            # print("[DEBUG] graph.fusion_groups =", graph.fusion_groups)
-            # print("[DEBUG] effective fusion_groups =", fusion_groups)
-            # print("[DEBUG] fusion_probs =", fusion_probs)
-            # print("------------------------------------------------\n")
-
-
-        # Print fusion groups with index
-        # print(f"[DEBUG] INFO: Fusion Groups:")
-        # for i, group in enumerate(fusion_groups):
-            # print(f"Group {i}: {group}")
-            
-        for idx, group in enumerate(fusion_groups):
-            
-
-            weight = fusion_probs[idx] if self.fusion_aware and fusion_params is not None else torch.tensor(1.0, device=self.config.DEVICE)
-            fused_latency = torch.tensor(0.0, device=self.config.DEVICE)
-            fused_energy = torch.tensor(0.0, device=self.config.DEVICE)
-            fused_mismatch = torch.tensor(0.0, device=self.config.DEVICE)
-            fused_comp = torch.tensor(0.0, device=self.config.DEVICE)
-
-            split_latency = torch.tensor(0.0, device=self.config.DEVICE)
-            split_energy = torch.tensor(0.0, device=self.config.DEVICE)
-            split_mismatch = torch.tensor(0.0, device=self.config.DEVICE)
-            split_comp = torch.tensor(0.0, device=self.config.DEVICE)
-
-            current_pattern = tuple(graph.layers[layer_name]['type'] for layer_name in group)
-            dmt_model = self.dmt_registry.get(current_pattern) if (self.fusion_aware and fusion_params is not None) else None
-            
-            # debug
-            # print(f"DMT Model for pattern {current_pattern}: {dmt_model}")
-
-            if dmt_model is not None:
-                # print(f"[DEBUG] INFO: {dmt_model}")
-                fused_latency, fused_energy, fused_mismatch, fused_comp, _ = dmt_model(group, graph, hw_params, mapping, self.config)
+                total_latency += lat
+                total_energy  += en
+                total_buffer_mismatch_loss += mismatch
             else:
-                for layer_name in group:
-                    
-                    # print(f"[DEBUG] Evaluating layer {layer_name} with mapping:")
-                    for name, param in mapping.named_parameters():
-                        print(f"  {name}: {param.data}")
-                        
-                    # print(f"[DEBUG] all_factors for {layer_name}:", all_factors)
-                    lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
-                    fused_latency += lat
-                    fused_energy += en
-                    fused_mismatch += mismatch
+                # 多层组：概率路由 + 容量约束
+                lat, en, comp_pen, cap_pen = self.evaluate_group_depth_first(
+                    group, graph, hw_params, mapping, all_factors, debug_data=None
+                )
+                total_latency += lat
+                total_energy  += en
+                total_compatibility_penalty += comp_pen
+                total_capacity_penalty      += cap_pen
 
-            for layer_name in group:
-                lat, en, mismatch = self._evaluate_single_layer(layer_name, graph, hw_params, mapping, all_factors, debug_data)
-                split_latency += lat
-                split_energy += en
-                
-                split_mismatch += mismatch
-
-            # bug
-            latency = weight * fused_latency + (1 - weight) * split_latency
-            energy = weight * fused_energy + (1 - weight) * split_energy            
-
-            group_buffer_mismatch_loss = weight * fused_mismatch + (1 - weight) * split_mismatch
-            compatibility_penalty = weight * fused_comp + (1 - weight) * split_comp
-
-            total_latency += latency
-            total_energy += energy
-            total_buffer_mismatch_loss += group_buffer_mismatch_loss
-            total_compatibility_penalty += compatibility_penalty
-
+        # === 额外成本 ===
         area_cost = hw_params.get_area_cost()
-
-        # Compute invalid mapping penalty
         mapping_invalid_penalty = self.compute_invalid_penalty(mapping)
 
-        if debug_data is not None and debug_output_path is not None:
-            import json
-            
-            def tensor_to_serializable(obj):
-                if isinstance(obj, torch.Tensor):
-                    return obj.detach().cpu().numpy().tolist()
-                elif isinstance(obj, dict):
-                    return {k: tensor_to_serializable(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [tensor_to_serializable(item) for item in obj]
-                else:
-                    return obj
-            
-            with torch.no_grad():
-                serializable_debug_data = tensor_to_serializable(debug_data)
-                with open(debug_output_path, 'w', encoding='utf-8') as f:
-                    json.dump(serializable_debug_data, f, indent=4, ensure_ascii=False)
+        # === 总 penalty ===
+        penalty = (mapping_invalid_penalty
+                + total_buffer_mismatch_loss
+                + total_compatibility_penalty
+                + total_capacity_penalty)
 
-        total_latency = total_latency.squeeze() if total_latency.dim() > 0 else total_latency
-        total_energy = total_energy.squeeze() if total_energy.dim() > 0 else total_energy
-        area_cost = area_cost.squeeze() if area_cost.dim() > 0 else area_cost
-        total_buffer_mismatch_loss = total_buffer_mismatch_loss.squeeze() if total_buffer_mismatch_loss.dim() > 0 else total_buffer_mismatch_loss
-        total_compatibility_penalty = total_compatibility_penalty.squeeze() if total_compatibility_penalty.dim() > 0 else total_compatibility_penalty
-        penalty = mapping_invalid_penalty + total_buffer_mismatch_loss + total_compatibility_penalty
-        
-        
-
-        return total_latency, total_energy, area_cost, total_buffer_mismatch_loss, total_compatibility_penalty, mapping_invalid_penalty, penalty
+        return (total_latency, total_energy, area_cost,
+                total_buffer_mismatch_loss, total_compatibility_penalty,
+                mapping_invalid_penalty, penalty)
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
