@@ -285,15 +285,6 @@ class HighFidelityPerformanceModel(nn.Module):
         lb = {k: lb_rev[k] for k in group_layers}
         return lb
 
-    def set_group_weight_residency(self, enabled: bool, residency_level: str = 'L2_Scratchpad'):
-        """
-        启用/关闭"融合组全权重常驻"模式。
-        若 enabled=True，则本 perf_model 实例生命周期内仅第一次对指定 residency_level 的权重填充计入流量，
-        后续层的权重填充记为 0（视作已驻留）。
-        """
-        self._group_w_persist_enabled = bool(enabled)
-        self._group_w_residency_level = residency_level
-        self._group_w_first_load_done = False
 
     def compute_invalid_penalty(self, mapping: nn.Module) -> torch.Tensor:
         """
@@ -1269,7 +1260,6 @@ class HighFidelityPerformanceModel(nn.Module):
 
         # =============== 反推 LB（几何下界，保证跨层兼容） =================
         last_layer = group_layers[-1]
-        last_dims  = graph.layers[last_layer]["dims"]
 
         # 先默认全1
         out_tile_last = {"P": 1.0, "Q": 1.0, "K": 1.0, "N": 1.0}
@@ -1364,6 +1354,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 "dims": dims,
                 "macs": macs,
                 "traffic": traffic_dict,  # 结构：{"reads":{level:{tensor:bytes}}, "writes":..., "updates":...}
+                "all_factors": all_factors[lname],  # 添加 all_factors 信息用于 spatial factors 计算
             })
 
 
@@ -1381,27 +1372,25 @@ class HighFidelityPerformanceModel(nn.Module):
             nxt = i + 1
             s_i = s_list[i]
 
-            # (2+3) 本层 Output：根据 s 在 L3 写回 和 L2 copy 之间分流
+            # （1）本层 Output：根据 s 在 L3 写回 和 L2 copy 之间分流
             cur_writes = per_layer[i]["traffic"]["writes"]
-
             # 原始的写回流量（单层统计给的基线）
-            orig_O_to_DRAM = cur_writes["L3_DRAM"]["Output"]
-
-            # 重分配： (1-s) 部分写 DRAM，s 部分写 L2
+            orig_O_to_DRAM = cur_writes["L3_DRAM"]["Output"] # Output对L3 DRAM的Write的traffic
+            # 如果融合了，那么Output对DRAM的写流量，就变成了对L2 Scratchpad的写流量
             cur_writes["L2_Scratchpad"]["Output"] = s_i * orig_O_to_DRAM
 
-            # (1) 下一层的 Input：减少其在 L3 的读取 + L2 的写入
+            # （2）下一层的 Input：减少其在 L3 的读取 + L2 的写入
             nxt_reads = per_layer[nxt]["traffic"]["reads"]
             nxt_writes = per_layer[nxt]["traffic"]["writes"]
 
             if "L3_DRAM" in nxt_reads and "Input" in nxt_reads["L3_DRAM"]:
-                nxt_reads["L3_DRAM"]["Input"] = (1.0 - s_i) * nxt_reads["L3_DRAM"]["Input"]
+                nxt_reads["L3_DRAM"]["Input"] = (1.0 - s_i) * nxt_reads["L3_DRAM"]["Input"] # 如果融合了，那么Input对DRAM的读流量就没了
 
             if "L2_Scratchpad" in nxt_writes and "Input" in nxt_writes["L2_Scratchpad"]:
-                nxt_writes["L2_Scratchpad"]["Input"] = (1.0 - s_i) * nxt_writes["L2_Scratchpad"]["Input"]
+                nxt_writes["L2_Scratchpad"]["Input"] = (1.0 - s_i) * nxt_writes["L2_Scratchpad"]["Input"] # 如果融合了，那么Input对L2 Scratchpad的写流量就没了
 
 
-            # (2) 本层 Output：部分写回到 DRAM（updates(dst=L3)）
+            # (2) 当前layer的输出写回到L3DRAM在融合场景下，就没了
             cur_updates = per_layer[i]["traffic"]["writes"]
             if "L3_DRAM" in cur_updates and "Output" in cur_updates["L3_DRAM"]:
                 cur_updates["L3_DRAM"]["Output"] = (1.0 - s_i) * cur_updates["L3_DRAM"]["Output"]
@@ -1423,11 +1412,35 @@ class HighFidelityPerformanceModel(nn.Module):
             clk_hz  = torch.tensor(self.config.CLOCK_FREQUENCY_MHZ * 1e6, device=dev)
             eps     = torch.tensor(1e-9, device=dev)
 
-            # 1) compute cycles
+            # 1) compute cycles with spatial factors consideration
             layer_macs = layer_data.get('macs', torch.tensor(0.0, device=dev))
+            
+            # 计算实际利用的PE数量 (spatial factors)
+            utilized_pes = torch.tensor(1.0, device=self.config.DEVICE)
+            
+            # 从 layer_data 中获取 all_factors 信息
+            all_factors = layer_data.get('all_factors', {})
+            
+            for dim_name, dim_mapping in all_factors.items():
+                for level_name, level_factors in dim_mapping.items():
+                    if 'spatial' in level_factors:
+                        spatial_factor = level_factors['spatial']
+                        
+                        # 类型转换
+                        if not isinstance(spatial_factor, torch.Tensor):
+                            spatial_factor = torch.tensor(
+                                float(spatial_factor),
+                                device=self.config.DEVICE
+                            )
+                        
+                        utilized_pes *= spatial_factor
+            
+            # 确保至少使用1个PE
+            effective_pes = torch.max(utilized_pes, torch.tensor(1.0, device=self.config.DEVICE))
+            
             # 每 PE 每拍做几次 MAC？建议接 hw_params 的峰值：macs_per_pe_per_cycle
             macs_per_pe_per_cycle = getattr(hw_params, "macs_per_pe_per_cycle", 1.0)
-            macs_per_cycle_total  = torch.tensor(float(macs_per_pe_per_cycle * num_pes), device=dev)
+            macs_per_cycle_total  = torch.tensor(float(macs_per_pe_per_cycle), device=dev) * effective_pes
             compute_cycles = layer_macs / (macs_per_cycle_total + eps)
 
             # 2) 按 level 汇总 bytes
@@ -1483,7 +1496,6 @@ class HighFidelityPerformanceModel(nn.Module):
 
             return latency, energy
 
-
         # 对每层计算性能指标
         layer_latencies = []
         layer_energies = []
@@ -1497,37 +1509,38 @@ class HighFidelityPerformanceModel(nn.Module):
         latency = torch.sum(torch.stack(layer_latencies))  # 所有层顺序执行，latency 累加
         energy = torch.sum(torch.stack(layer_energies))    # 累加所有层的能耗
 
-        # =============== L2 容量软惩罚（保守峰值，无 overlap） =================
+        # =============== L2 容量软惩罚（权重全常驻 + Fully Recompute + 跨层兼容） =================
         l2_cap = hw_params.get_buffer_size_kb('L2_Scratchpad') * 1024.0
         guard  = 0.05 * l2_cap
-        # 近似峰值：W（整组上界） + 活跃 I/O + 为下一层预留的 O（s_i * LB_O）
-        W_resident = torch.tensor(0.0, device=dev)
+
+        # (1) 整条 fusion chain 的权重一次性常驻
+        W_chain = torch.tensor(0.0, device=dev)
         for lname in group_layers:
             dims = graph.layers[lname]["dims"]
             W_elems = torch.tensor(1.0, device=dev)
             for d in ("K", "C", "R", "S"):
                 W_elems *= torch.tensor(float(dims.get(d, 1)), device=dev)
-            W_resident += W_elems * BYTES
-        W_resident = torch.clamp(W_resident, max=torch.tensor(l2_cap, device=dev))
+            W_chain += W_elems * BYTES
 
         U_candidates = []
-        for i, lname in enumerate(group_layers):
-            io_active = lb_I_bytes[i] + lb_O_bytes[i]
-            stash = (s_list[i] * lb_O_bytes[i]) if i < len(group_layers) - 1 else torch.tensor(0.0, device=dev)
-            U_i = W_resident + io_active + stash
+        for i in range(len(group_layers)):
+            # stash：第 i 层输出交接给第 i+1 层
+            if i < len(group_layers) - 1:
+                stash = s_list[i] * lb_O_bytes[i]
+            else:
+                stash = torch.tensor(0.0, device=dev)
+
+            # 总占用 = 权重常驻 + stash
+            U_i = W_chain + stash
             U_candidates.append(U_i)
+
         U_L2_peak = torch.stack(U_candidates).max()
 
+        # (3) soft penalty
         kappa   = 0.05 * l2_cap
-        cap_pen = torch.nn.functional.softplus((U_L2_peak - (l2_cap - guard)) / kappa) ** 2
+        cap_pen = torch.nn.functional.softplus((U_L2_peak - (l2_cap - guard)) / (kappa + 1e-9)) ** 2
 
-        # 兼容性罚：LB反推后相邻天然兼容，这里记0，保留接口
-        comp_pen = torch.tensor(0.0, device=dev)
-
-        # 方便画图/校核：暴露本组 W(L2->L0) 总字节
-        self._last_group_W_L2_to_L0 = total_W_L2_to_L0.detach()
-
-        return latency, energy, comp_pen, cap_pen
+        return latency, energy, cap_pen
 
     def _evaluate_single_layer(self, layer_name: str, graph, hw_params: HardwareParameters,
                                mapping: FineGrainedMapping, all_factors: dict,
