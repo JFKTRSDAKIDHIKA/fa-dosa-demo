@@ -21,7 +21,6 @@ if not hasattr(torch, "_original_tensor"):
 from dosa.config import Config
 from dosa.hardware_parameters import HardwareParameters
 from dosa.mapping import FineGrainedMapping
-from dosa.dmt import InPlaceFusionDMT, SkipConnectionDMT
 
 def debug_grad(target_var, mapping, path="L2_Scratchpad.R.spatial", var_name="target_var", fusion_params=None):
     try:
@@ -142,10 +141,16 @@ def format_mapping_as_all_factors(mapping):
                 formatted[dim_name] = {}
             spatial_val = factor_dict.get("spatial", 1.0)
             temporal_val = factor_dict.get("temporal", 1.0)
+
+            # 包装成 tensor 并转成 real domain
             if not isinstance(spatial_val, torch.Tensor):
                 spatial_val = torch.tensor(float(spatial_val), device="cuda:0")
             if not isinstance(temporal_val, torch.Tensor):
                 temporal_val = torch.tensor(float(temporal_val), device="cuda:0")
+
+            spatial_val = torch.exp(spatial_val)
+            temporal_val = torch.exp(temporal_val)
+
             formatted[dim_name][level_name] = {
                 "spatial": spatial_val,
                 "temporal": temporal_val,
@@ -154,47 +159,27 @@ def format_mapping_as_all_factors(mapping):
     # --- Complete L3_DRAM ---
     for d in ['N','K','C','P','Q','R','S']:
         if d in mapping.dims:  # Only process existing dimensions
-            # Ensure dimension exists in formatted
             if d not in formatted:
                 formatted[d] = {}
             
-            # Check if L3_DRAM mapping already exists
             if 'L3_DRAM' not in formatted[d]:
-                # Calculate product of temporal factors for all on-chip levels
-                on_chip_temporal_product = torch.tensor(1.0, device="cuda:0")
-                print(f"\nProcessing dimension {d}:")
-                print(f"Initial on-chip temporal product = {on_chip_temporal_product}")
-                
-                for level_name in formatted[d]:
-                    temporal_factor = formatted[d][level_name].get('temporal', torch.tensor(1.0, device="cuda:0"))
-                    on_chip_temporal_product *= temporal_factor
-                    print(f"  {level_name} temporal factor = {temporal_factor}")
-                    print(f"  Updated product = {on_chip_temporal_product}")
-
                 on_chip_product = torch.tensor(1.0, device="cuda:0")
                 for level_name in formatted[d]:
-                    spatial_factor = formatted[d][level_name].get('spatial', torch.tensor(1.0, device="cuda:0"))
-                    temporal_factor = formatted[d][level_name].get('temporal', torch.tensor(1.0, device="cuda:0"))
-                    on_chip_product *= spatial_factor * temporal_factor
+                    sf = formatted[d][level_name].get('spatial', torch.tensor(1.0, device="cuda:0"))
+                    tf = formatted[d][level_name].get('temporal', torch.tensor(1.0, device="cuda:0"))
+                    on_chip_product *= sf * tf
 
-                                
-                # DRAM temporal factor is the remaining portion
                 problem_dim_size = torch.tensor(float(mapping.dims[d]), device="cuda:0")
-                print(f"Problem dimension size = {problem_dim_size}")
-                
                 dram_temporal = problem_dim_size / torch.clamp(on_chip_product, min=1.0)
-                print(f"Calculated DRAM temporal factor = {dram_temporal}")
-                
-                # Clamp to ensure minimum of 1
                 clamped_dram_temporal = torch.clamp(dram_temporal, min=1.0)
-                print(f"Final clamped DRAM temporal factor = {clamped_dram_temporal}")
-                
+
                 formatted[d]['L3_DRAM'] = {
                     "spatial": torch.tensor(1.0, device="cuda:0"),
                     "temporal": clamped_dram_temporal
                 }
 
     return formatted
+
 
 class HighFidelityPerformanceModel(nn.Module):
     """
@@ -350,18 +335,6 @@ class HighFidelityPerformanceModel(nn.Module):
                 # 映射张量类型到DATA_SUPPLY_MAP中使用的名称
                 tensor_name_map = {'W': 'Weight', 'I': 'Input', 'O': 'Output'}
                 tensor_name = tensor_name_map[tensor_type]
-
-                # === GROUP RESIDENCY OVERRIDE: 全链权重常驻（只记一次填充） ===
-                if self._group_w_persist_enabled and tensor_type == 'W':
-                    # 仅对“驻留层”的权重填充做“只记一次”的处理
-                    if destination_level_name == self._group_w_residency_level:
-                        if self._group_w_first_load_done:
-                            # 后续层的权重填充记 0——视作已驻留
-                            tensor_fill_bytes = torch.tensor(0.0, device=self.config.DEVICE)
-                            tensor_fill_accesses = torch.tensor(0.0, device=self.config.DEVICE)
-                        else:
-                            # 第一次遇到权重填充：正常计入，并标记完成
-                            self._group_w_first_load_done = True
                 
                 # 查询供给来源：使用DATA_SUPPLY_MAP查询源层级
                 if (destination_level_name not in self.config.DATA_SUPPLY_MAP or 
@@ -808,6 +781,9 @@ class HighFidelityPerformanceModel(nn.Module):
         # ---------- Input Reads ----------
         # I: L3 -> L2 （无广播）
         i = memory_levels.index('L2_Scratchpad')
+        print(f"[DEBUG] layer {i} dims: {layer_dims}")
+        print(f"[DEBUG] mapping_table for layer {i}: {mapping_table}")
+        print(f"[DEBUG] tensor type: I")
         C_i_I = self._calculate_data_block_size(i, 'I', layer_dims, mapping_table)
         tiles_i_I = self._tiles_above_for_I(i, layer_dims, mapping_table)
         base_I_L3_to_L2 = C_i_I * tiles_i_I  # 元素计
@@ -1265,7 +1241,18 @@ class HighFidelityPerformanceModel(nn.Module):
         out_tile_last = {"P": 1.0, "Q": 1.0, "K": 1.0, "N": 1.0}
 
         # 从 mapping 里取出 L1 及以下层级的 tiling factor，逐个相乘
-        mapping_last = layer2mapping[last_layer]  # ★ 注意：这里是 per-layer 的 FineGrainedMapping
+        mapping_last_obj = layer2mapping[last_layer]
+        mapping_last = {}
+        for name, param in mapping_last_obj.named_parameters():
+            # name 形如 factors.L0_Registers.K.temporal
+            parts = name.split(".")
+            level, dim, kind = parts[1], parts[2], parts[3]
+            if level not in mapping_last:
+                mapping_last[level] = {}
+            # 只取真实因子值（exp(log-param)）
+            import math
+            mapping_last[level][dim] = math.exp(param.item())
+
         for level, factors in mapping_last.items():
             if level in ("L1_Accumulator", "L0_Registers"):   # 只考虑 L1 及以下
                 for dim in ("P", "Q", "K", "N"):              # 只考虑 Output 相关维度
@@ -1292,6 +1279,9 @@ class HighFidelityPerformanceModel(nn.Module):
 
         from dosa.utils import calculate_macs
 
+        # Print group layers structure for debugging
+        print(f"[DEBUG] Processing group_layers: {group_layers}")
+        
         for lname in group_layers:
             layer = graph.layers[lname]
             dims  = layer["dims"]
@@ -1303,12 +1293,32 @@ class HighFidelityPerformanceModel(nn.Module):
                 hw_params=hw_params,
                 debug_data=None,
             )
+            # Create debug data dict for read traffic
+            read_debug = {}
+            
+            # print(f"[DEBUG] all_factors_eff[{lname}] = {all_factors_eff[lname]}")
             detailed_read = self.calculate_inter_level_read_traffic(
                 dims, all_factors_eff[lname],
                 num_pes=hw_params.get_projected_num_pes(),
                 hw_params=hw_params,
-                debug_data=None,
+                debug_data=read_debug,
             )
+            
+            # Print detailed read traffic information
+            print(f"\n[DEBUG] Layer {lname} Read Traffic Details:")
+            for interface, info in detailed_read.items():
+                print(f"\nInterface: {interface}")
+                print("  Total bytes:", info["total_bytes"].item())
+                print("  Breakdown by tensor type:")
+                for tensor, bytes in info["breakdown"].items():
+                    print(f"    {tensor}: {bytes.item()} bytes")
+                if "drivers" in info:
+                    print("  Traffic drivers:")
+                    for tensor, factors in info["drivers"].items():
+                        print(f"    {tensor}:")
+                        for factor_name, value in factors.items():
+                            print(f"      {factor_name}: {value}")
+                            
             detailed_write = self.calculate_inter_level_writeback_traffic(
                 dims, all_factors_eff[lname],
                 num_pes=hw_params.get_projected_num_pes(),
@@ -1354,7 +1364,7 @@ class HighFidelityPerformanceModel(nn.Module):
                 "dims": dims,
                 "macs": macs,
                 "traffic": traffic_dict,  # 结构：{"reads":{level:{tensor:bytes}}, "writes":..., "updates":...}
-                "all_factors": all_factors[lname],  # 添加 all_factors 信息用于 spatial factors 计算
+                "all_factors": all_factors_eff[lname],  # 添加 all_factors 信息用于 spatial factors 计算
             })
 
 
@@ -1364,7 +1374,9 @@ class HighFidelityPerformanceModel(nn.Module):
         s_list = []
         for i in range(len(group_layers) - 1):
             key = f"{group_layers[i]}->{group_layers[i+1]}"
-            s_list.append(torch.sigmoid(self.fusion_boundary_logits[key]))
+            s_i = torch.sigmoid(self.fusion_boundary_logits[key])
+            print(f"[DEBUG] Fusion boundary {key}: s={s_i.item():.3f} (logit={self.fusion_boundary_logits[key].item():.3f})")
+            s_list.append(s_i)
 
 
         # =============== 用 s 修正跨层流量：基于 reads/writes/updates 结构 =================
@@ -1377,18 +1389,30 @@ class HighFidelityPerformanceModel(nn.Module):
             # 原始的写回流量（单层统计给的基线）
             orig_O_to_DRAM = cur_writes["L3_DRAM"]["Output"] # Output对L3 DRAM的Write的traffic
             # 如果融合了，那么Output对DRAM的写流量，就变成了对L2 Scratchpad的写流量
+            # Debug 打印
+            print("="*60)
+            print(f"[DEBUG Fusion] Layer={group_layers[i]}  →  Next={group_layers[i+1]}")
+            print(f"    s_i={s_i.item() if torch.is_tensor(s_i) else s_i:.6f}")
+            print(f"    原始写回 L3_DRAM: {orig_O_to_DRAM.item() if torch.is_tensor(orig_O_to_DRAM) else orig_O_to_DRAM:.6e}")
+            print(f"    分流到 L2_Scratchpad 的流量: {(s_i * orig_O_to_DRAM).item() if torch.is_tensor(orig_O_to_DRAM) else s_i * orig_O_to_DRAM:.6e}")
             cur_writes["L2_Scratchpad"]["Output"] = s_i * orig_O_to_DRAM
 
             # （2）下一层的 Input：减少其在 L3 的读取 + L2 的写入
             nxt_reads = per_layer[nxt]["traffic"]["reads"]
             nxt_writes = per_layer[nxt]["traffic"]["writes"]
+            
+            # Print debug info for next layer traffic
+            print(f"[DEBUG] Next layer {nxt} reads traffic: {nxt_reads}")
+            print(f"[DEBUG] Next layer {nxt} writes traffic: {nxt_writes}")
 
+            print(f"[DEBUG] Checking L3_DRAM Input read traffic reduction condition: L3_DRAM in nxt_reads={('L3_DRAM' in nxt_reads)}, Input in nxt_reads['L3_DRAM']={('Input' in nxt_reads.get('L3_DRAM', {}))}")
             if "L3_DRAM" in nxt_reads and "Input" in nxt_reads["L3_DRAM"]:
                 nxt_reads["L3_DRAM"]["Input"] = (1.0 - s_i) * nxt_reads["L3_DRAM"]["Input"] # 如果融合了，那么Input对DRAM的读流量就没了
+                print(f"[DEBUG] Layer {nxt} L3_DRAM Input read traffic reduced by factor {1.0 - s_i}")
 
             if "L2_Scratchpad" in nxt_writes and "Input" in nxt_writes["L2_Scratchpad"]:
                 nxt_writes["L2_Scratchpad"]["Input"] = (1.0 - s_i) * nxt_writes["L2_Scratchpad"]["Input"] # 如果融合了，那么Input对L2 Scratchpad的写流量就没了
-
+                print(f"[DEBUG] Layer {nxt} L2_Scratchpad Input write traffic reduced by factor {1.0 - s_i}")
 
             # (2) 当前layer的输出写回到L3DRAM在融合场景下，就没了
             cur_updates = per_layer[i]["traffic"]["writes"]
@@ -1849,31 +1873,29 @@ class HighFidelityPerformanceModel(nn.Module):
                 total_buffer_mismatch_loss += mismatch
             else:
                 # 多层组：概率路由 + 容量约束
-                lat, en, comp_pen, cap_pen = self.evaluate_group_depth_first(
+                lat, en, cap_pen = self.evaluate_group_depth_first(
                     group, graph, hw_params,
                     {lname: layer2mapping[lname] for lname in group},
-                    {lname: all_factors[lname] for lname in group},
-                    debug_data=None
+                    {lname: all_factors[lname] for lname in group}
                 )
 
                 total_latency += lat
                 total_energy  += en
-                total_compatibility_penalty += comp_pen
                 total_capacity_penalty      += cap_pen
 
         # === 额外成本 ===
         area_cost = hw_params.get_area_cost()
-        mapping_invalid_penalty = self.compute_invalid_penalty(mapping)
+        # mapping_invalid_penalty = self.compute_invalid_penalty(mapping)
 
         # === 总 penalty ===
-        penalty = (mapping_invalid_penalty
+        penalty = (0
                 + total_buffer_mismatch_loss
                 + total_compatibility_penalty
                 + total_capacity_penalty)
 
         return (total_latency, total_energy, area_cost,
                 total_buffer_mismatch_loss, total_compatibility_penalty,
-                mapping_invalid_penalty, penalty)
+                0, penalty)
 
     def calculate_buffer_req_kb(self, dims, factors, level_idx):
         total_buffer_bytes = torch.tensor(0.0, device=self.config.DEVICE)
