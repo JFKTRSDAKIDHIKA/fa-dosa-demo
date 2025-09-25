@@ -41,7 +41,13 @@ def parse_scalar_access(file_path):
     return results
 
 if __name__ == "__main__":
-    file_path = "/root/fa-dosa-demo/output/validation_workspace_1/timeloop-mapper.stats.txt"  # 你给的文件路径
+    import sys
+    
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+    else:
+        file_path = "/root/fa-dosa-demo/output/validation_workspace_1/timeloop-mapper.stats.txt"  # 默认文件路径
+    
     data = parse_scalar_access(file_path)
 
     # 转成 DataFrame

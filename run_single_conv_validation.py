@@ -161,28 +161,157 @@ def generate_factors_by_strategy(dim_size: int, num_pes_sqrt: int, strategy: str
 
     return factors
 
+def _assert_constraints(mapping_config, dims, pe_count):
+    m = mapping_config["conv1"]
+    # (1) spatial 只在 L0，且乘积 ≤ PE
+    assert "spatial" in m["L0_Registers"] and all(
+        lvl not in m or "spatial" not in m[lvl] for lvl in ["L1_Accumulator", "L2_Scratchpad", "DRAM"]
+    ), "Spatial tiling must exist only at L0."
+    spatial_prod = 1
+    for d in m["L0_Registers"]["spatial"].values():
+        spatial_prod *= d
+    assert spatial_prod <= pe_count, f"Spatial product {spatial_prod} exceeds PE count {pe_count}."
+
+    # (2) L0 temporal 除 PQ 外均为 1
+    l0t = m["L0_Registers"]["temporal"]
+    for k, v in l0t.items():
+        if k not in ("P", "Q"):
+            assert v == 1, f"L0 temporal on {k} must be 1 (got {v})."
+
+    # (3) PQ 仅在 L0/L3
+    for lvl in ["L1_Accumulator", "L2_Scratchpad"]:
+        assert m[lvl]["temporal"]["P"] == 1 and m[lvl]["temporal"]["Q"] == 1, f"PQ must not be temporally tiled at {lvl}."
+    assert m["DRAM"]["temporal"]["P"] >= 1 and m["DRAM"]["temporal"]["Q"] >= 1
+
+    # (4) R/S/C 的 temporal 仅在 L1
+    for lvl in ["L0_Registers", "L2_Scratchpad", "DRAM"]:
+        for red in ["R", "S", "C"]:
+            tv = m[lvl]["temporal"].get(red, 1)
+            assert tv == 1, f"Reduction dim {red} must not be temporally tiled at {lvl} (got {tv})."
+
+    # (5) permutation 一致
+    perms = {m[lvl]["permutation"] for lvl in ["L0_Registers","L1_Accumulator","L2_Scratchpad","DRAM"]}
+    assert len(perms) == 1, f"Permutations must be identical across levels (got {perms})."
+
+
+def generate_constrained_mapping_configs(num_configs: int = 10):
+    """
+    生成符合约束条件的mapping配置
+    """
+    fixed_permutation = "P Q K C R S N"
+    dims = CONV_LAYER_CONFIG["dims"]
+    pe_count = 64
+    pe_sqrt = int(pe_count ** 0.5)
+
+    for config_id in range(num_configs):
+        # ---- L0 spatial (K/C only) ----
+        k_spatial_candidates = [d for d in get_divisors(dims["K"]).tolist() if d <= pe_sqrt]
+        c_spatial_candidates = [d for d in get_divisors(dims["C"]).tolist() if d <= pe_sqrt]
+        k_spatial = random.choice(k_spatial_candidates)
+        max_c_spatial = min(pe_count // k_spatial, max(c_spatial_candidates))
+        c_spatial_valid = [d for d in c_spatial_candidates if d <= max_c_spatial]
+        c_spatial = random.choice(c_spatial_valid) if c_spatial_valid else 1
+
+        # ---- L1 R/S/C temporal ----
+        # 改成：吃满 R/S
+        r_l1 = dims["R"]
+        s_l1 = dims["S"]
+
+        # C 仍然吃满 after L0 spatial
+        c_after_l0 = dims["C"] // c_spatial
+        c_l1 = c_after_l0
+
+        # ---- L0 + DRAM PQ temporal ----
+        p_l0_candidates = get_divisors(dims["P"]).tolist()
+        q_l0_candidates = get_divisors(dims["Q"]).tolist()
+        p_l0 = random.choice(p_l0_candidates)
+        q_l0 = random.choice(q_l0_candidates)
+        p_dram = dims["P"] // p_l0
+        q_dram = dims["Q"] // q_l0
+
+        # ---- K 分解：L2/L1 ----
+        k_remaining_after_l0 = dims["K"] // k_spatial
+        k_l2_candidates = get_divisors(k_remaining_after_l0).tolist()
+        k_l2 = random.choice(k_l2_candidates)
+        k_l1 = k_remaining_after_l0 // k_l2
+
+        # ---- DRAM 禁止 R/S/C temporal ----
+        c_dram, r_dram, s_dram = 1, 1, 1
+
+        # ---- build mapping ----
+        mapping_config = {
+            "conv1": {
+                "DRAM": {
+                    "temporal": {"N": 1, "C": c_dram, "K": 1, "P": p_dram, "Q": q_dram, "R": r_dram, "S": s_dram},
+                    "permutation": fixed_permutation
+                },
+                "L2_Scratchpad": {
+                    "temporal": {"N": 1, "C": 1, "K": k_l2, "P": 1, "Q": 1, "R": 1, "S": 1},
+                    "permutation": fixed_permutation
+                },
+                "L1_Accumulator": {
+                    "temporal": {"N": 1, "C": c_l1, "K": k_l1, "P": 1, "Q": 1, "R": r_l1, "S": s_l1},
+                    "permutation": fixed_permutation
+                },
+                "L0_Registers": {
+                    "temporal": {"N": 1, "C": 1, "K": 1, "P": p_l0, "Q": q_l0, "R": 1, "S": 1},
+                    "spatial": {"C": c_spatial, "K": k_spatial},
+                    "permutation": fixed_permutation
+                }
+            }
+        }
+
+        # ---- 验证维度乘积 ----
+        for dim_name, total_size in dims.items():
+            product = 1
+            for level in ["DRAM", "L2_Scratchpad", "L1_Accumulator", "L0_Registers"]:
+                if level == "L0_Registers":
+                    t = mapping_config["conv1"][level]["temporal"].get(dim_name, 1)
+                    s = mapping_config["conv1"][level].get("spatial", {}).get(dim_name, 1)
+                    product *= t * s
+                else:
+                    t = mapping_config["conv1"][level]["temporal"].get(dim_name, 1)
+                    product *= t
+            if product != total_size:
+                print(f"Warning: {dim_name} product mismatch {product} != {total_size}")
+
+        # ---- 构建 config ----
+        config = {
+            "hardware_config": make_hw_config(num_pes=64, l0_kb=128.0, l1_kb=4.0, l2_kb=256.0),
+            "mapping_config": mapping_config,
+            "layer_info": {
+                "layer_name": "conv1",
+                "layer_type": "Conv",
+                "dims": dims
+            }
+        }
+
+        # ---- 硬断言约束 ----
+        _assert_constraints(mapping_config, dims, pe_count)
+        yield config
+
+
 def get_fixed_validation_config():
     """返回 validation_point_id=1 的固定配置字典"""
     config_vp1 = {
         "hardware_config": make_hw_config(num_pes=64, l0_kb=128.0, l1_kb=4.0, l2_kb=256.0),
         "mapping_config": {
             "conv1": {
-                # 外层：K/C 在最外，R/S 其后；N/P/Q 放到最内侧，保障在 L0 内做时间复用
                 "DRAM": {
-                    "temporal": {"N":1,"C":1,"K":1,"P":28,"Q":28,"R":1,"S":1},
+                    "temporal": {"N":1,"K":1,"C":1,"P":28,"Q":2,"R":1,"S":1},
                     "permutation": "P Q K C R S N"
                 },
                 "L2_Scratchpad": {
-                    "temporal": {"N":1,"C":1,"K":4,"P":1,"Q":1,"R":1,"S":1},
+                    "temporal": {"N":1,"K":2,"C":1,"P":1,"Q":1,"R":1,"S":1},
                     "permutation": "P Q K C R S N"
                 },
                 "L1_Accumulator": {
-                    "temporal": {"N":1,"C":8,"K":2,"P":1,"Q":1,"R":3,"S":3},
+                    "temporal": {"N":1,"K":32,"C":8,"P":1,"Q":1,"R":3,"S":3},
                     "permutation": "P Q K C R S N"
                 },
                 "L0_Registers": {
-                    "temporal": {"N":1,"C":1,"K":1,"P":2,"Q":2,"R":1,"S":1},
-                    "spatial":  {"C":8,"K":8},  
+                    "temporal": {"N":1,"K":1,"C":1,"P":2,"Q":28,"R":1,"S":1},
+                    "spatial": {"K":1,"C":8},
                     "permutation": "P Q K C R S N"
                 }
             }
@@ -715,12 +844,13 @@ def generate_timeloop_files(config: dict, work_dir: Path):
     with open(work_dir / 'env.yaml', 'w') as f:
         yaml.dump(env_config, f, sort_keys=False, default_style="'")
 
-def generate_validation_configs(max_runs: int = None, use_fixed_config: bool = True):
+def generate_validation_configs(max_runs: int = None, use_fixed_config: bool = True, use_constrained_mapping: bool = False):
     """Generate validation configurations for single convolution layer testing.
     
     Args:
         max_runs: Maximum number of validation runs
         use_fixed_config: If True, always use fixed configuration for debugging
+        use_constrained_mapping: If True, use constrained mapping configurations
     """
     configs = []
     
@@ -733,6 +863,14 @@ def generate_validation_configs(max_runs: int = None, use_fixed_config: bool = T
         if max_runs is not None and max_runs > 1:
             for i in range(2, max_runs + 1):
                 configs.append((i, get_fixed_validation_config()))
+    elif use_constrained_mapping:
+        # 约束mapping扫描模式：使用符合约束条件的mapping配置
+        print("[INFO] Generating constrained mapping configurations")
+        num_configs = max_runs if max_runs is not None else 10
+        for i, config in enumerate(generate_constrained_mapping_configs(num_configs)):
+            configs.append((i + 1, config))
+            if max_runs is not None and len(configs) >= max_runs:
+                break
     else:
         # 生产模式：生成随机配置
         print("[INFO] Generating random configurations")
@@ -752,20 +890,49 @@ def run_traffic_comparison(work_dir, validation_point_id):
         # 导入diff_traffic模块
         import diff_traffic
         
-        # 构建文件路径 - 使用实际生成的文件名
-        # 这些文件在当前工作目录下生成，而不是在work_dir中
-        model_csv_path = Path("traffic_summary_tensor.csv")  # 模型生成的文件
-        timeloop_csv_path = Path("scalar_access_summary.csv")  # extract_scalar_access.py生成的文件
+        # 构建文件路径 - 现在都从work_dir读取
+        model_csv_path = work_dir / "traffic_summary_tensor.csv"  # 模型生成的文件，已移动到work_dir
+        timeloop_csv_path = work_dir / "scalar_access_summary.csv"  # extract_scalar_access.py在work_dir中生成的文件
         output_csv_path = work_dir / "traffic_diff.csv"
+        
+        print(f"[DEBUG] Traffic comparison for validation point {validation_point_id}:")
+        print(f"[DEBUG]   Model CSV: {model_csv_path} (exists: {model_csv_path.exists()})")
+        print(f"[DEBUG]   Timeloop CSV: {timeloop_csv_path} (exists: {timeloop_csv_path.exists()})")
+        print(f"[DEBUG]   Output CSV: {output_csv_path}")
         
         # 检查必需文件是否存在
         if not model_csv_path.exists():
             print(f"[WARNING] Model traffic CSV not found: {model_csv_path}")
-            return {"traffic_comparison_status": "model_csv_missing", "traffic_accuracy_percent": 0.0}
+            return {"traffic_comparison_status": "model_csv_missing", 
+                   "traffic_accuracy_percent": -1.0, 
+                   "traffic_total_rows": -1, 
+                   "traffic_correct_rows": -1}
         
         if not timeloop_csv_path.exists():
             print(f"[WARNING] Timeloop traffic CSV not found: {timeloop_csv_path}")
-            return {"traffic_comparison_status": "timeloop_csv_missing", "traffic_accuracy_percent": 0.0}
+            return {"traffic_comparison_status": "timeloop_csv_missing", 
+                   "traffic_accuracy_percent": -1.0, 
+                   "traffic_total_rows": -1, 
+                   "traffic_correct_rows": -1}
+        
+        # 检查文件大小
+        model_size = model_csv_path.stat().st_size
+        timeloop_size = timeloop_csv_path.stat().st_size
+        print(f"[DEBUG] File sizes - Model CSV: {model_size} bytes, Timeloop CSV: {timeloop_size} bytes")
+        
+        if model_size == 0:
+            print(f"[WARNING] Model CSV file is empty: {model_csv_path}")
+            return {"traffic_comparison_status": "model_csv_empty", 
+                   "traffic_accuracy_percent": -1.0, 
+                   "traffic_total_rows": -1, 
+                   "traffic_correct_rows": -1}
+        
+        if timeloop_size == 0:
+            print(f"[WARNING] Timeloop CSV file is empty: {timeloop_csv_path}")
+            return {"traffic_comparison_status": "timeloop_csv_empty", 
+                   "traffic_accuracy_percent": -1.0, 
+                   "traffic_total_rows": -1, 
+                   "traffic_correct_rows": -1}
         
         # 调用diff_traffic模块的分析函数
         print(f"[INFO] Running traffic comparison analysis for validation point {validation_point_id}")
@@ -775,12 +942,16 @@ def run_traffic_comparison(work_dir, validation_point_id):
         if not stats_file_path.exists():
             stats_file_path = work_dir / "timeloop-output" / "stats.txt"
         
+        print(f"[DEBUG] Stats file: {stats_file_path} (exists: {stats_file_path.exists()})")
+        
         stats = diff_traffic.run_traffic_diff_analysis(
             str(model_csv_path), 
             str(timeloop_csv_path), 
             str(output_csv_path),
             str(stats_file_path) if stats_file_path.exists() else None
         )
+        
+        print(f"[INFO] Traffic comparison completed for validation point {validation_point_id}: {stats.get('correct_count', 0)}/{stats.get('total_count', 0)} ({stats.get('accuracy_percent', 0.0):.1f}%)")
         
         return {
             "traffic_comparison_status": "success",
@@ -790,12 +961,20 @@ def run_traffic_comparison(work_dir, validation_point_id):
         }
         
     except ImportError as e:
-        print(f"[ERROR] Failed to import diff_traffic module: {e}")
-        return {"traffic_comparison_status": "import_error", "traffic_accuracy_percent": 0.0}
+        print(f"[ERROR] Failed to import diff_traffic module for validation point {validation_point_id}: {e}")
+        return {"traffic_comparison_status": "import_error", 
+               "traffic_accuracy_percent": -1.0, 
+               "traffic_total_rows": -1, 
+               "traffic_correct_rows": -1}
     
     except Exception as e:
-        print(f"[ERROR] Traffic comparison analysis failed: {e}")
-        return {"traffic_comparison_status": "analysis_error", "traffic_accuracy_percent": 0.0}
+        print(f"[ERROR] Traffic comparison analysis failed for validation point {validation_point_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"traffic_comparison_status": "analysis_error", 
+               "traffic_accuracy_percent": -1.0, 
+               "traffic_total_rows": -1, 
+               "traffic_correct_rows": -1}
 
 def main():
     """Main control script to run single convolution layer validation experiments."""
@@ -808,6 +987,8 @@ def main():
                        help=f'Timeout in seconds for each validation point (default: {VALIDATION_TIMEOUT_SECONDS})')
     parser.add_argument('--use-random-config', action='store_true', default=False,
                        help='Use random configurations instead of fixed configuration (default: False, use fixed config for debugging)')
+    parser.add_argument('--use-constrained-mapping', action='store_true', default=False,
+                       help='Use constrained mapping configurations for systematic scanning (default: False)')
     args = parser.parse_args()
     
     # Create output directory
@@ -815,10 +996,12 @@ def main():
     output_dir.mkdir(exist_ok=True)
     
     all_results = []
+    all_diff_data = []  # 存储所有配置点的diff数据
     master_configs = {}  # Dictionary to store all validation point configurations
     max_runs = args.max_runs
     timeout_seconds = args.timeout
-    use_fixed_config = not args.use_random_config  # 默认使用固定配置
+    use_fixed_config = not args.use_random_config and not args.use_constrained_mapping  # 默认使用固定配置
+    use_constrained_mapping = args.use_constrained_mapping
     
     # Statistics counters
     success_count = 0
@@ -828,7 +1011,14 @@ def main():
     print("Starting single convolution layer validation run...")
     print(f"[INFO] Output directory: {output_dir.resolve()}")
     print(f"[INFO] Timeout per validation point: {timeout_seconds} seconds ({timeout_seconds/60:.1f} minutes)")
-    print(f"[INFO] Configuration mode: {'Fixed (debugging)' if use_fixed_config else 'Random (production)'}")
+    
+    if use_constrained_mapping:
+        print("[INFO] Configuration mode: Constrained mapping scanning")
+    elif use_fixed_config:
+        print("[INFO] Configuration mode: Fixed (debugging)")
+    else:
+        print("[INFO] Configuration mode: Random (production)")
+        
     if max_runs is not None:
         print(f"[INFO] Limited to {max_runs} validation runs for quick testing")
     else:
@@ -836,7 +1026,7 @@ def main():
 
     try:
         # Generate validation configurations
-        validation_configs = generate_validation_configs(max_runs, use_fixed_config)
+        validation_configs = generate_validation_configs(max_runs, use_fixed_config, use_constrained_mapping)
         print(f"[INFO] Generated {len(validation_configs)} validation configurations")
         
         for validation_point_id, config in validation_configs:
@@ -849,37 +1039,89 @@ def main():
             work_dir = output_dir / f'validation_workspace_{validation_point_id}'
             work_dir.mkdir(exist_ok=True)
             
+            # Clean up any residual CSV files from previous runs
+            for csv_file in work_dir.glob("*.csv"):
+                csv_file.unlink()
+                print(f"[INFO] Cleaned up residual CSV file: {csv_file.name}")
+            
             try:
                 # Run dual-track evaluation
                 dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
+                
+                # Move model-side traffic_summary_tensor.csv to work_dir
+                model_csv_path = Path("traffic_summary_tensor.csv")
+                if model_csv_path.exists():
+                    target_csv_path = work_dir / "traffic_summary_tensor.csv"
+                    model_csv_path.rename(target_csv_path)
+                    print(f"[INFO] Moved traffic_summary_tensor.csv to {target_csv_path}")
+                else:
+                    print(f"[WARNING] Model CSV file not found: {model_csv_path}")
+                
                 timeloop_results = run_timeloop_simulation(config, work_dir)
                 
-                # 调用 extract 脚本，解析 timeloop stats
-                # 优先检查 v0.4 默认文件
+                # Check if Timeloop simulation failed (more comprehensive check)
+                timeloop_failed = (timeloop_results.get("simulated_latency_s", -1) <= 0 or 
+                                 timeloop_results.get("simulated_energy_pj", -1) <= 0 or
+                                 timeloop_results.get("simulated_latency_s", -1) == -1.0 or 
+                                 timeloop_results.get("simulated_energy_pj", -1) == -1.0)
+                
+                # 检查stats文件是否存在（这是运行diff分析的前提）
                 stats_file = work_dir / "timeloop-mapper.stats.txt"
-
-                # 兼容旧版路径
                 if not stats_file.exists():
                     stats_file = work_dir / "timeloop-output" / "stats.txt"
-
-
-                if stats_file.exists():
+                
+                stats_file_exists = stats_file.exists()
+                
+                if timeloop_failed:
+                    print(f"[WARNING] Timeloop simulation failed for validation point {validation_point_id} (latency={timeloop_results.get('simulated_latency_s', 'N/A')}, energy={timeloop_results.get('simulated_energy_pj', 'N/A')})")
+                    traffic_results = {"traffic_comparison_status": "timeloop_simulation_failed", 
+                                     "traffic_accuracy_percent": -1.0, 
+                                     "traffic_total_rows": -1, 
+                                     "traffic_correct_rows": -1}
+                elif not stats_file_exists:
+                    print(f"[WARNING] Timeloop stats file not found for validation point {validation_point_id}, cannot run traffic analysis")
+                    traffic_results = {"traffic_comparison_status": "stats_file_missing", 
+                                     "traffic_accuracy_percent": -1.0, 
+                                     "traffic_total_rows": -1, 
+                                     "traffic_correct_rows": -1}
+                else:
+                    # Timeloop成功且stats文件存在，运行traffic分析
                     print(f"[INFO] Running extract_scalar_access.py on {stats_file}")
                     try:
+                        # 使用相对于工作目录的文件名
+                        stats_filename = stats_file.name  # 只取文件名，如 "timeloop-mapper.stats.txt"
                         subprocess.run(
-                            ["python", "extract_scalar_access.py", str(stats_file)],
+                            ["python", str(Path.cwd() / "extract_scalar_access.py"), stats_filename],
+                            cwd=str(work_dir),
                             check=True
                         )
                         
                         # 运行traffic comparison分析
                         traffic_results = run_traffic_comparison(work_dir, validation_point_id)
                         
+                        # 收集diff数据用于汇总
+                        diff_csv_path = work_dir / "traffic_diff.csv"
+                        if diff_csv_path.exists():
+                            try:
+                                diff_df = pd.read_csv(diff_csv_path)
+                                # 添加配置点ID列
+                                diff_df['validation_point_id'] = validation_point_id
+                                all_diff_data.append(diff_df)
+                            except Exception as e:
+                                print(f"[WARNING] Failed to read diff CSV for validation point {validation_point_id}: {e}")
+                        
                     except subprocess.CalledProcessError as e:
-                        print(f"[ERROR] extract_scalar_access.py failed: {e}")
-                        traffic_results = {"traffic_comparison_status": "extract_failed"}
-                else:
-                    print(f"[WARNING] stats.txt not found in {stats_file.parent}")
-                    traffic_results = {"traffic_comparison_status": "stats_file_missing"}
+                        print(f"[ERROR] extract_scalar_access.py failed for validation point {validation_point_id}: {e}")
+                        traffic_results = {"traffic_comparison_status": "extract_failed", 
+                                         "traffic_accuracy_percent": -1.0, 
+                                         "traffic_total_rows": -1, 
+                                         "traffic_correct_rows": -1}
+                    except Exception as e:
+                        print(f"[ERROR] Unexpected error during traffic analysis for validation point {validation_point_id}: {e}")
+                        traffic_results = {"traffic_comparison_status": "analysis_error", 
+                                         "traffic_accuracy_percent": -1.0, 
+                                         "traffic_total_rows": -1, 
+                                         "traffic_correct_rows": -1}
 
                 # Combine results (including traffic comparison results)
                 flat_config = {
@@ -887,11 +1129,18 @@ def main():
                     "layer_name": config['layer_info']['layer_name'],
                     **config['hardware_config']
                 }
-                combined_result = {**flat_config, **dosa_results, **timeloop_results, **traffic_results, "status": "success"}
-                all_results.append(combined_result)
-                success_count += 1
                 
-                print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
+                # Determine overall status
+                overall_status = "timeloop_failed" if timeloop_failed else "success"
+                combined_result = {**flat_config, **dosa_results, **timeloop_results, **traffic_results, "status": overall_status}
+                all_results.append(combined_result)
+                
+                if timeloop_failed:
+                    error_count += 1
+                    print(f"[PARTIAL SUCCESS] Validation point {validation_point_id} completed with Timeloop simulation failure")
+                else:
+                    success_count += 1
+                    print(f"[SUCCESS] Validation point {validation_point_id} completed successfully")
                 
             except Exception as e:
                 print(f"[ERROR] Validation point {validation_point_id} failed: {e}")
@@ -924,6 +1173,14 @@ def main():
             
             df.to_csv(csv_file, index=False)
             print(f"[INFO] Results saved to {csv_file}")
+        
+        # Save aggregated diff data to a single CSV file
+        if all_diff_data:
+            aggregated_diff_csv = output_dir / "aggregated_traffic_diff.csv"
+            combined_diff_df = pd.concat(all_diff_data, ignore_index=True)
+            combined_diff_df.to_csv(aggregated_diff_csv, index=False)
+            print(f"[INFO] Aggregated diff data saved to {aggregated_diff_csv}")
+            print(f"[INFO] Total diff records: {len(combined_diff_df)}")
         
         # Final statistics
         total_points = len(all_results)

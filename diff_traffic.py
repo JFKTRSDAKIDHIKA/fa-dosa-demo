@@ -65,7 +65,10 @@ def map_model_level(row):
     return LEVEL_NAME_TO_ID.get(name, None)
 
 def load_model_csv(path: str):
+    print(f"[DEBUG] Loading model CSV from: {path}")
     df = pd.read_csv(path)
+    print(f"[DEBUG] Model CSV loaded: {len(df)} rows, columns: {df.columns.tolist()}")
+    
     if "tensor" not in df.columns:
         raise ValueError(f"[ERROR] 模型 CSV 缺少 tensor 列，实际列: {df.columns.tolist()}")
 
@@ -79,6 +82,7 @@ def load_model_csv(path: str):
 
     # 只保留合法组合
     df = df[df.apply(lambda r: r["type"] in VALID_TYPES.get(r["tensor"], set()), axis=1)]
+    print(f"[DEBUG] Model CSV after processing: {len(df)} rows")
     return df
 
 def load_timeloop_csv(path: str, stats_file_path: str = None):
@@ -89,6 +93,9 @@ def load_timeloop_csv(path: str, stats_file_path: str = None):
         path: timeloop CSV文件路径
         stats_file_path: timeloop stats文件路径，用于解析PE数量
     """
+    print(f"[DEBUG] Loading timeloop CSV from: {path}")
+    print(f"[DEBUG] Stats file path: {stats_file_path}")
+    
     # 解析PE数量
     if stats_file_path:
         pe_count = parse_pe_count_from_stats(stats_file_path)
@@ -97,6 +104,8 @@ def load_timeloop_csv(path: str, stats_file_path: str = None):
         print("警告: 未提供stats文件路径，使用默认PE数量64")
     
     df = pd.read_csv(path)
+    print(f"[DEBUG] Timeloop CSV loaded: {len(df)} rows, columns: {df.columns.tolist()}")
+    
     # 展开 fills/reads/updates
     df = df.melt(
         id_vars=["level", "tensor"],
@@ -165,6 +174,13 @@ def run_traffic_diff_analysis(model_csv_path="traffic_summary_tensor.csv", timel
     Returns:
         dict: 包含分析结果的字典
     """
+    print(f"[DEBUG] ===== Traffic Diff Analysis Start =====")
+    print(f"[DEBUG] Model CSV path: {model_csv_path}")
+    print(f"[DEBUG] Timeloop CSV path: {timeloop_csv_path}")
+    print(f"[DEBUG] Output CSV path: {output_csv_path}")
+    print(f"[DEBUG] Stats file path: {stats_file_path}")
+    print(f"[DEBUG] ==========================================")
+    
     model_df = load_model_csv(model_csv_path)
     tl_df = load_timeloop_csv(timeloop_csv_path, stats_file_path)
 
