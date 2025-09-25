@@ -29,7 +29,7 @@ INPUT_SPEC = {
         "S": 3
     },
     "hardware": {                    # 硬件配置
-        "initial_num_pes": 16,
+        "initial_num_pes": 64,
         "initial_l0_kb": 2,
         "initial_l1_kb": 4,
         "initial_l2_kb": 64
@@ -39,12 +39,12 @@ INPUT_SPEC = {
             {
                 "name": "conv1",
                 "type": "Conv",
-                "dims": {"N":1, "C":64, "K":128, "P":32, "Q":32, "R":3, "S":3}
+                "dims": {"N":1, "C":3, "K":16, "P":32, "Q":32, "R":3, "S":3}
             },
             {
                 "name": "conv2",
                 "type": "Conv",
-                "dims": {"N":1, "C":128, "K":256, "P":32, "Q":32, "R":3, "S":3}
+                "dims": {"N":1, "C":16, "K":32, "P":32, "Q":32, "R":3, "S":3}
             }
         ],
         "fusion_groups": [
@@ -55,37 +55,92 @@ INPUT_SPEC = {
         ]
     },
     "mappings": {
-        "conv1": {
-            "discrete_factors": {
-                "L0_Registers": {
-                    "temporal": {"K":1,"C":1,"P":4,"Q":4,"R":1,"S":1},
-                    "spatial":  {"K":4,"C":4}
-                },
-                "L1_Accumulator": {
-                    "temporal": {"K":1,"C":8,"P":1,"Q":1,"R":3,"S":3}
-                },
-                "L2_Scratchpad": {
-                    "temporal": {"K":1,"C":4,"P":1,"Q":1,"R":1,"S":1}
-                }
-            }
+  "conv1": {
+    "discrete_factors": {
+      "L0_Registers": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 1,
+          "S": 1,
+          "K": 1,
+          "C": 1,
+          "N": 1
         },
-        "conv2": {
-            "discrete_factors": {
-                "L0_Registers": {
-                    "temporal": {"K":1,"C":1,"P":4,"Q":4,"R":1,"S":1},
-                    "spatial":  {"K":4,"C":4}
-                },
-                "L1_Accumulator": {
-                    "temporal": {"K":1,"C":8,"P":1,"Q":1,"R":3,"S":3}
-                },
-                "L2_Scratchpad": {
-                    "temporal": {"K":1,"C":8,"P":1,"Q":1,"R":1,"S":1}
-                }
-            }
+        "spatial": {
+          "K": 4,
+          "C": 3
         }
-    },
+      },
+      "L1_Accumulator": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 3,
+          "S": 3,
+          "K": 1,
+          "C": 1,
+          "N": 1
+        }
+      },
+      "L2_Scratchpad": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 1,
+          "S": 1,
+          "K": 1,
+          "C": 1,
+          "N": 1
+        }
+      }
+    }
+  },
+  "conv2": {
+    "discrete_factors": {
+      "L0_Registers": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 1,
+          "S": 1,
+          "K": 1,
+          "C": 1,
+          "N": 1
+        },
+        "spatial": {
+          "K": 8,
+          "C": 4
+        }
+      },
+      "L1_Accumulator": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 3,
+          "S": 3,
+          "K": 1,
+          "C": 1,
+          "N": 1
+        }
+      },
+      "L2_Scratchpad": {
+        "temporal": {
+          "P": 1,
+          "Q": 1,
+          "R": 1,
+          "S": 1,
+          "K": 1,
+          "C": 1,
+          "N": 1
+        }
+      }
+    }
+  }
+},
     "fusion_boundaries": {
-        "conv1->conv2": {"s": 0.01}   # 融合概率0.5，可改为 logit
+        "conv1->conv2": {"s": 0.99},
+        "conv2->conv3": {"s": 0.99}
     },
     "print_options": {
         "show_lb": True,

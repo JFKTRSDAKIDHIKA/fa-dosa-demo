@@ -11,6 +11,8 @@ import multiprocessing
 import contextlib
 from pathlib import Path
 import torch
+import math
+import torch.nn as nn
 
 # FA-DOSA core modules
 from dosa.config import Config as DosaConfig
@@ -167,7 +169,7 @@ def get_fixed_validation_config():
             "conv1": {
                 # 外层：K/C 在最外，R/S 其后；N/P/Q 放到最内侧，保障在 L0 内做时间复用
                 "DRAM": {
-                    "temporal": {"N":1,"C":1,"K":1,"P":7,"Q":7,"R":1,"S":1},
+                    "temporal": {"N":1,"C":1,"K":1,"P":28,"Q":28,"R":1,"S":1},
                     "permutation": "P Q K C R S N"
                 },
                 "L2_Scratchpad": {
@@ -179,7 +181,7 @@ def get_fixed_validation_config():
                     "permutation": "P Q K C R S N"
                 },
                 "L0_Registers": {
-                    "temporal": {"N":1,"C":1,"K":1,"P":8,"Q":8,"R":1,"S":1},
+                    "temporal": {"N":1,"C":1,"K":1,"P":2,"Q":2,"R":1,"S":1},
                     "spatial":  {"C":8,"K":8},  
                     "permutation": "P Q K C R S N"
                 }
@@ -277,7 +279,7 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
     
     # 3. 初始化核心对象
     dosa_config = DosaConfig()
-    perf_model = HighFidelityPerformanceModel(dosa_config, debug_latency=False, fusion_aware=False)
+    perf_model = HighFidelityPerformanceModel(dosa_config)
 
     hw_params = HardwareParameters(
         initial_num_pes=hw_config['num_pes'],
@@ -295,19 +297,29 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
 
     print(f"[INFO] Loading mapping config for layer: {layer_name}")
     layer_mapping = mapping_config.get(layer_name, {})
+
     for level_name, level_mapping in layer_mapping.items():
         if level_name in mapping.factors:
             temporal_factors = level_mapping.get('temporal', {})
-            spatial_factors = level_mapping.get('spatial', {})
-            
-            for dim_name in mapping.factors[level_name]:
-                t_factor = temporal_factors.get(dim_name, 1.0)
-                s_factor = spatial_factors.get(dim_name, 1.0)
-                
-                import torch.nn as nn
-                mapping.factors[level_name][dim_name]['temporal'] = nn.Parameter(torch.tensor(float(t_factor)))
-                mapping.factors[level_name][dim_name]['spatial'] = nn.Parameter(torch.tensor(float(s_factor)))
+            spatial_factors  = level_mapping.get('spatial', {})
 
+            for dim_name in mapping.factors[level_name]:
+                t_real = float(temporal_factors.get(dim_name, 1.0))
+                s_real = float(spatial_factors.get(dim_name, 1.0))
+
+                # 防御：因子至少为 1（避免 log(0) 或 <1 导致负 log）
+                t_real = max(t_real, 1.0)
+                s_real = max(s_real, 1.0)
+
+                t_log = math.log(t_real)
+                s_log = math.log(s_real)
+
+                mapping.factors[level_name][dim_name]['temporal'] = nn.Parameter(
+                    torch.tensor(t_log, device=dosa_config.DEVICE)
+                )
+                mapping.factors[level_name][dim_name]['spatial'] = nn.Parameter(
+                    torch.tensor(s_log, device=dosa_config.DEVICE)
+                )
     mapping.to(dosa_config.DEVICE)
     
     # Print mapping information
@@ -331,12 +343,14 @@ def run_dosa_prediction(config: dict, validation_point_id: int = None, output_di
     
 
     with torch.no_grad():
+        # Create layer2mapping dictionary with layer name as key
+        layer2mapping = {layer_name: mapping}
+        
         total_latency, total_energy, area_cost, mismatch_loss, comp_penalty, _, _ = perf_model(
             graph=graph,
             hw_params=hw_params,
-            mapping=mapping,  # <--- 使用 mapping 对象
+            layer2mapping=layer2mapping,  # <--- 传递字典而不是单个mapping对象
             fusion_params=None,
-            direct_mapping_table=None, # <--- 明确地不再使用它
             debug_output_path=debug_filename
         )
 
@@ -730,6 +744,59 @@ def generate_validation_configs(max_runs: int = None, use_fixed_config: bool = T
     
     return configs
 
+def run_traffic_comparison(work_dir, validation_point_id):
+    """
+    运行traffic comparison分析，调用diff_traffic.py模块
+    """
+    try:
+        # 导入diff_traffic模块
+        import diff_traffic
+        
+        # 构建文件路径 - 使用实际生成的文件名
+        # 这些文件在当前工作目录下生成，而不是在work_dir中
+        model_csv_path = Path("traffic_summary_tensor.csv")  # 模型生成的文件
+        timeloop_csv_path = Path("scalar_access_summary.csv")  # extract_scalar_access.py生成的文件
+        output_csv_path = work_dir / "traffic_diff.csv"
+        
+        # 检查必需文件是否存在
+        if not model_csv_path.exists():
+            print(f"[WARNING] Model traffic CSV not found: {model_csv_path}")
+            return {"traffic_comparison_status": "model_csv_missing", "traffic_accuracy_percent": 0.0}
+        
+        if not timeloop_csv_path.exists():
+            print(f"[WARNING] Timeloop traffic CSV not found: {timeloop_csv_path}")
+            return {"traffic_comparison_status": "timeloop_csv_missing", "traffic_accuracy_percent": 0.0}
+        
+        # 调用diff_traffic模块的分析函数
+        print(f"[INFO] Running traffic comparison analysis for validation point {validation_point_id}")
+        
+        # 构建stats文件路径
+        stats_file_path = work_dir / "timeloop-mapper.stats.txt"
+        if not stats_file_path.exists():
+            stats_file_path = work_dir / "timeloop-output" / "stats.txt"
+        
+        stats = diff_traffic.run_traffic_diff_analysis(
+            str(model_csv_path), 
+            str(timeloop_csv_path), 
+            str(output_csv_path),
+            str(stats_file_path) if stats_file_path.exists() else None
+        )
+        
+        return {
+            "traffic_comparison_status": "success",
+            "traffic_accuracy_percent": stats.get("accuracy_percent", 0.0),
+            "traffic_total_rows": stats.get("total_count", 0),
+            "traffic_correct_rows": stats.get("correct_count", 0)
+        }
+        
+    except ImportError as e:
+        print(f"[ERROR] Failed to import diff_traffic module: {e}")
+        return {"traffic_comparison_status": "import_error", "traffic_accuracy_percent": 0.0}
+    
+    except Exception as e:
+        print(f"[ERROR] Traffic comparison analysis failed: {e}")
+        return {"traffic_comparison_status": "analysis_error", "traffic_accuracy_percent": 0.0}
+
 def main():
     """Main control script to run single convolution layer validation experiments."""
     parser = argparse.ArgumentParser(description="Run single convolution layer validation experiments")
@@ -787,13 +854,40 @@ def main():
                 dosa_results = run_dosa_prediction(config, validation_point_id, output_dir)
                 timeloop_results = run_timeloop_simulation(config, work_dir)
                 
-                # Combine results
+                # 调用 extract 脚本，解析 timeloop stats
+                # 优先检查 v0.4 默认文件
+                stats_file = work_dir / "timeloop-mapper.stats.txt"
+
+                # 兼容旧版路径
+                if not stats_file.exists():
+                    stats_file = work_dir / "timeloop-output" / "stats.txt"
+
+
+                if stats_file.exists():
+                    print(f"[INFO] Running extract_scalar_access.py on {stats_file}")
+                    try:
+                        subprocess.run(
+                            ["python", "extract_scalar_access.py", str(stats_file)],
+                            check=True
+                        )
+                        
+                        # 运行traffic comparison分析
+                        traffic_results = run_traffic_comparison(work_dir, validation_point_id)
+                        
+                    except subprocess.CalledProcessError as e:
+                        print(f"[ERROR] extract_scalar_access.py failed: {e}")
+                        traffic_results = {"traffic_comparison_status": "extract_failed"}
+                else:
+                    print(f"[WARNING] stats.txt not found in {stats_file.parent}")
+                    traffic_results = {"traffic_comparison_status": "stats_file_missing"}
+
+                # Combine results (including traffic comparison results)
                 flat_config = {
                     "validation_point_id": validation_point_id,
                     "layer_name": config['layer_info']['layer_name'],
                     **config['hardware_config']
                 }
-                combined_result = {**flat_config, **dosa_results, **timeloop_results, "status": "success"}
+                combined_result = {**flat_config, **dosa_results, **timeloop_results, **traffic_results, "status": "success"}
                 all_results.append(combined_result)
                 success_count += 1
                 
@@ -822,7 +916,8 @@ def main():
             df = pd.DataFrame(all_results)
             # Ensure all required columns are present
             required_columns = ['validation_point_id', 'layer_name', 'num_pes', 'l2_scratchpad_size_kb', 
-                               'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 'status']
+                               'predicted_latency_s', 'predicted_energy_pj', 'simulated_latency_s', 'simulated_energy_pj', 
+                               'traffic_comparison_status', 'traffic_accuracy_percent', 'status']
             for col in required_columns:
                 if col not in df.columns:
                     df[col] = -1.0 if 'latency' in col or 'energy' in col else 'unknown'
